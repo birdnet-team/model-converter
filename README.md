@@ -3,7 +3,7 @@ Converts PyTorch models to other formats.
 
 ## Setup
 
-Download or clone the repository
+Download or clone repository
 ```
 git clone https://github.com/birdnet-team/model-converter.git
 cd model-converter

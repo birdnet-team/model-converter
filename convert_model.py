@@ -269,9 +269,9 @@ def createOnnxModel():
 ###########################################################################################
 
 
-# createTfPreprocessingModel()
-# createTfMainModel(saveKerasModel=True)
-# combineTfModels()
+createTfPreprocessingModel()
+createTfMainModel(saveKerasModel=True)
+combineTfModels()
 
 createTorchScriptModel()
-#createOnnxModel()
+createOnnxModel()

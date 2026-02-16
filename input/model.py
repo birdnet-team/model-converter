@@ -5,8 +5,6 @@ import torch.nn.functional as F
 import timm
 
 
-
-
 def init_layer(layer):
     nn.init.xavier_uniform_(layer.weight)
 
@@ -33,56 +31,6 @@ def init_weights(model):
     elif classname.find("Linear") != -1:
         model.weight.data.normal_(0, 0.01)
         model.bias.data.zero_()
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=(3, 3),
-            stride=(1, 1),
-            padding=(1, 1),
-            bias=False)
-
-        self.conv2 = nn.Conv2d(
-            in_channels=out_channels,
-            out_channels=out_channels,
-            kernel_size=(3, 3),
-            stride=(1, 1),
-            padding=(1, 1),
-            bias=False)
-
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-        self.init_weight()
-
-    def init_weight(self):
-        init_layer(self.conv1)
-        init_layer(self.conv2)
-        init_bn(self.bn1)
-        init_bn(self.bn2)
-
-    def forward(self, input, pool_size=(2, 2), pool_type='avg'):
-
-        x = input
-        x = F.relu_(self.bn1(self.conv1(x)))
-        x = F.relu_(self.bn2(self.conv2(x)))
-        if pool_type == 'max':
-            x = F.max_pool2d(x, kernel_size=pool_size)
-        elif pool_type == 'avg':
-            x = F.avg_pool2d(x, kernel_size=pool_size)
-        elif pool_type == 'avg+max':
-            x1 = F.avg_pool2d(x, kernel_size=pool_size)
-            x2 = F.max_pool2d(x, kernel_size=pool_size)
-            x = x1 + x2
-        else:
-            raise Exception('Incorrect argument!')
-
-        return x
-
 
 class AttBlock(nn.Module):
     def __init__(self,
@@ -130,9 +78,6 @@ class AttBlock(nn.Module):
         elif self.activation == 'sigmoid':
             return torch.sigmoid(x)
         
-
-
-# multihead
 class GeM(torch.nn.Module):
     def __init__(self, p=3, eps=1e-6):
         super(GeM, self).__init__()
@@ -148,7 +93,6 @@ class GeM(torch.nn.Module):
         return x
 
 
-# multihead
 class MultiHead01(nn.Module):
 
     def __init__(self, backbone, nClasses, pretrained=True):
@@ -186,6 +130,25 @@ class MultiHead01(nn.Module):
         
         self.init_weight()
 
+    ## Custom 1D pooling (for tflite compatibility)
+    def _pool1d_avg(self, x):
+        """Manual avg_pool1d with kernel_size=3, stride=1, padding=1.
+        x: [B, C, T]
+        """
+        # Pad with zeros on both sides
+        x_padded = F.pad(x, (1, 1), mode='constant', value=0.0)
+        # Sum 3 neighboring values and divide by 3
+        return (x_padded[:, :, 0:-2] + x_padded[:, :, 1:-1] + x_padded[:, :, 2:]) / 3.0
+
+    def _pool1d_max(self, x):
+        """Manual max_pool1d with kernel_size=3, stride=1, padding=1.
+        x: [B, C, T]
+        """
+        # Pad with -inf on both sides
+        x_padded = F.pad(x, (1, 1), mode='constant', value=-1e9)
+        # Max of 3 neighboring values
+        return torch.max(torch.max(x_padded[:, :, 0:-2], x_padded[:, :, 1:-1]), x_padded[:, :, 2:])
+
 
     
     def init_weight(self):
@@ -216,8 +179,12 @@ class MultiHead01(nn.Module):
         x = torch.mean(features, dim=3)
         #print('torch.mean(x, dim=3)', x.shape)              # torch.Size([48, 1408, 7])     
 
-        x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        ## Custom 1D pooling (for tflite compatibility)
+        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
+        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x1 = self._pool1d_max(x)
+        x2 = self._pool1d_avg(x)
+
         x = x1 + x2 # ToCheck if concat or using only max or avg is better
         #print('x = x1 + x2', x.shape)  # torch.Size([48, 1408, 7]) 
 
@@ -247,8 +214,12 @@ class MultiHead01(nn.Module):
         x = torch.mean(features, dim=2)
         #print('torch.mean(x, dim=2)', x.shape)              # torch.Size([8, 1408, 18])   
 
-        x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        ## Custom 1D pooling (for tflite compatibility)
+        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
+        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x1 = self._pool1d_max(x)
+        x2 = self._pool1d_avg(x)
+
         x = x1 + x2
 
 
@@ -282,5 +253,4 @@ class MultiHead01(nn.Module):
     
         # Single output for TorchScript export
         return torch.sigmoid((logitsHead1 + logitsHead2 + logitsHead3) / 3.0)
-
-
+    

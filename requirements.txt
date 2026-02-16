@@ -4,3 +4,6 @@ torchaudio==2.9.0
 litert-torch==0.8.0
 timm
 librosa
+onnx
+onnxruntime-gpu
+onnxscript

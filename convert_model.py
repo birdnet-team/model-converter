@@ -219,8 +219,21 @@ def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
 
     return model
 
+def createTorchScriptModel():
+
+    # Load model
+    model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False)
+    
+    scripted_module = torch.jit.script(model)
+    dstDir = modelDir + 'torchscript/'
+    os.makedirs(dstDir, exist_ok=True)
+    scripted_module.save(dstDir + 'model.pt')
+    print('TorchScript model saved to', dstDir + 'model.pt')
 
 def createOnnxModel():
+
+    # Load model
+    model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False)
 
     model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
 
@@ -248,7 +261,7 @@ def createOnnxModel():
     onnx.save(onnxModel, dstDir+'model.onnx', save_as_external_data=False)
     os.remove(dstDir+'temp.onnx')
     os.remove(dstDir+'temp.onnx.data')
-    
+
     print('ONNX model exported successfully to', dstDir+'model.onnx')
 
 ###########################################################################################
@@ -260,4 +273,5 @@ def createOnnxModel():
 # createTfMainModel(saveKerasModel=True)
 # combineTfModels()
 
-createOnnxModel()
+createTorchScriptModel()
+#createOnnxModel()

@@ -92,17 +92,29 @@ class AttBlock(nn.Module):
         init_bn(self.bn_att)
 
     def forward(self, x):
+
+
         # x: (n_samples, n_in, n_time)
         norm_att = torch.softmax(torch.clamp(self.att(x), -10, 10), dim=-1)
         cla = self.nonlinear_transform(self.cla(x))
         x = torch.sum(norm_att * cla, dim=2)
         return x, norm_att, cla
 
-    def nonlinear_transform(self, x):
+    # NNN
+    # def nonlinear_transform(self, x):
+    #     if self.activation == 'linear':
+    #         return x
+    #     elif self.activation == 'sigmoid':
+    #         return torch.sigmoid(x)
+    def nonlinear_transform(self, x: torch.Tensor) -> torch.Tensor:
+        # Add explicit type annotation and ensure we always return a Tensor
         if self.activation == 'linear':
             return x
         elif self.activation == 'sigmoid':
             return torch.sigmoid(x)
+        else:
+            # Add a default case to ensure TorchScript knows a Tensor is always returned
+            return x
         
 class GeM(torch.nn.Module):
     def __init__(self, p=3, eps=1e-6):

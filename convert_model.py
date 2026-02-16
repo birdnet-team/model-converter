@@ -12,10 +12,13 @@ import litert_torch
 import onnx
 
 
+# Adjust this path to point to the directory containing the PyTorch checkpoint and model definition (model.py)
 modelDir = os.path.dirname(os.path.abspath(__file__)) + '/models/01_BirdNET+_V3.0-preview3_Global_11K/'
 
-segmentDuration = 3.0
+# LiteRT models don't yet support dynamic batch size and input length, so we need to specify those here
 batchSize = 1
+segmentDuration = 3.0
+
 
 
 # Load model definitions from model.py
@@ -264,14 +267,17 @@ def createOnnxModel():
 
     print('ONNX model exported successfully to', dstDir+'model.onnx')
 
+
 ###########################################################################################
 ###########################################################################################
 ###########################################################################################
 
 
-createTfPreprocessingModel()
-createTfMainModel(saveKerasModel=True)
-combineTfModels()
+if __name__ == '__main__':
 
-createTorchScriptModel()
-createOnnxModel()
+    createTfPreprocessingModel()
+    createTfMainModel(saveKerasModel=True)
+    combineTfModels()
+
+    createTorchScriptModel()
+    createOnnxModel()

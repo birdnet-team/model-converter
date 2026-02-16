@@ -15,3 +15,8 @@ conda create --name model-converter python=3.12
 conda activate model-converter
 pip install -r requirements.txt
 ```
+
+Convert PyTorch model to other formats (e.g. tf, litert, torchscript, onnx)
+```
+python convert_model.py
+```

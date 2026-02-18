@@ -255,15 +255,18 @@ def createOnnxModel():
         #output_names=['output'],  # needed ?
         output_names=['embeddings', 'predictions'],
         dynamo=True,
-        #dynamic_shapes={'input': {0: 'batch_size', 1: 'samples'}}
-        dynamic_shapes={'input': {0: 'batch_size'}}
+        dynamic_shapes={'input': {0: 'batch_size', 1: 'samples'}}
+        #dynamic_shapes={'input': {0: 'batch_size'}}
     )
 
-    # Load model and save wihtout external data format
+    # Load model and save without external data format
     onnxModel = onnx.load(dstDir+'temp.onnx')
     onnx.save(onnxModel, dstDir+'model.onnx', save_as_external_data=False)
-    os.remove(dstDir+'temp.onnx')
-    os.remove(dstDir+'temp.onnx.data')
+    if os.path.exists(dstDir+'temp.onnx'):
+        os.remove(dstDir+'temp.onnx')
+    if os.path.exists(dstDir+'temp.onnx.data'):
+        os.remove(dstDir+'temp.onnx.data')
+
 
     print('ONNX model exported successfully to', dstDir+'model.onnx')
 

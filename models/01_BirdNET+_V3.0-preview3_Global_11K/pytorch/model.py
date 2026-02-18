@@ -679,4 +679,3 @@ class Preprocessing(Layer):
         melSpecTf = tf.transpose(melSpecTf, perm=[0, 2, 3, 1]) # bs,c,h,w --> bs,h,w,c
         
         return melSpecTf
-

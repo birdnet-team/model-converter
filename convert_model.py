@@ -17,7 +17,7 @@ modelDir = os.path.dirname(os.path.abspath(__file__)) + '/models/01_BirdNET+_V3.
 
 # LiteRT models don't yet support dynamic batch size and input length, so we need to specify those here
 batchSize = 1
-segmentDuration = 3.0
+segmentDuration = 3.0 # 3.0 5.0
 
 
 
@@ -222,10 +222,11 @@ def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
 
     return model
 
+
 def createTorchScriptModel():
 
-    # Load model
-    model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False)
+    # Load model and weights
+    model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
     
     scripted_module = torch.jit.script(model)
     dstDir = modelDir + 'torchscript/'
@@ -235,12 +236,10 @@ def createTorchScriptModel():
 
 def createOnnxModel():
 
-    # Load model
-    model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False)
-
+    # Load model and weights
     model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
 
-    # Create dummy input
+    # Create dummy input (but model should be able to handle dynamic batch size and input length, so this is just for export)
     batch_size = 4
     inputBatch = torch.rand(batch_size, int(segmentDuration*model_module.sampleRate)).to(next(model.parameters()).device)
 
@@ -252,11 +251,12 @@ def createOnnxModel():
         inputBatch, 
         dstDir+'temp.onnx', 
         verbose=True, 
-        input_names=['input'],  # needed ?
+        input_names=['input'],
         #output_names=['output'],  # needed ?
-        output_names=['embeddings', 'predictions'],  # needed ?
+        output_names=['embeddings', 'predictions'],
         dynamo=True,
-        dynamic_shapes={'input': {0: 'batch_size', 1: 'samples'}}
+        #dynamic_shapes={'input': {0: 'batch_size', 1: 'samples'}}
+        dynamic_shapes={'input': {0: 'batch_size'}}
     )
 
     # Load model and save wihtout external data format

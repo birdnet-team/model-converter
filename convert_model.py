@@ -1,4 +1,3 @@
-
 import os
 import sys
 import numpy as np
@@ -8,8 +7,9 @@ from tensorflow import keras
 from tensorflow.python.keras.engine.base_layer import Layer
 import torch
 import litert_torch
-
 import onnx
+from onnx import helper, numpy_helper
+from fix_conv2dsame import fix_conv2dsame_padding
 
 
 # Adjust this path to point to the directory containing the PyTorch checkpoint and model definition (model.py)
@@ -17,7 +17,7 @@ modelDir = os.path.dirname(os.path.abspath(__file__)) + '/models/01_BirdNET+_V3.
 
 # LiteRT models don't yet support dynamic batch size and input length, so we need to specify those here
 batchSize = 1
-segmentDuration = 3.0 # 3.0 5.0
+segmentDuration = 5.0 #3.0 # 3.0 5.0
 
 
 
@@ -234,6 +234,201 @@ def createTorchScriptModel():
     scripted_module.save(dstDir + 'model.pt')
     print('TorchScript model saved to', dstDir + 'model.pt')
 
+
+
+def patch_onnx_resize_to_dynamic(model_path, output_path,
+                                  imageWidthResizeFactor=1.5,
+                                  fftHopSizeInSamples=512):
+    """Patch the ONNX model to replace baked-in Resize output sizes with
+    a dynamic computation based on the input 'samples' dimension.
+    
+    The dynamo exporter produces a Resize node whose sizes input is:
+        Concat([batch, channels], [224, 281])
+    where [224, 281] is a constant initializer.
+    
+    We replace [224, 281] with [imageHeight, dynamic_imageWidth] where:
+        dynamic_imageWidth = (imageWidthResizeFactor_num * samples) 
+                             // (imageWidthResizeFactor_den * fftHopSizeInSamples)
+    
+    imageWidthResizeFactor is a float (e.g. 1.5) which is converted to a
+    rational fraction (num/den) so that the computation stays in int64.
+    """
+    from fractions import Fraction
+    frac = Fraction(imageWidthResizeFactor).limit_denominator(1000)
+    imageWidthResizeFactor_num = frac.numerator
+    imageWidthResizeFactor_den = frac.denominator
+    print(f"imageWidthResizeFactor={imageWidthResizeFactor} -> {imageWidthResizeFactor_num}/{imageWidthResizeFactor_den}")
+    
+    model = onnx.load(model_path)
+    graph = model.graph
+    
+    # Build initializer lookup
+    initializers = {}
+    for init in graph.initializer:
+        initializers[init.name] = numpy_helper.to_array(init)
+    
+    # Build output -> node map
+    output_to_node = {}
+    for node in graph.node:
+        for out in node.output:
+            output_to_node[out] = node
+    
+    # Compute expected baked-in values
+    dummy_samples = int(segmentDuration * model_module.sampleRate)
+    expected_imageWidth = int(imageWidthResizeFactor_num * dummy_samples // (imageWidthResizeFactor_den * fftHopSizeInSamples))
+    expected_imageHeight = model_module.imageHeight
+    
+    print(f"Looking for baked-in Resize sizes: [{expected_imageHeight}, {expected_imageWidth}]")
+    
+    # Strategy: Find the initializer containing [224, 281] by searching all initializers,
+    # then trace forward to find which Concat node uses it, then verify that Concat
+    # feeds into a Resize node.
+    
+    target_init_name = None
+    target_concat_node = None
+    target_resize_node = None
+    concat_input_idx = None
+    
+    for init_name, init_val in initializers.items():
+        flat = init_val.flatten().tolist()
+        if len(flat) >= 2 and expected_imageHeight in [int(v) for v in flat] and expected_imageWidth in [int(v) for v in flat]:
+            print(f"Found candidate initializer '{init_name}': {init_val.flatten()}")
+            
+            # Find which node(s) consume this initializer
+            for node in graph.node:
+                if init_name in node.input:
+                    if node.op_type == 'Concat':
+                        # Verify this Concat feeds into a Resize
+                        concat_output = node.output[0]
+                        for resize_candidate in graph.node:
+                            if resize_candidate.op_type == 'Resize' and concat_output in resize_candidate.input:
+                                target_init_name = init_name
+                                target_concat_node = node
+                                target_resize_node = resize_candidate
+                                concat_input_idx = list(node.input).index(init_name)
+                                print(f"  -> feeds into Concat '{node.name}' at input[{concat_input_idx}]")
+                                print(f"  -> which feeds into Resize '{resize_candidate.name}'")
+                                break
+                    elif node.op_type == 'Resize':
+                        # Direct connection (legacy exporter style)
+                        target_init_name = init_name
+                        target_resize_node = node
+                        print(f"  -> directly feeds into Resize '{node.name}'")
+                        break
+                if target_resize_node:
+                    break
+        if target_resize_node:
+            break
+    
+    if target_resize_node is None:
+        print("WARNING: Could not find Resize node with baked-in sizes. Model may already be dynamic.")
+        onnx.save(model, output_path, save_as_external_data=False)
+        return
+    
+    # ========================================================================
+    # Build the dynamic imageWidth computation subgraph
+    # ========================================================================
+    
+    model_input_name = graph.input[0].name  # 'input'
+    prefix = "dynamic_resize_patch"
+    
+    new_nodes = []
+    new_initializers = []
+    
+    # 1. Get input shape: Shape(input) -> [batch, samples]
+    input_shape_name = f"{prefix}/input_shape"
+    new_nodes.append(helper.make_node("Shape", [model_input_name], [input_shape_name]))
+    
+    # 2. Extract samples dimension: Gather(input_shape, 1) -> samples (scalar)
+    samples_dim_name = f"{prefix}/samples_dim"
+    gather_idx_name = f"{prefix}/gather_idx"
+    new_initializers.append(numpy_helper.from_array(
+        np.array(1, dtype=np.int64), name=gather_idx_name))
+    new_nodes.append(helper.make_node("Gather",
+        [input_shape_name, gather_idx_name], [samples_dim_name], axis=0))
+    
+    # 3. Reshape samples to [1] for arithmetic
+    samples_1d_name = f"{prefix}/samples_1d"
+    one_shape_name = f"{prefix}/one_shape"
+    new_initializers.append(numpy_helper.from_array(
+        np.array([1], dtype=np.int64), name=one_shape_name))
+    new_nodes.append(helper.make_node("Reshape",
+        [samples_dim_name, one_shape_name], [samples_1d_name]))
+    
+    # 4. numerator = imageWidthResizeFactor_num * samples
+    numerator_name = f"{prefix}/numerator"
+    num_factor_name = f"{prefix}/num_factor"
+    new_initializers.append(numpy_helper.from_array(
+        np.array([imageWidthResizeFactor_num], dtype=np.int64), name=num_factor_name))
+    new_nodes.append(helper.make_node("Mul",
+        [samples_1d_name, num_factor_name], [numerator_name]))
+    
+    # 5. denominator = imageWidthResizeFactor_den * fftHopSizeInSamples
+    denom_val = imageWidthResizeFactor_den * fftHopSizeInSamples
+    denom_name = f"{prefix}/denom"
+    new_initializers.append(numpy_helper.from_array(
+        np.array([denom_val], dtype=np.int64), name=denom_name))
+    
+    # 6. imageWidth = numerator // denominator (integer floor division)
+    image_width_name = f"{prefix}/image_width"
+    new_nodes.append(helper.make_node("Div",
+        [numerator_name, denom_name], [image_width_name]))
+    
+    # 7. Build replacement: [imageHeight, imageWidth]
+    image_height_name = f"{prefix}/image_height"
+    new_initializers.append(numpy_helper.from_array(
+        np.array([expected_imageHeight], dtype=np.int64), name=image_height_name))
+    
+    dynamic_hw_name = f"{prefix}/dynamic_hw"
+    new_nodes.append(helper.make_node("Concat",
+        [image_height_name, image_width_name], [dynamic_hw_name], axis=0))
+    
+    # ========================================================================
+    # Wire it up
+    # ========================================================================
+    
+    if target_concat_node is not None:
+        # Dynamo style: replace the input to the Concat node
+        target_concat_node.input[concat_input_idx] = dynamic_hw_name
+        print(f"  Replaced Concat input[{concat_input_idx}] '{target_init_name}' -> '{dynamic_hw_name}'")
+    else:
+        # Legacy style: replace the input to the Resize node directly
+        for i, inp_name in enumerate(target_resize_node.input):
+            if inp_name == target_init_name:
+                target_resize_node.input[i] = dynamic_hw_name
+                print(f"  Replaced Resize input[{i}] '{target_init_name}' -> '{dynamic_hw_name}'")
+                break
+    
+    # Remove old initializer
+    for init in list(graph.initializer):
+        if init.name == target_init_name:
+            graph.initializer.remove(init)
+            print(f"  Removed old initializer '{target_init_name}'")
+            break
+    
+    # Insert new nodes before the target (Concat or Resize)
+    target_node = target_concat_node if target_concat_node else target_resize_node
+    insert_idx = list(graph.node).index(target_node)
+    for i, node in enumerate(new_nodes):
+        graph.node.insert(insert_idx + i, node)
+    
+    for init in new_initializers:
+        graph.initializer.append(init)
+    
+    # Validate
+    print("\nValidating patched model...")
+    try:
+        onnx.checker.check_model(model)
+        print("  ✅ Model is valid")
+    except Exception as e:
+        print(f"  ⚠️  Validation warning: {e}")
+    
+    # Save
+    onnx.save(model, output_path, save_as_external_data=False)
+    print(f"\nPatched model saved to {output_path}")
+
+
+
 def createOnnxModel():
 
     # Load model and weights
@@ -247,29 +442,49 @@ def createOnnxModel():
     os.makedirs(dstDir, exist_ok=True)
 
     torch.onnx.export(
-        model,  # Use original model, not scripted_module
+        model,
         inputBatch, 
         dstDir+'temp.onnx', 
         verbose=True, 
         input_names=['input'],
-        #output_names=['output'],  # needed ?
         output_names=['embeddings', 'predictions'],
         dynamo=True,
         dynamic_shapes={'input': {0: 'batch_size', 1: 'samples'}}
-        #dynamic_shapes={'input': {0: 'batch_size'}}
     )
 
     # Load model and save without external data format
     onnxModel = onnx.load(dstDir+'temp.onnx')
-    onnx.save(onnxModel, dstDir+'model.onnx', save_as_external_data=False)
+    onnx.save(onnxModel, dstDir+'model_static_resize.onnx', save_as_external_data=False)
+
+    print('ONNX model (static resize) exported to', dstDir+'model_static_resize.onnx')
+
+    # Patch Resize node to be dynamic
+    patch_onnx_resize_to_dynamic(
+        dstDir+'model_static_resize.onnx',
+        dstDir+'model.onnx',
+        imageWidthResizeFactor=model_module.imageWidthResizeFactor,
+        fftHopSizeInSamples=model_module.fftHopSizeInSamples
+    )
+
+    print('ONNX model (dynamic resize) exported to', dstDir+'model.onnx')
+
+    # Fix Conv2dSame baked padding for dynamic input sizes
+    onnx_path = dstDir + 'model.onnx'
+    onnx_model = onnx.load(onnx_path)
+    n_fixed = fix_conv2dsame_padding(onnx_model)
+    if n_fixed > 0:
+        onnx.save(onnx_model, onnx_path, save_as_external_data=False)
+        print(f'Fixed {n_fixed} Conv2dSame node(s) with baked padding in {onnx_path}')
+    else:
+        print('No Conv2dSame padding issues found (model may not use Conv2dSame)')
+
+    # Cleanup temp files
     if os.path.exists(dstDir+'temp.onnx'):
         os.remove(dstDir+'temp.onnx')
     if os.path.exists(dstDir+'temp.onnx.data'):
         os.remove(dstDir+'temp.onnx.data')
-
-
-    print('ONNX model exported successfully to', dstDir+'model.onnx')
-
+    if os.path.exists(dstDir+'model_static_resize.onnx'):
+        os.remove(dstDir+'model_static_resize.onnx')
 
 ###########################################################################################
 ###########################################################################################

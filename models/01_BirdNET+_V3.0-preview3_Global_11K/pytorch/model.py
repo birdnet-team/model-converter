@@ -378,6 +378,44 @@ class PreprocessingLayerTorch(nn.Module):
             antialias=False
         )
         
+        # # Compute imageWidth dynamically — use scale_factor instead of size
+        # # This avoids baking in a constant output size; ONNX Resize will use
+        # # scales relative to the input, which adapts to any input length.
+        # scale_h = self.imageHeight / melSpec.shape[2]  # target_h / current_h
+        # scale_w = self.imageWidthResizeFactor * sampleVec.shape[1] / (self.fftHopSizeInSamples * melSpec.shape[3])
+
+        # melSpec = torch.nn.functional.interpolate(
+        #     melSpec,
+        #     scale_factor=(scale_h, scale_w),
+        #     mode='bilinear',
+        #     align_corners=False,
+        #     antialias=False
+        # )
+
+
+        # # Compute imageWidth dynamically using integer tensor arithmetic
+        # # so that dynamo export preserves it as a dynamic computation
+        # imageWidth = torch.div(
+        #     torch.tensor(self.imageWidthResizeFactor, dtype=torch.float32, device=sampleVec.device) * sampleVec.shape[1],
+        #     self.fftHopSizeInSamples,
+        #     rounding_mode='trunc'
+        # )
+        # imageWidth = imageWidth.to(torch.int64)
+
+        # # Use size= with a list of ints for interpolate
+        # # .item() converts tensor to Python int — during dynamo tracing this
+        # # is captured as a dynamic symbolic expression, NOT constant-folded
+        # melSpec = torch.nn.functional.interpolate(
+        #     melSpec, 
+        #     size=(self.imageHeight, imageWidth.item()), 
+        #     mode='bilinear',
+        #     align_corners=False,
+        #     antialias=False
+        # )
+
+
+
+
         ## Expand and return normalized
         melSpec = melSpec.expand(-1, 3, -1, -1) # Expand to 3 channels: (bs, 1, nFreqs, nFrames) --> (bs, 3, nFreqs, nFrames)
         return (melSpec - self.mean) / self.std  # Manual normalization for onnx export

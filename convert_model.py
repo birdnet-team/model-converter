@@ -10,15 +10,15 @@ import litert_torch
 import onnx
 from onnx import helper, numpy_helper
 from fix_conv2dsame import fix_conv2dsame_padding
+from fix_tflite_reshape import fix_reshape_for_dynamic_batch, verify_fix
 
 
 # Adjust this path to point to the directory containing the PyTorch checkpoint and model definition (model.py)
 modelDir = os.path.dirname(os.path.abspath(__file__)) + '/models/01_BirdNET+_V3.0-preview3_Global_11K/'
 
-# LiteRT models don't yet support dynamic batch size and input length, so we need to specify those here
 batchSize = 1
-segmentDuration = 5.0 #3.0 # 3.0 5.0
-
+# Use smallest duration that should be supported by litert
+segmentDuration = 2.0 #3.0 # 3.0 5.0 
 
 
 # Load model definitions from model.py
@@ -104,60 +104,132 @@ def createTfMainModel(saveKerasModel=False):
     model = loadPytorchModelAndWeights()
 
     imageWidth = int(model_module.imageWidthResizeFactor * segmentDuration * model_module.sampleRate / model_module.fftHopSizeInSamples)
+
+
     inputShape = (batchSize, 3, model_module.imageHeight, imageWidth)
     dtype = np.float32
     testInputNp = np.random.rand(inputShape[0],inputShape[1],inputShape[2],inputShape[3]).astype(dtype)
     testInputTorch = torch.from_numpy(testInputNp)
     sample_inputs = (testInputTorch,)
 
-
-    ## Conversion
+    print(f"Sample input shape: {testInputTorch.shape}")
 
     dstDir = modelDir + 'tf/main/'
+    os.makedirs(dstDir, exist_ok=True)
+
+    staticDir = dstDir + '_static/'
+    os.makedirs(staticDir, exist_ok=True)
+
+
+    ## Step 1: Convert with static shapes via litert_torch
+
+    print("Step 1: Converting PyTorch model to static TF SavedModel...")
 
     edge_model = litert_torch.convert(
-        model, 
-        sample_inputs, 
-        _saved_model_dir=dstDir
+        model,
+        sample_inputs,
+        _saved_model_dir=staticDir,
     )
 
-    # Export TFLite model
-    dstPath = dstDir + 'model.tflite'
-    edge_model.export(dstPath)
-    print('Exported main tflite model to', dstPath)
+    print("  Static conversion complete.")
 
 
-    ## Get optimized TFLite model
 
-    # # Use litert_torch to create optimized TFLite model
-    # edge_model = litert_torch.convert(
-    #     model, 
-    #     sample_inputs, 
-    #     _ai_edge_converter_flags={'optimizations': [tf.lite.Optimize.DEFAULT]},
-    #     _saved_model_dir=dstDir
-    # )
-    # dstPath = dstDir + 'model_optimized.tflite'
-    # edge_model.export(dstPath)
-    # print('Exported optimized main tflite model to', dstPath)
+    ## Step 2: Re-wrap the SavedModel with dynamic input signatures
 
-    # Use saved model and TFLiteConverter to create optimized TFLite model
-    converter = tf.lite.TFLiteConverter.from_saved_model(dstDir)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
-    dstPath = dstDir + 'model_optimized.tflite'
-    with open(dstPath, 'wb') as f: f.write(tflite_model)
-    print('Exported optimized main tflite model to', dstPath)
+    print("Step 2: Re-wrapping SavedModel with dynamic input signatures...")
+
+    static_model = tf.saved_model.load(staticDir)
+    static_fn = static_model.signatures['serving_default']
+
+    input_keys = list(static_fn.structured_input_signature[1].keys())
+    print(f"  Static signature input keys: {input_keys}")
+
+    output_keys = list(static_fn.structured_outputs.keys())
+    print(f"  Static signature output keys: {output_keys}")
+
+    class DynamicWrapper(tf.Module):
+        def __init__(self, static_model, static_fn):
+            super().__init__()
+            self._static_model = static_model
+            self._fn = static_fn
+
+        @tf.function(input_signature=[
+            tf.TensorSpec(shape=[None, 3, model_module.imageHeight, None], dtype=tf.float32)
+        ])
+        def serve(self, x):
+            result = self._fn(**{input_keys[0]: x})
+            return result[output_keys[0]]
+
+    wrapper = DynamicWrapper(static_model, static_fn)
+
+    # Trace with concrete input
+    test_input_tf = tf.constant(testInputNp)
+    _ = wrapper.serve(test_input_tf)
+
+    # Save with dynamic signature
+    tf.saved_model.save(
+        wrapper,
+        dstDir,
+        signatures={'serving_default': wrapper.serve}
+    )
+
+    print(f"  Dynamic SavedModel saved to {dstDir}")
+
+    # Verify
+    loaded = tf.saved_model.load(dstDir)
+    sig = loaded.signatures['serving_default']
+    input_specs = sig.structured_input_signature
+    if input_specs and len(input_specs) > 1 and input_specs[1]:
+        for name, spec in input_specs[1].items():
+            dynamic_dims = [i for i, s in enumerate(spec.shape) if s is None]
+            print(f"  SavedModel input '{name}': shape={spec.shape} "
+                  f"{'✅ dynamic: ' + str(dynamic_dims) if dynamic_dims else '⚠️ static'}")
+
+
+    ## Step 3: Convert dynamic SavedModel to TFLite and fix static Reshape ops
+
+    def _convert_and_fix_tflite(saved_model_dir, tflite_path, optimize=False):
+        """Convert SavedModel to TFLite, then fix static Reshape for dynamic batch."""
+        converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+        if optimize:
+            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        tflite_model = converter.convert()
+        with open(tflite_path, 'wb') as f:
+            f.write(tflite_model)
+        label = 'optimized ' if optimize else ''
+        print(f"  Exported {label}TFLite model to {tflite_path}")
+
+        print(f"  Fixing static Reshape nodes for dynamic batch...")
+        n_fixed = fix_reshape_for_dynamic_batch(tflite_path)
+        if n_fixed > 0:
+            verify_fix(tflite_path, model_module.imageHeight, imageWidth)
+
+    print("Step 3: Converting and fixing TFLite models...")
+    _convert_and_fix_tflite(dstDir, dstDir + 'model.tflite', optimize=False)
+    _convert_and_fix_tflite(dstDir, dstDir + 'model_optimized.tflite', optimize=True)
+
+
+    ## Cleanup
+    import shutil
+    if os.path.exists(staticDir):
+        shutil.rmtree(staticDir)
+        print(f"Cleaned up {staticDir}")
 
 
     ## Save as keras model
     if saveKerasModel:
         dstPath = dstDir + 'model.keras'
-        saved_model = tf.keras.layers.TFSMLayer(dstDir, call_endpoint='serving_default') # Load the saved model
+        saved_model = tf.keras.layers.TFSMLayer(dstDir, call_endpoint='serving_default')
         tf.keras.models.save_model(saved_model, dstPath, overwrite=True)
         print('Exported keras model to', dstPath)
 
-   
+
+
+
 def combineTfModels():
+
+    imageWidth = int(model_module.imageWidthResizeFactor * segmentDuration * model_module.sampleRate / model_module.fftHopSizeInSamples)
 
     ## Wrap both models in a new tf.Model that runs them sequentially
     class CombinedModel(tf.Module):
@@ -166,10 +238,10 @@ def combineTfModels():
             self.pre = pre
             self.main = main
 
-        @tf.function(input_signature=[tf.TensorSpec(shape=[1, 96000], dtype=tf.float32)])
+        @tf.function(input_signature=[tf.TensorSpec(shape=[None, None], dtype=tf.float32)])
         def __call__(self, x):
             pre_out = self.pre.signatures['serving_default'](x)['output_0']
-            # reshape pre_out to match input shape of main model: (1, 224, 281, 3) --> (1, 3, 224, 281)
+            # reshape pre_out to match input shape of main model: (B, 224, W, 3) --> (B, 3, 224, W)
             pre_out = tf.transpose(pre_out, perm=[0, 3, 1, 2])
             main_out = self.main.signatures['serving_default'](pre_out)['output_0']
             return main_out
@@ -190,20 +262,25 @@ def combineTfModels():
     )
     print(f'Combined model saved to {dstDir}')
 
-    ## Convert the combined model to TFLite
-    converter = tf.lite.TFLiteConverter.from_saved_model(dstDir)
-    tflite_model = converter.convert()
-    dstPath = dstDir + 'model.tflite'
-    with open(dstPath, 'wb') as f: f.write(tflite_model)
-    print('Exported combined tflite model to', dstPath)
+    ## Convert to TFLite and fix static Reshape ops for dynamic batch
 
-    ## Get optimized TFLite model
-    converter = tf.lite.TFLiteConverter.from_saved_model(dstDir)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
-    dstPath = dstDir + 'model_optimized.tflite'
-    with open(dstPath, 'wb') as f: f.write(tflite_model)
-    print('Exported combined optimized tflite model to', dstPath)
+    def _convert_and_fix_tflite(saved_model_dir, tflite_path, optimize=False):
+        converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+        if optimize:
+            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        tflite_model = converter.convert()
+        with open(tflite_path, 'wb') as f:
+            f.write(tflite_model)
+        label = 'optimized ' if optimize else ''
+        print(f'  Exported combined {label}TFLite model to {tflite_path}')
+
+        print(f'  Fixing static Reshape nodes for dynamic batch...')
+        n_fixed = fix_reshape_for_dynamic_batch(tflite_path)
+        if n_fixed > 0:
+            verify_fix(tflite_path, model_module.imageHeight, imageWidth)
+
+    _convert_and_fix_tflite(dstDir, dstDir + 'model.tflite', optimize=False)
+    _convert_and_fix_tflite(dstDir, dstDir + 'model_optimized.tflite', optimize=True)
 
 
 def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
@@ -494,7 +571,7 @@ def createOnnxModel():
 if __name__ == '__main__':
 
     createTfPreprocessingModel()
-    createTfMainModel(saveKerasModel=True)
+    createTfMainModel(saveKerasModel=False)
     combineTfModels()
 
     createTorchScriptModel()

@@ -126,7 +126,8 @@ class GeM(torch.nn.Module):
         #print('x.shape', x.shape) # torch.Size([8, 1280, 7, 18]) --> batchsize, channels, height, width
         x = torch.nn.functional.adaptive_avg_pool2d(x.clamp(min=self.eps).pow(self.p), (1,1)).pow(1.0 / self.p)
         #print('self.p', self.p)
-        x = x.view(x.shape[0], x.shape[1])
+        #x = x.view(x.shape[0], x.shape[1]) # old way (bakes batch dim during export)
+        x = x.flatten(start_dim=1) # new way (dynamic batch dim)
         #x = x.view(x.shape[0], -1)
         return x
 
@@ -528,7 +529,7 @@ class MultiHead01WithPreprocessing(nn.Module):
         logitsHead2 = logit
         logitsHead2PerTime = segmentwise_output
 
-        ## Head 3
+        ## Head 3model-converter/models/01_BirdNET+_V3.0-preview3_Global_11K/pytorch/model_bu4.py
 
         #print('self.encoder.forward_features', x.shape)     # torch.Size([48, 1408, 7, 18]) 
         x = torch.mean(features, dim=2)

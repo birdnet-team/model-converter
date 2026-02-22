@@ -169,24 +169,22 @@ class MultiHead01(nn.Module):
         
         self.init_weight()
 
-    ## Custom 1D pooling (for tflite compatibility)
+        # Fixed depthwise conv kernel for avg_pool1d (used by _pool1d_avg)
+        # persistent=False: not saved/loaded from checkpoints (not a learned parameter)
+        self.register_buffer('_avg_kernel', torch.ones(in_features, 1, 3) / 3.0, persistent=False)
+
+    ## 1D pooling — avoiding both SLICE ops and unsupported StableHLO lowerings:
+    ## - F.max_pool1d  → tfl.max_pool_2d ✅ (works natively)
+    ## - F.avg_pool1d  → vhlo.reduce_window ❌ (not supported by TFLite converter)
+    ## - Manual slicing → tfl.slice ❌ (bakes batch=1 during tracing)
+    ## Solution: avg_pool1d via depthwise conv1d with fixed 1/3 weights.
     def _pool1d_avg(self, x):
-        """Manual avg_pool1d with kernel_size=3, stride=1, padding=1.
-        x: [B, C, T]
-        """
-        # Pad with zeros on both sides
-        x_padded = F.pad(x, (1, 1), mode='constant', value=0.0)
-        # Sum 3 neighboring values and divide by 3
-        return (x_padded[:, :, 0:-2] + x_padded[:, :, 1:-1] + x_padded[:, :, 2:]) / 3.0
+        """avg_pool1d via depthwise conv1d with uniform 1/3 weights. x: [B, C, T]"""
+        return F.conv1d(x, self._avg_kernel, padding=1, groups=self._avg_kernel.shape[0])
 
     def _pool1d_max(self, x):
-        """Manual max_pool1d with kernel_size=3, stride=1, padding=1.
-        x: [B, C, T]
-        """
-        # Pad with -inf on both sides
-        x_padded = F.pad(x, (1, 1), mode='constant', value=-1e9)
-        # Max of 3 neighboring values
-        return torch.max(torch.max(x_padded[:, :, 0:-2], x_padded[:, :, 1:-1]), x_padded[:, :, 2:])
+        """max_pool1d with kernel_size=3, stride=1, padding=1. x: [B, C, T]"""
+        return F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
 
 
     
@@ -662,7 +660,10 @@ class Preprocessing(Layer):
         melSpecTf = 10.0 * (tf.math.log(tf.math.maximum(melSpecTf, amin)) / tf.math.log(10.0))
         ref_value = tf.math.abs(ref)
         melSpecTf -= 10.0 * tf.math.log(tf.math.maximum(ref_value, amin)) / tf.math.log(10.0)
-        melSpecTf = tf.math.maximum(melSpecTf, tf.math.reduce_max(melSpecTf) - self.topDb)
+        
+        # Per sample normalization !!!
+        # melSpecTf = tf.math.maximum(melSpecTf, tf.math.reduce_max(melSpecTf) - self.topDb)
+        melSpecTf = tf.math.maximum(melSpecTf, tf.math.reduce_max(melSpecTf, axis=[1, 2], keepdims=True) - self.topDb)
 
         # [bs, n_frames, n_mels] [bs, n_mels, n_frames]
         melSpecTf = tf.transpose(melSpecTf, perm=[0, 2, 1])

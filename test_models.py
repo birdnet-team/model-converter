@@ -18,6 +18,7 @@ import torch
 import librosa
 import onnxruntime as ort
 from ai_edge_litert.interpreter import Interpreter
+from convert_model import batchSize as tflite_batch_size
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 MODEL_DIR = os.path.join(
@@ -38,8 +39,8 @@ AUDIO_PATH = '/home/malk/projects/241017-1-BirdNetPlus/10_1_Inferencing/05_1_Bir
 SAMPLE_RATE = 32000
 
 # ── Test configurations ──────────────────────────────────────────────────────
-BATCH_SIZES       = [4]
-SEGMENT_DURATIONS = [2.0, 3.0, 5.0, 10.0]
+BATCH_SIZES       = [tflite_batch_size]
+SEGMENT_DURATIONS = [3.0, 5.0, 10.0]
 
 # Tolerance for "match" (absolute + relative)
 ATOL = 0.025

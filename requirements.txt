@@ -7,3 +7,10 @@ librosa
 onnx
 onnxruntime-gpu
 onnxscript
+# For inference tests
+pandas
+torchmetrics
+ffmpeg-python
+# For TensorRT
+tensorrt-cu12
+

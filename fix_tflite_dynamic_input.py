@@ -103,7 +103,7 @@ def _patch_int32_in_buffer(buf, val, patched_val, patched_offsets, label=""):
 
 # ─── RESHAPE fix ─────────────────────────────────────────────────────────────
 
-def _find_all_reshape_shapes(interpreter):
+def _find_all_reshape_shapes(interpreter, expected_t_dims):
     """Find all Reshape ops whose shape tensor starts with 1 (static batch)
     and whose input/output are batch-dependent."""
 
@@ -173,11 +173,18 @@ def _find_all_reshape_shapes(interpreter):
         # Note: We now fix batch=1 and make time dynamic.
         # Temporal dimensions we expect (derived from 3.0s window): 7, 9, 14, 281
         if len(shape_val) >= 2 and -1 not in shape_val:
-            for t_dim in [7, 9, 14, 281]:
+            for t_dim in expected_t_dims:
                 if t_dim in shape_val:
                     patched_shape = list(shape_val)
                     # Replace the temporal dimension with -1
-                    patched_shape[list(shape_val).index(t_dim)] = -1
+                    # Since temporal dim is usually the last one, search from the end to avoid replacing frequency bins like 14 or 7.
+                    idx_to_replace = -1
+                    for idx_t in range(len(shape_val)-1, 0, -1):
+                        if shape_val[idx_t] == t_dim:
+                            idx_to_replace = idx_t
+                            break
+                    if idx_to_replace != -1:
+                        patched_shape[idx_to_replace] = -1
                     
                     results.append({
                         'op_idx': op_idx,
@@ -191,10 +198,10 @@ def _find_all_reshape_shapes(interpreter):
     return results
 
 
-def _fix_reshape(buf, interpreter, patched_offsets):
+def _fix_reshape(buf, interpreter, patched_offsets, expected_t_dims):
     """Fix all RESHAPE ops with static batch. Returns number of fixes."""
 
-    reshape_ops = _find_all_reshape_shapes(interpreter)
+    reshape_ops = _find_all_reshape_shapes(interpreter, expected_t_dims)
 
     if not reshape_ops:
         print("  RESHAPE: No ops with static batch found.")
@@ -444,7 +451,7 @@ def _find_all_strided_slice_sizes(interpreter):
     return results
 
 
-def _fix_strided_slice(buf, interpreter, patched_offsets):
+def _fix_strided_slice(buf, interpreter, patched_offsets, expected_t_dims):
     """Fix all STRIDED_SLICE ops with static batch. Returns number of fixes."""
 
     ss_ops = _find_all_strided_slice_sizes(interpreter)
@@ -521,7 +528,7 @@ def _fix_strided_slice(buf, interpreter, patched_offsets):
             
             for i in range(1, len(patched_val)):
                 # If it's a known temporal length from BirdNET models
-                if patched_val[i] in [7, 9, 14, 281]:
+                if patched_val[i] in expected_t_dims:
                     if num_minus_one == 0:
                         patched_val[i] = -1
                         num_minus_one += 1
@@ -570,11 +577,14 @@ def _fix_strided_slice(buf, interpreter, patched_offsets):
 
 # ─── Public API ──────────────────────────────────────────────────────────────
 
-def fix_all_for_dynamic_batch(tflite_path, output_path=None):
+def fix_all_for_dynamic_batch(tflite_path, output_path=None, image_width=281, audio_length=96000, expected_t_dims=None):
     """Apply all dynamic batch fixes (RESHAPE + SLICE + STRIDED_SLICE)
     to a TFLite model. Returns total number of fixes."""
     import tensorflow as tf
 
+    if expected_t_dims is None:
+        expected_t_dims = [7, 9, 14, 281]
+        
     if output_path is None:
         output_path = tflite_path
 
@@ -608,9 +618,9 @@ def fix_all_for_dynamic_batch(tflite_path, output_path=None):
         for i in range(1, ndim):
             if sig[i] == -1 or shape[i] <= 1:
                 if ndim == 4 and i == 3:
-                    new_shape[i] = 281  # Safe default width for EfficientNet
+                    new_shape[i] = image_width  # Dynamic dimension passed in
                 elif ndim == 2 and i == 1:
-                    new_shape[i] = 96000 # Safe default audio length
+                    new_shape[i] = audio_length # Dynamic dimension passed in
                 else:
                     new_shape[i] = max(shape[i], 1)
                 need_resize = True
@@ -625,7 +635,7 @@ def fix_all_for_dynamic_batch(tflite_path, output_path=None):
 
     patched_offsets = set()
 
-    n_reshape = _fix_reshape(buf, interpreter, patched_offsets)
+    n_reshape = _fix_reshape(buf, interpreter, patched_offsets, expected_t_dims)
 
     # NOTE: SLICE and STRIDED_SLICE fixes are intentionally NOT applied here.
     # TFLite does not propagate -1 in SLICE size tensors to output tensor shapes

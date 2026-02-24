@@ -18,7 +18,7 @@ modelDir = os.path.dirname(os.path.abspath(__file__)) + '/models/01_BirdNET+_V3.
 
 batchSize = 1
 # Use smallest duration that should be supported by litert
-segmentDuration = 3.0 # 3.0 5.0 
+segmentDuration = 3.0 
 
 
 # Load model definitions from model.py
@@ -99,8 +99,48 @@ def loadPytorchModelAndWeights():
     return model
 
 
-def createTfMainModel(saveKerasModel=False):
+def get_expected_t_dims():
+    model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
+    device = next(model.parameters()).device
+    
+    def get_shapes_for_duration(duration):
+        frames = int(duration * model_module.sampleRate)
+        input_dummy = torch.rand(1, frames).to(device)
+        shapes = []
+        def hook_fn(module, input, output):
+            if isinstance(output, torch.Tensor):
+                shapes.append(tuple(output.shape))
+        handles = []
+        for name, module in model.named_modules():
+            handles.append(module.register_forward_hook(hook_fn))
+        with torch.no_grad():
+            _ = model(input_dummy)
+        for h in handles:
+            h.remove()
+        return shapes, frames
 
+    # Compare an arbitrary alternate duration (1.0s) against current segmentDuration
+    shapes_1, _ = get_shapes_for_duration(1.0)
+    shapes_curr, frames_curr = get_shapes_for_duration(segmentDuration)
+    
+    t_dims = set()
+    for s1, sc in zip(shapes_1, shapes_curr):
+        if s1 != sc:
+            if len(s1) == len(sc):
+                for d1, dc in zip(s1, sc):
+                    if d1 != dc:
+                        t_dims.add(dc)
+                        
+    # We also add the input seq length explicitly just in case
+    t_dims.add(frames_curr)
+    if 1 in t_dims:
+        t_dims.remove(1)
+        
+    return sorted(list(t_dims))
+
+
+def createTfMainModel(saveKerasModel=False):
+    expected_t_dims = get_expected_t_dims()
     model = loadPytorchModelAndWeights()
 
     imageWidth = int(model_module.imageWidthResizeFactor * segmentDuration * model_module.sampleRate / model_module.fftHopSizeInSamples)
@@ -206,7 +246,8 @@ def createTfMainModel(saveKerasModel=False):
         print(f"  Exported {label}TFLite model to {tflite_path}")
 
         print(f"  Fixing static ops for dynamic batch...")
-        n_fixed = fix_all_for_dynamic_batch(tflite_path)
+        audio_length = int(segmentDuration * model_module.sampleRate)
+        n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
         if n_fixed > 0:
             verify_fix(tflite_path, model_module.imageHeight, imageWidth)
 
@@ -233,7 +274,7 @@ def createTfMainModel(saveKerasModel=False):
 
 
 def combineTfModels():
-
+    expected_t_dims = get_expected_t_dims()
     imageWidth = int(model_module.imageWidthResizeFactor * segmentDuration * model_module.sampleRate / model_module.fftHopSizeInSamples)
 
     # --------------------------------------------------------------------------
@@ -281,7 +322,8 @@ def combineTfModels():
         print(f'  Exported combined {label}TFLite model to {tflite_path}')
 
         print(f'  Fixing static ops for dynamic batch...')
-        n_fixed = fix_all_for_dynamic_batch(tflite_path)
+        audio_length = int(segmentDuration * model_module.sampleRate)
+        n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
         if n_fixed > 0:
             verify_fix(tflite_path, model_module.imageHeight, imageWidth)
 

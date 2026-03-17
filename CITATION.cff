@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: BirdNET Model Converter
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - family-names: Lasseck
+    given-names: Mario
+  - family-names: Haupt
+    given-names: Josef
+  - family-names: Mauermann
+    given-names: Max
+  - family-names: Wood
+    given-names: Connor
+  - family-names: Klinck
+    given-names: Holger
+  - family-names: Kahl
+    given-names: Stefan
+abstract: >-
+  Scripts and tools to convert BirdNET V3.0 PyTorch
+  audio classification models into TensorFlow/LiteRT,
+  TorchScript, and ONNX formats with support for
+  dynamic input lengths and batch sizes.
+license: MIT
+url: https://github.com/birdnet-team/model-converter
+year: 2026

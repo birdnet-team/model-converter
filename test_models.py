@@ -10,6 +10,7 @@ All models take raw audio [batch, samples].
 - LiteRT part  → predictions   (preprocessing tflite + main optimised tflite)
 """
 
+import argparse
 import os
 import sys
 import time
@@ -18,46 +19,30 @@ import torch
 import librosa
 import onnxruntime as ort
 from ai_edge_litert.interpreter import Interpreter
-from convert_model import batchSize as tflite_batch_size
-
-# ── Paths ────────────────────────────────────────────────────────────────────
-MODEL_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    'models', '01_BirdNET+_V3.0-preview3_Global_11K'
-)
-TORCHSCRIPT_PATH = os.path.join(MODEL_DIR, 'torchscript', 'model.pt')
-ONNX_PATH        = os.path.join(MODEL_DIR, 'onnx', 'model.onnx')          # Set to None to skip
-TFLITE_PATH      = os.path.join(MODEL_DIR, 'tf', 'combined', 'model.tflite')  # Set to None to skip
-TFLITE_OPT_PATH  = os.path.join(MODEL_DIR, 'tf', 'combined', 'model_optimized.tflite')  # Set to None to skip
-
-# Partly optimised: unoptimised preprocessing + optimised main (set both to None to skip)
-TFLITE_PRE_PATH      = os.path.join(MODEL_DIR, 'tf', 'preprocessing', 'model.tflite')  # Set to None to skip
-TFLITE_MAIN_OPT_PATH = os.path.join(MODEL_DIR, 'tf', 'main', 'model_optimized.tflite')  # Set to None to skip
-
-AUDIO_PATH = '/home/malk/projects/241017-1-BirdNetPlus/10_1_Inferencing/05_1_BirdNetPlusInference/birdnetplus-inference/example/LusMeg00027.mp3'
 
 SAMPLE_RATE = 32000
-
-# ── Test configurations ──────────────────────────────────────────────────────
-BATCH_SIZES       = [tflite_batch_size]
-SEGMENT_DURATIONS = [3.0, 5.0, 10.0]
+DEFAULT_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'export')
+DEFAULT_AUDIO = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'example', 'soundscape.wav')
 
 # Tolerance for "match" (absolute + relative)
 ATOL = 0.025
 RTOL = 1e-4
 TOP_K = 3
 
-# Device: set to True to run TorchScript and ONNX on GPU (LiteRT stays on CPU)
-USE_GPU = False #torch.cuda.is_available()
-
 
 # ── Audio loading ────────────────────────────────────────────────────────────
 
-def load_audio(duration: float, batch_size: int) -> np.ndarray:
+def load_audio(audio_path: str, duration: float, batch_size: int) -> np.ndarray:
     samples = int(duration * SAMPLE_RATE)
-    audio, sr = librosa.load(AUDIO_PATH, sr=SAMPLE_RATE, duration=duration,
-                             offset=0.0, dtype=np.float32)
-    assert sr == SAMPLE_RATE
+    if audio_path and os.path.isfile(audio_path):
+        audio, sr = librosa.load(audio_path, sr=SAMPLE_RATE, duration=duration,
+                                 offset=0.0, dtype=np.float32)
+        assert sr == SAMPLE_RATE
+    else:
+        if audio_path:
+            print(f"Warning: audio file not found: {audio_path} — using random noise")
+        rng = np.random.default_rng(seed=42)
+        audio = rng.standard_normal(samples).astype(np.float32) * 0.1
     if len(audio) < samples:
         audio = np.pad(audio, (0, samples - len(audio)))
     else:
@@ -154,61 +139,117 @@ def compare_and_print(name: str, ref_out, other_out, duration, batch_size, ref_d
     return 'PASS' if passed else 'FAIL'
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        description='Compare converted model outputs against TorchScript reference.',
+    )
+    parser.add_argument(
+        '-e', '--export-dir',
+        default=DEFAULT_EXPORT_DIR,
+        help='Path to export directory containing converted models (default: export/)',
+    )
+    parser.add_argument(
+        '-a', '--audio',
+        default=DEFAULT_AUDIO,
+        help='Path to audio file for test input (default: example/soundscape.wav).',
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=1,
+        help='Batch size for test inputs (default: 1)',
+    )
+    parser.add_argument(
+        '--durations',
+        type=float,
+        nargs='+',
+        default=[3.0],
+        help='Segment durations in seconds to test (default: 3.0)',
+    )
+    parser.add_argument(
+        '--gpu',
+        action='store_true',
+        help='Use GPU for TorchScript and ONNX (LiteRT always runs on CPU)',
+    )
+    return parser
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    device = 'cuda' if USE_GPU else 'cpu'
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    export_dir = os.path.abspath(args.export_dir)
+    audio_path = args.audio
+    batch_sizes = [args.batch_size]
+    durations = args.durations
+    use_gpu = args.gpu and torch.cuda.is_available()
+    device = 'cuda' if use_gpu else 'cpu'
+
+    # Derive model paths from export directory
+    torchscript_path = os.path.join(export_dir, 'torchscript', 'model.pt')
+    onnx_path = os.path.join(export_dir, 'onnx', 'model.onnx')
+    tflite_path = os.path.join(export_dir, 'tf', 'combined', 'model.tflite')
+    tflite_opt_path = os.path.join(export_dir, 'tf', 'combined', 'model_optimized.tflite')
+    tflite_pre_path = os.path.join(export_dir, 'tf', 'preprocessing', 'model.tflite')
+    tflite_main_opt_path = os.path.join(export_dir, 'tf', 'main', 'model_optimized.tflite')
+
+    audio_label = audio_path if audio_path else 'random noise (seed=42)'
     print(f"Model comparison (reference: TorchScript)  |  atol={ATOL}  rtol={RTOL}  top-{TOP_K}")
-    print(f"Device: {device}" + (f"  ({torch.cuda.get_device_name()})" if USE_GPU else ""))
-    print(f"Audio: {AUDIO_PATH}\n")
+    print(f"Device: {device}" + (f"  ({torch.cuda.get_device_name()})" if use_gpu else ""))
+    print(f"Audio: {audio_label}")
+    print(f"Export dir: {export_dir}\n")
 
     # Check which models exist
     models = {}
 
     print("Loading models...", flush=True)
 
-    print(f"  TorchScript: {TORCHSCRIPT_PATH}")
-    ts_model = torch.jit.load(TORCHSCRIPT_PATH, map_location=device)
+    if not os.path.exists(torchscript_path):
+        sys.exit(f'Error: TorchScript reference not found at {torchscript_path}')
+    print(f"  TorchScript: {torchscript_path}")
+    ts_model = torch.jit.load(torchscript_path, map_location=device)
     ts_model.eval()
     models['TS'] = ts_model
 
-    if ONNX_PATH and os.path.exists(ONNX_PATH):
+    if os.path.exists(onnx_path):
         onnx_providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
-                          if USE_GPU else ['CPUExecutionProvider'])
-        print(f"  ONNX:        {ONNX_PATH}  (providers: {onnx_providers[0]})")
-        onnx_session = ort.InferenceSession(ONNX_PATH, providers=onnx_providers)
+                          if use_gpu else ['CPUExecutionProvider'])
+        print(f"  ONNX:        {onnx_path}  (providers: {onnx_providers[0]})")
+        onnx_session = ort.InferenceSession(onnx_path, providers=onnx_providers)
         models['ONNX'] = onnx_session
     else:
-        print(f"  ONNX:        {'SKIPPED' if not ONNX_PATH else 'NOT FOUND'}")
+        print(f"  ONNX:        NOT FOUND — skipping")
 
-    if TFLITE_PATH and os.path.exists(TFLITE_PATH):
-        print(f"  LiteRT:      {TFLITE_PATH}")
-        models['LiteRT'] = TFLITE_PATH
+    if os.path.exists(tflite_path):
+        print(f"  LiteRT:      {tflite_path}")
+        models['LiteRT'] = tflite_path
     else:
-        print(f"  LiteRT:      {'SKIPPED' if not TFLITE_PATH else 'NOT FOUND'}")
+        print(f"  LiteRT:      NOT FOUND — skipping")
 
-    if (TFLITE_PRE_PATH and TFLITE_MAIN_OPT_PATH
-            and os.path.exists(TFLITE_PRE_PATH) and os.path.exists(TFLITE_MAIN_OPT_PATH)):
-        print(f"  LiteRT part: {TFLITE_PRE_PATH}")
-        print(f"             + {TFLITE_MAIN_OPT_PATH}")
-        models['LRTpart'] = (TFLITE_PRE_PATH, TFLITE_MAIN_OPT_PATH)
+    if os.path.exists(tflite_pre_path) and os.path.exists(tflite_main_opt_path):
+        print(f"  LiteRT part: {tflite_pre_path}")
+        print(f"             + {tflite_main_opt_path}")
+        models['LRTpart'] = (tflite_pre_path, tflite_main_opt_path)
     else:
-        skip = not TFLITE_PRE_PATH or not TFLITE_MAIN_OPT_PATH
-        print(f"  LiteRT part: {'SKIPPED' if skip else 'NOT FOUND'}")
+        print(f"  LiteRT part: NOT FOUND — skipping")
 
-    if TFLITE_OPT_PATH and os.path.exists(TFLITE_OPT_PATH):
-        print(f"  LiteRT opt:  {TFLITE_OPT_PATH}")
-        models['LiteRTopt'] = TFLITE_OPT_PATH
+    if os.path.exists(tflite_opt_path):
+        print(f"  LiteRT opt:  {tflite_opt_path}")
+        models['LiteRTopt'] = tflite_opt_path
     else:
-        print(f"  LiteRT opt:  {'SKIPPED' if not TFLITE_OPT_PATH else 'NOT FOUND'}")
+        print(f"  LiteRT opt:  NOT FOUND — skipping")
 
     print("done.\n")
 
     results = []
 
-    for duration in SEGMENT_DURATIONS:
-        for batch_size in BATCH_SIZES:
-            audio = load_audio(duration, batch_size)
+    for duration in durations:
+        for batch_size in batch_sizes:
+            audio = load_audio(audio_path, duration, batch_size)
             ts_out, ts_dt = run_torchscript(ts_model, audio, device)
 
             # ONNX

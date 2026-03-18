@@ -23,12 +23,15 @@
 
 This repository contains scripts to convert BirdNET V3.0 PyTorch models (EfficientNetV2-S backbone, multi-head architecture, ~11K species) into deployment-ready formats:
 
-| Format | Script | Output |
-|---|---|---|
-| TensorFlow SavedModel | `convert_model.py` | `export/tf/` |
-| TFLite / LiteRT | `convert_model.py` | `export/tf/**/*.tflite` |
-| TorchScript | `convert_model.py` | `export/torchscript/model.pt` |
-| ONNX | `convert_model.py` | `export/onnx/model.onnx` |
+| Format | Output (FP32) | FP16 | INT8 |
+|---|---|---|---|
+| TF SavedModel (preprocessing) | `export/tf/preprocessing/` | — | — |
+| TF SavedModel (main) | `export/tf/main/` | — | — |
+| TFLite — preprocessing | `export/tf/preprocessing/model.tflite` | — | — |
+| TFLite — main (spectrogram in) | `export/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` |
+| TFLite — combined (audio in) | `export/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` |
+| TorchScript | `export/torchscript/model.pt` | `model_fp16.pt` | — |
+| ONNX | `export/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` |
 
 Additional utilities:
 
@@ -75,7 +78,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-Convert the PyTorch model to all supported formats:
+Convert the PyTorch model to all supported formats and precisions:
 
 ```bash
 python convert_model.py
@@ -94,6 +97,24 @@ python convert_model.py -f onnx torchscript
 python convert_model.py -f tf tflite
 ```
 
+Export FP32 only (skip FP16 and INT8):
+
+```bash
+python convert_model.py -p fp32
+```
+
+Export only ONNX in FP16:
+
+```bash
+python convert_model.py -f onnx -p fp16
+```
+
+Use a custom audio file for INT8 calibration (TFLite):
+
+```bash
+python convert_model.py -p int8 --calibration-audio path/to/audio.wav
+```
+
 Use a different model directory:
 
 ```bash
@@ -110,6 +131,7 @@ python convert_model.py --list-models
 
 ```
 usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
+                        [-p PREC [PREC ...]] [--calibration-audio FILE]
                         [--batch-size BATCH_SIZE]
                         [--segment-duration SEGMENT_DURATION]
                         [--list-models]
@@ -117,10 +139,25 @@ usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
   -m, --model-dir          Path to model directory (default: models/01_BirdNET+_...)
   -o, --output-dir         Directory for converted model output (default: export/)
   -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
+  -p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)
+      --calibration-audio  Audio file for INT8 calibration (default: example/soundscape.wav)
       --batch-size          Batch size baked into TFLite models (default: 1)
       --segment-duration    Min audio segment duration in seconds for tracing (default: 3.0)
       --list-models         List available models and exit
 ```
+
+### Precision Variants
+
+By default all precision variants are exported. Use `-p` to select specific ones:
+
+| Precision | Method | Notes |
+|---|---|---|
+| `fp32` | Standard export | Full precision, used as reference |
+| `fp16` | Weight conversion to float16 | ~2× smaller, minimal accuracy loss |
+| `int8` | Dynamic quantization (ONNX, TorchScript) / representative-dataset quantization (TFLite) | **Currently unstable** — ~4× smaller but significant accuracy loss; not recommended at the moment |
+
+For TFLite INT8, calibration data is generated from an audio file (default: `example/soundscape.wav`).
+Pass `--calibration-audio` to use a different file.
 
 ### Conversion Pipeline
 
@@ -128,9 +165,13 @@ The full pipeline (`-f tf tflite torchscript onnx`) runs these steps:
 
 1. **TF Preprocessing** — Exports the mel-spectrogram preprocessing as a standalone TF SavedModel and TFLite model.
 2. **TF Main Model** — Converts the classifier via `litert_torch`, re-wraps with dynamic input signatures, and exports to TFLite.
-3. **TF Combined** — Chains preprocessing + main model into a single end-to-end TFLite model.
+3. **TF Combined** — Chains preprocessing + main model into a single end-to-end TFLite model (audio → predictions).
 4. **TorchScript** — Exports the full model (with preprocessing) via `torch.jit.script`.
 5. **ONNX** — Exports via `torch.onnx.export` with `dynamo=True`, then patches Resize and Conv2dSame ops for dynamic inputs.
+
+The TFLite preprocessing and main models are exported **separately** in addition to the combined model.
+This lets users plug in their own spectrogram pipeline or run the classifier independently —
+for example, pre-computing spectrograms on a server and sending only the images to an edge device running the main model.
 
 ### Testing Converted Models
 
@@ -166,10 +207,11 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 ```
 
 > **Interpreting results:** The test compares each format against TorchScript using a tight tolerance (`atol=0.025`).
-> ONNX and unoptimized LiteRT (combined) should pass at the default 3.0s duration.
-> The **optimized** TFLite variants (`LiteRTopt`, `LRTpart`) use quantization or mixed pipelines that introduce
-> larger numerical differences — failures for these are expected and do not indicate broken models.
-> Check that the top predicted species still match even when `max_diff` exceeds the threshold.
+> ONNX and LiteRT (combined) should pass at the default 3.0s duration.
+> **FP16** variants typically show slightly larger differences but should still pass.
+> **INT8** variants are **unstable** — dynamic quantization introduces severe numerical
+> differences that change the top predicted species entirely. INT8 is included as an
+> experimental option and is **not recommended** for production use.
 
 ## License
 

@@ -31,7 +31,8 @@ The BirdNET V3.0 model uses:
   - `litert_torch` traces with static shapes; the TFLite fix script patches RESHAPE/SLICE shape tensors afterward.
   - ONNX `torch.export` bakes Conv2dSame padding and Resize output sizes; separate fix scripts patch these.
 - **TFLite limitations:** `F.avg_pool1d` lowers to unsupported StableHLO ops; the model uses depthwise conv1d as a workaround.
-- **Preprocessing is split:** TF uses a Keras `Layer` for preprocessing (exported separately), while TorchScript/ONNX use the PyTorch `PreprocessingLayerTorch`.
+- **Preprocessing is split:** TF exports three TFLite variants: preprocessing-only (spectrogram), main-only (classifier, spectrogram input), and combined (audio → predictions). The split lets users swap in their own spectrogram pipeline or run classifier on pre-computed spectrograms. TorchScript/ONNX use the PyTorch `PreprocessingLayerTorch` and export end-to-end.
+- **Precision variants:** The converter supports `fp32`, `fp16`, and `int8` exports for TFLite, TorchScript, and ONNX. TFLite INT8 uses representative-dataset quantization (calibration audio). ONNX and TorchScript use dynamic quantization for INT8. **INT8 is unstable** — dynamic quantization introduces severe accuracy loss and is not recommended for production.
 
 ## Coding Conventions
 
@@ -46,3 +47,4 @@ The BirdNET V3.0 model uses:
 - Be aware that `torch.export` / `litert_torch` / `tf.lite.TFLiteConverter` each have their own quirks with dynamic shapes.
 - The fix scripts (`fix_conv2dsame.py`, `fix_tflite_dynamic_input.py`) operate on raw model bytes/graphs — changes here need careful testing.
 - Model definitions live inside `models/.../pytorch/model.py`, not at the repo root.
+- FP16/INT8 variants are generated alongside FP32 when requested via `-p`. Changes to the conversion functions must handle all precision paths.

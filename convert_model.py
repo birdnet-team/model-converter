@@ -15,6 +15,7 @@ from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
+ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
 DEFAULT_MODEL_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     'models', '01_BirdNET+_V3.0-preview3_Global_11K'
@@ -24,22 +25,32 @@ DEFAULT_OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'export'
 )
 
+DEFAULT_CALIBRATION_AUDIO = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'example', 'soundscape.wav'
+)
+
 # Module-level state (set by _init_config, read by conversion functions)
 modelDir = DEFAULT_MODEL_DIR + '/'
 outputDir = DEFAULT_OUTPUT_DIR + '/'
 batchSize = 1
 segmentDuration = 3.0
+precisions = set(ALL_PRECISIONS)  # default: all precisions
+calibrationAudioPath = DEFAULT_CALIBRATION_AUDIO
 model_module = None
 
 
-def _init_config(model_dir, output_dir, batch_size, segment_duration):
+def _init_config(model_dir, output_dir, batch_size, segment_duration,
+                 precision_set=None, calibration_audio=None):
     """Initialise module-level config and load the model definition module."""
     global modelDir, outputDir, batchSize, segmentDuration, model_module
+    global precisions, calibrationAudioPath
 
     modelDir = model_dir.rstrip('/') + '/'
     outputDir = output_dir.rstrip('/') + '/'
     batchSize = batch_size
     segmentDuration = segment_duration
+    precisions = precision_set if precision_set else set(ALL_PRECISIONS)
+    calibrationAudioPath = calibration_audio or DEFAULT_CALIBRATION_AUDIO
 
     model_module_path = os.path.join(modelDir, 'pytorch', 'model.py')
     if not os.path.isfile(model_module_path):
@@ -53,7 +64,14 @@ def _init_config(model_dir, output_dir, batch_size, segment_duration):
 
 
 def createTfPreprocessingModel():
+    """Export the mel-spectrogram preprocessing layer as a TF SavedModel and TFLite.
 
+    Builds a Keras model around the model_module.Preprocessing layer, saves it
+    as a TF SavedModel, then converts to TFLite.  Supports dynamic input length
+    when allow_dynamic_input_length is True (default).
+
+    Output: ``{outputDir}/tf/preprocessing/`` (SavedModel + model.tflite)
+    """
     allow_dynamic_input_length = True
     batch_size = batchSize
 
@@ -97,18 +115,13 @@ def createTfPreprocessingModel():
         f.write(tflite_model)
     print('Exported preprocessing tflite model to', dstPath)
 
-
-    # Works but leads to quite hight differences (Max absolute difference: 8.590895)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
-    dstPath = dstDir + 'model_optimized.tflite'
-    with open(dstPath, 'wb') as f:
-        f.write(tflite_model)
-    print('Exported optimized preprocessing tflite model to', dstPath)
-
     
 def loadPytorchModelAndWeights():
+    """Load the MultiHead01 classifier (without preprocessing) and its checkpoint weights.
 
+    Returns:
+        torch.nn.Module: The model in eval mode on CPU.
+    """
     # Load model
     model = model_module.MultiHead01(model_module.backbone, model_module.nClasses, pretrained=False)
 
@@ -123,6 +136,16 @@ def loadPytorchModelAndWeights():
 
 
 def get_expected_t_dims():
+    """Discover temporal dimension sizes that change with input duration.
+
+    Runs the full model at two durations (1.0 s and ``segmentDuration``) and
+    collects every intermediate tensor shape.  Any dimension that differs
+    between the two runs is considered time-dependent and returned so that
+    ``fix_tflite_dynamic_input`` can patch static RESHAPE/SLICE tensors.
+
+    Returns:
+        list[int]: Sorted list of temporal dimension sizes at ``segmentDuration``.
+    """
     model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
     device = next(model.parameters()).device
     
@@ -163,6 +186,21 @@ def get_expected_t_dims():
 
 
 def createTfMainModel(saveKerasModel=False):
+    """Convert the classifier to a TF SavedModel and TFLite (spectrogram input).
+
+    Steps:
+        1. Convert the PyTorch classifier to a static TF SavedModel via litert_torch.
+        2. Re-wrap the SavedModel with a dynamic temporal dimension.
+        3. Export to TFLite (fp32, and optionally fp16/int8) and fix static ops.
+
+    For INT8 calibration the preprocessing model is loaded to generate realistic
+    spectrogram data from ``calibrationAudioPath``.
+
+    Args:
+        saveKerasModel: If True, also save a ``.keras`` file.
+
+    Output: ``{outputDir}/tf/main/`` (SavedModel + TFLite variants)
+    """
     expected_t_dims = get_expected_t_dims()
     model = loadPytorchModelAndWeights()
 
@@ -257,16 +295,27 @@ def createTfMainModel(saveKerasModel=False):
 
     ## Step 3: Convert dynamic SavedModel to TFLite and fix static Reshape ops
 
-    def _convert_and_fix_tflite(saved_model_dir, tflite_path, optimize=False):
+    def _convert_and_fix_tflite(saved_model_dir, tflite_path,
+                                optimize=False, representative_dataset=None,
+                                supported_types=None):
         """Convert SavedModel to TFLite, then fix static Reshape for dynamic batch."""
         converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
         if optimize:
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        if supported_types:
+            converter.target_spec.supported_types = supported_types
+        if representative_dataset:
+            converter.representative_dataset = representative_dataset
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+            ]
+            converter.inference_input_type = tf.float32
+            converter.inference_output_type = tf.float32
         tflite_model = converter.convert()
         with open(tflite_path, 'wb') as f:
             f.write(tflite_model)
-        label = 'optimized ' if optimize else ''
-        print(f"  Exported {label}TFLite model to {tflite_path}")
+        print(f"  Exported TFLite model to {tflite_path}")
 
         print(f"  Fixing static ops for dynamic batch...")
         audio_length = int(segmentDuration * model_module.sampleRate)
@@ -274,9 +323,69 @@ def createTfMainModel(saveKerasModel=False):
         if n_fixed > 0:
             verify_fix(tflite_path, model_module.imageHeight, imageWidth)
 
+    def _make_representative_dataset():
+        """Generate calibration data for INT8 quantization of the main model.
+
+        The main model expects spectrogram input (batch, 3, height, width).
+        We run the preprocessing on calibration audio to produce realistic
+        spectrogram data, falling back to random if unavailable.
+        """
+        import librosa
+
+        # Try to produce real spectrograms from calibration audio
+        spectrograms = []
+        if os.path.isfile(calibrationAudioPath):
+            audio, _ = librosa.load(calibrationAudioPath, sr=model_module.sampleRate,
+                                    dtype=np.float32)
+            print(f"  INT8 calibration audio: {calibrationAudioPath} "
+                  f"({len(audio)/model_module.sampleRate:.1f}s)")
+            segment_samples = int(segmentDuration * model_module.sampleRate)
+            step = segment_samples // 2
+
+            # Load the TF preprocessing model to convert audio → spectrogram
+            pre_path = outputDir + 'tf/preprocessing/'
+            if os.path.isdir(pre_path):
+                pre_model = tf.saved_model.load(pre_path)
+                pre_fn = pre_model.signatures['serving_default']
+                pre_out_key = list(pre_fn.structured_outputs.keys())[0]
+                for start in range(0, max(1, len(audio) - segment_samples + 1), step):
+                    chunk = audio[start:start + segment_samples]
+                    if len(chunk) < segment_samples:
+                        chunk = np.pad(chunk, (0, segment_samples - len(chunk)))
+                    chunk_tf = tf.constant(chunk.reshape(batchSize, -1), dtype=tf.float32)
+                    spec = pre_fn(chunk_tf)[pre_out_key].numpy()
+                    # spec shape: (B, H, W, 3) → transpose to (B, 3, H, W)
+                    spec = np.transpose(spec, (0, 3, 1, 2))
+                    spectrograms.append(spec.astype(np.float32))
+            else:
+                print(f"  Warning: preprocessing model not found at {pre_path}, "
+                      "using random spectrogram data for calibration")
+        else:
+            print(f"  INT8 calibration: {calibrationAudioPath} not found, "
+                  "using random spectrogram data")
+
+        def representative_dataset():
+            if spectrograms:
+                for spec in spectrograms:
+                    yield [spec]
+            else:
+                rng = np.random.default_rng(seed=42)
+                for _ in range(100):
+                    yield [rng.standard_normal(inputShape).astype(np.float32)]
+
+        return representative_dataset
+
     print("Step 3: Converting and fixing TFLite models...")
-    _convert_and_fix_tflite(dstDir, dstDir + 'model.tflite', optimize=False)
-    _convert_and_fix_tflite(dstDir, dstDir + 'model_optimized.tflite', optimize=True)
+
+    if 'fp32' in precisions:
+        _convert_and_fix_tflite(dstDir, dstDir + 'model.tflite')
+    if 'fp16' in precisions:
+        _convert_and_fix_tflite(dstDir, dstDir + 'model_fp16.tflite',
+                                optimize=True, supported_types=[tf.float16])
+    if 'int8' in precisions:
+        rep_data = _make_representative_dataset()
+        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite',
+                                optimize=True, representative_dataset=rep_data)
 
 
     ## Cleanup
@@ -297,6 +406,14 @@ def createTfMainModel(saveKerasModel=False):
 
 
 def combineTfModels():
+    """Chain the preprocessing and main TF SavedModels into an end-to-end model.
+
+    Loads the previously exported preprocessing and main SavedModels, wraps them
+    in a single ``tf.Module`` that accepts raw audio ``(batch, samples)`` and
+    returns predictions, exports as a TF SavedModel and TFLite variants.
+
+    Output: ``{outputDir}/tf/combined/`` (SavedModel + TFLite variants)
+    """
     expected_t_dims = get_expected_t_dims()
     imageWidth = int(model_module.imageWidthResizeFactor * segmentDuration * model_module.sampleRate / model_module.fftHopSizeInSamples)
 
@@ -334,15 +451,26 @@ def combineTfModels():
 
     ## Convert to TFLite and fix static Reshape ops for dynamic batch
 
-    def _convert_and_fix_tflite(saved_model_dir, tflite_path, optimize=False):
+    def _convert_and_fix_tflite(saved_model_dir, tflite_path,
+                                optimize=False, representative_dataset=None,
+                                supported_types=None):
         converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
         if optimize:
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        if supported_types:
+            converter.target_spec.supported_types = supported_types
+        if representative_dataset:
+            converter.representative_dataset = representative_dataset
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+            ]
+            converter.inference_input_type = tf.float32
+            converter.inference_output_type = tf.float32
         tflite_model = converter.convert()
         with open(tflite_path, 'wb') as f:
             f.write(tflite_model)
-        label = 'optimized ' if optimize else ''
-        print(f'  Exported combined {label}TFLite model to {tflite_path}')
+        print(f'  Exported combined TFLite model to {tflite_path}')
 
         print(f'  Fixing static ops for dynamic batch...')
         audio_length = int(segmentDuration * model_module.sampleRate)
@@ -350,12 +478,55 @@ def combineTfModels():
         if n_fixed > 0:
             verify_fix(tflite_path, model_module.imageHeight, imageWidth)
 
-    _convert_and_fix_tflite(dstDir, dstDir + 'model.tflite', optimize=False)
-    _convert_and_fix_tflite(dstDir, dstDir + 'model_optimized.tflite', optimize=True)
+    def _make_combined_representative_dataset():
+        """Generate calibration data for combined INT8 model (raw audio input)."""
+        import librosa
+        audio = None
+        if os.path.isfile(calibrationAudioPath):
+            audio, _ = librosa.load(calibrationAudioPath, sr=model_module.sampleRate,
+                                    dtype=np.float32)
+            print(f"  INT8 calibration audio: {calibrationAudioPath} "
+                  f"({len(audio)/model_module.sampleRate:.1f}s)")
+        else:
+            print(f"  INT8 calibration: {calibrationAudioPath} not found, using random data")
+
+        segment_samples = int(segmentDuration * model_module.sampleRate)
+
+        def representative_dataset():
+            if audio is not None:
+                step = segment_samples // 2
+                for start in range(0, max(1, len(audio) - segment_samples + 1), step):
+                    chunk = audio[start:start + segment_samples]
+                    if len(chunk) < segment_samples:
+                        chunk = np.pad(chunk, (0, segment_samples - len(chunk)))
+                    yield [chunk.reshape(batchSize, -1).astype(np.float32)]
+            else:
+                rng = np.random.default_rng(seed=42)
+                for _ in range(100):
+                    yield [rng.standard_normal((batchSize, segment_samples)).astype(np.float32)]
+
+        return representative_dataset
+
+    if 'fp32' in precisions:
+        _convert_and_fix_tflite(dstDir, dstDir + 'model.tflite')
+    if 'fp16' in precisions:
+        _convert_and_fix_tflite(dstDir, dstDir + 'model_fp16.tflite',
+                                optimize=True, supported_types=[tf.float16])
+    if 'int8' in precisions:
+        rep_data = _make_combined_representative_dataset()
+        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite',
+                                optimize=True, representative_dataset=rep_data)
 
 
 def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
+    """Load the full model (preprocessing + classifier) and its checkpoint weights.
 
+    Uses ``strict=False`` because the preprocessing layer parameters are not
+    stored in the checkpoint — they are initialised from layer defaults.
+
+    Returns:
+        torch.nn.Module: The model in eval mode on GPU (if available) or CPU.
+    """
     # Load model
     model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False)
 
@@ -372,15 +543,34 @@ def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
 
 
 def createTorchScriptModel():
+    """Export the full model (with preprocessing) to TorchScript.
 
+    Produces one ``.pt`` file per requested precision:
+        - fp32: ``torch.jit.script``
+        - fp16: ``model.half()`` then ``torch.jit.script``
+
+    INT8 is not supported for TorchScript — ``quantize_dynamic`` only covers
+    Linear/Conv1d layers, leaving the EfficientNet Conv2d backbone untouched
+    (460 MB vs 517 MB fp32).
+
+    Output: ``{outputDir}/torchscript/model[_fp16].pt``
+    """
     # Load model and weights
     model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
     
-    scripted_module = torch.jit.script(model)
     dstDir = outputDir + 'torchscript/'
     os.makedirs(dstDir, exist_ok=True)
-    scripted_module.save(dstDir + 'model.pt')
-    print('TorchScript model saved to', dstDir + 'model.pt')
+
+    if 'fp32' in precisions:
+        scripted_module = torch.jit.script(model)
+        scripted_module.save(dstDir + 'model.pt')
+        print('TorchScript model saved to', dstDir + 'model.pt')
+
+    if 'fp16' in precisions:
+        model_fp16 = model.half()
+        scripted_fp16 = torch.jit.script(model_fp16)
+        scripted_fp16.save(dstDir + 'model_fp16.pt')
+        print('TorchScript FP16 model saved to', dstDir + 'model_fp16.pt')
 
 
 
@@ -578,7 +768,17 @@ def patch_onnx_resize_to_dynamic(model_path, output_path,
 
 
 def createOnnxModel():
+    """Export the full model (with preprocessing) to ONNX.
 
+    Uses ``torch.onnx.export`` with ``dynamo=True`` and dynamic shapes for
+    batch and temporal axes, then post-processes the graph:
+        1. Patch Resize nodes to compute output sizes dynamically.
+        2. Fix Conv2dSame nodes with baked static padding.
+        3. Optionally produce fp16 (onnxconverter-common) and int8
+           (onnxruntime dynamic quantization) variants.
+
+    Output: ``{outputDir}/onnx/model[_fp16|_int8].onnx``
+    """
     # Load model and weights
     model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
 
@@ -634,6 +834,70 @@ def createOnnxModel():
     if os.path.exists(dstDir+'model_static_resize.onnx'):
         os.remove(dstDir+'model_static_resize.onnx')
 
+    # FP16 variant
+    if 'fp16' in precisions:
+        from onnxconverter_common import float16
+        from onnx import TensorProto
+        fp32_model = onnx.load(onnx_path)
+        del fp32_model.graph.value_info[:]
+        # Convert entire graph to fp16, then manually wrap I/O with Cast nodes
+        # so the model accepts float32 input and returns float32 output.
+        # (keep_io_types=True is unreliable for ops like Gemm whose outputs
+        # are also consumed internally — it breaks type homogeneity.)
+        fp16_model = float16.convert_float_to_float16(fp32_model)
+        graph = fp16_model.graph
+
+        # Wrap each float16 input: keep graph input as float32, insert
+        # Cast(float32→float16), rename all downstream consumers to the cast output.
+        for inp in graph.input:
+            if inp.type.tensor_type.elem_type == TensorProto.FLOAT16:
+                old_name = inp.name
+                cast_out = old_name + '_cast_fp16'
+                cast_node = helper.make_node('Cast', [old_name], [cast_out],
+                                             to=TensorProto.FLOAT16)
+                for node in graph.node:
+                    for i, n in enumerate(node.input):
+                        if n == old_name:
+                            node.input[i] = cast_out
+                graph.node.insert(0, cast_node)
+                inp.type.tensor_type.elem_type = TensorProto.FLOAT
+
+        # Wrap each float16 output: add Cast(float16→float32) that reads
+        # from the original fp16 tensor and writes to a *new* name, then
+        # point the graph output entry at that new name.  This keeps the
+        # fp16 tensor intact for any internal consumers (e.g. Gemm reading
+        # 'embeddings' while 'embeddings' is also a graph output).
+        for out in graph.output:
+            if out.type.tensor_type.elem_type == TensorProto.FLOAT16:
+                fp16_name = out.name
+                fp32_name = fp16_name + '_fp32'
+                cast_node = helper.make_node('Cast', [fp16_name], [fp32_name],
+                                             to=TensorProto.FLOAT)
+                graph.node.append(cast_node)
+                out.name = fp32_name
+                out.type.tensor_type.elem_type = TensorProto.FLOAT
+
+        fp16_path = dstDir + 'model_fp16.onnx'
+        onnx.save(fp16_model, fp16_path, save_as_external_data=False)
+        print(f'ONNX FP16 model exported to {fp16_path}')
+
+    # INT8 variant (dynamic quantization)
+    if 'int8' in precisions:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+        # Clear stale shape annotations that conflict with our Resize/Conv2dSame
+        # patches — shape inference inside quantize_dynamic will re-derive them.
+        model_for_quant = onnx.load(onnx_path)
+        del model_for_quant.graph.value_info[:]
+        temp_quant_path = dstDir + 'model_pre_quant.onnx'
+        onnx.save(model_for_quant, temp_quant_path, save_as_external_data=False)
+        int8_path = dstDir + 'model_int8.onnx'
+        quantize_dynamic(
+            temp_quant_path, int8_path,
+            weight_type=QuantType.QInt8,
+        )
+        os.remove(temp_quant_path)
+        print(f'ONNX INT8 (dynamic quantization) model exported to {int8_path}')
+
 ###########################################################################################
 ###########################################################################################
 ###########################################################################################
@@ -653,6 +917,7 @@ def _list_models(base_dir):
 
 
 def _build_parser():
+    """Build the argparse parser for the conversion CLI."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     available_models = _list_models(base_dir)
     models_help = ', '.join(available_models) if available_models else '(none found)'
@@ -662,8 +927,11 @@ def _build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'examples:\n'
-            '  %(prog)s                              # convert default model to all formats\n'
+            '  %(prog)s                              # convert default model, all formats, all precisions\n'
             '  %(prog)s -f onnx torchscript           # ONNX + TorchScript only\n'
+            '  %(prog)s -p fp32                        # FP32 only (skip FP16/INT8)\n'
+            '  %(prog)s -f onnx -p fp16               # ONNX FP16 only\n'
+            '  %(prog)s --calibration-audio file.wav   # custom INT8 calibration audio\n'
             '  %(prog)s -m models/my_model             # use a different model directory\n'
             '  %(prog)s -o output/                     # custom output directory\n'
             '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
@@ -701,6 +969,25 @@ def _build_parser():
         help='Batch size baked into TFLite models (default: %(default)s)',
     )
     parser.add_argument(
+        '-p', '--precisions',
+        nargs='+',
+        choices=ALL_PRECISIONS,
+        default=ALL_PRECISIONS,
+        metavar='PREC',
+        help=(
+            'Precision variant(s) to produce. '
+            f'Choose from: {", ".join(ALL_PRECISIONS)} (default: all)'
+        ),
+    )
+    parser.add_argument(
+        '--calibration-audio',
+        default=DEFAULT_CALIBRATION_AUDIO,
+        help=(
+            'Audio file for INT8 calibration data '
+            '(default: %(default)s)'
+        ),
+    )
+    parser.add_argument(
         '--segment-duration',
         type=float,
         default=3.0,
@@ -718,6 +1005,7 @@ def _build_parser():
 
 
 def main():
+    """Entry point: parse CLI arguments, configure globals, and run conversions."""
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -732,15 +1020,19 @@ def main():
             print('No models found in models/.')
         return
 
-    _init_config(args.model_dir, args.output_dir, args.batch_size, args.segment_duration)
+    _init_config(args.model_dir, args.output_dir, args.batch_size, args.segment_duration,
+                 precision_set=set(args.precisions), calibration_audio=args.calibration_audio)
 
     formats = set(args.formats)
 
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')
     print(f'Output format(s):   {", ".join(sorted(formats))}')
+    print(f'Precision(s):       {", ".join(sorted(precisions))}')
     print(f'Batch size:         {batchSize}')
     print(f'Segment duration:   {segmentDuration}s')
+    if 'int8' in precisions:
+        print(f'Calibration audio:  {calibrationAudioPath}')
     print()
 
     if 'tf' in formats or 'tflite' in formats:

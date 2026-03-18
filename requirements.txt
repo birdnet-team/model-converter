@@ -6,6 +6,7 @@ timm
 librosa
 onnx
 onnxruntime-gpu
+onnxconverter-common
 onnxscript
 # For inference tests
 pandas

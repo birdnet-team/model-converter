@@ -1,13 +1,11 @@
 """
-Compare TorchScript (reference) against ONNX, LiteRT, and LiteRT optimized
+Compare TorchScript (reference) against ONNX, LiteRT, and quantized/reduced-precision
 model outputs across different batch sizes and segment durations.
 
 All models take raw audio [batch, samples].
 - TorchScript  → (embeddings, predictions)
 - ONNX         → (embeddings, predictions)
 - LiteRT       → predictions   (combined preprocessing + main)
-- LiteRT opt.  → predictions   (combined preprocessing + main, quantised)
-- LiteRT part  → predictions   (preprocessing tflite + main optimised tflite)
 """
 
 import argparse
@@ -33,6 +31,15 @@ TOP_K = 3
 # ── Audio loading ────────────────────────────────────────────────────────────
 
 def load_audio(audio_path: str, duration: float, batch_size: int) -> np.ndarray:
+    """Load or generate an audio batch.
+
+    Reads ``duration`` seconds from ``audio_path`` at 32 kHz, zero-pads or
+    truncates to the exact sample count, and tiles to ``batch_size`` rows.
+    Falls back to deterministic random noise if the file is missing.
+
+    Returns:
+        np.ndarray: Float32 array of shape ``(batch_size, samples)``.
+    """
     samples = int(duration * SAMPLE_RATE)
     if audio_path and os.path.isfile(audio_path):
         audio, sr = librosa.load(audio_path, sr=SAMPLE_RATE, duration=duration,
@@ -53,6 +60,11 @@ def load_audio(audio_path: str, duration: float, batch_size: int) -> np.ndarray:
 # ── Model runners ────────────────────────────────────────────────────────────
 
 def run_torchscript(model, audio_np: np.ndarray, device: str) -> np.ndarray:
+    """Run inference with a TorchScript model.
+
+    Returns:
+        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
+    """
     with torch.no_grad():
         audio_t = torch.from_numpy(audio_np).to(device)
         t0 = time.perf_counter()
@@ -64,6 +76,11 @@ def run_torchscript(model, audio_np: np.ndarray, device: str) -> np.ndarray:
 
 
 def run_onnx(session, audio_np: np.ndarray) -> np.ndarray:
+    """Run inference with an ONNX Runtime session.
+
+    Returns:
+        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
+    """
     input_name = session.get_inputs()[0].name
     t0 = time.perf_counter()
     outputs = session.run(None, {input_name: audio_np})
@@ -73,6 +90,14 @@ def run_onnx(session, audio_np: np.ndarray) -> np.ndarray:
 
 
 def run_tflite(model_path: str, audio_np: np.ndarray) -> np.ndarray:
+    """Run inference with a TFLite/LiteRT model.
+
+    Creates a fresh interpreter, resizes input tensors to match ``audio_np``,
+    and invokes the model.
+
+    Returns:
+        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
+    """
     interpreter = Interpreter(model_path=model_path)
     input_details = interpreter.get_input_details()
     interpreter.resize_tensor_input(input_details[0]['index'], list(audio_np.shape))
@@ -86,39 +111,10 @@ def run_tflite(model_path: str, audio_np: np.ndarray) -> np.ndarray:
     return interpreter.get_tensor(output_details[0]['index']), dt
 
 
-def run_tflite_partial(pre_path: str, main_path: str, audio_np: np.ndarray):
-    """Chain preprocessing tflite + main (optimised) tflite."""
-    # Preprocessing
-    pre = Interpreter(model_path=pre_path)
-    pre_in = pre.get_input_details()
-    pre.resize_tensor_input(pre_in[0]['index'], list(audio_np.shape))
-    pre.allocate_tensors()
-    pre_in  = pre.get_input_details()
-    pre_out = pre.get_output_details()
-    pre.set_tensor(pre_in[0]['index'], audio_np)
-    t0 = time.perf_counter()
-    pre.invoke()
-    spec = pre.get_tensor(pre_out[0]['index'])  # [B, H, W, C]
-
-    # Transpose to [B, C, H, W] for main model
-    spec = np.transpose(spec, (0, 3, 1, 2))
-
-    # Main (optimised)
-    main = Interpreter(model_path=main_path)
-    main_in = main.get_input_details()
-    main.resize_tensor_input(main_in[0]['index'], list(spec.shape))
-    main.allocate_tensors()
-    main_in  = main.get_input_details()
-    main_out = main.get_output_details()
-    main.set_tensor(main_in[0]['index'], spec)
-    main.invoke()
-    dt = time.perf_counter() - t0
-    return main.get_tensor(main_out[0]['index']), dt
-
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def fmt_topk(out, k=TOP_K):
+    """Format the top-k class indices and scores from the first batch element."""
     topk = np.argsort(out[0])[-k:][::-1]
     return " ".join(f"{i}({out[0][i]:.3f})" for i in topk)
 
@@ -142,6 +138,7 @@ def compare_and_print(name: str, ref_out, other_out, duration, batch_size, ref_d
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _build_parser():
+    """Build the argparse parser for the test CLI."""
     parser = argparse.ArgumentParser(
         description='Compare converted model outputs against TorchScript reference.',
     )
@@ -179,6 +176,7 @@ def _build_parser():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    """Entry point: parse CLI arguments, load models, run comparisons, and report results."""
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -193,9 +191,13 @@ def main():
     torchscript_path = os.path.join(export_dir, 'torchscript', 'model.pt')
     onnx_path = os.path.join(export_dir, 'onnx', 'model.onnx')
     tflite_path = os.path.join(export_dir, 'tf', 'combined', 'model.tflite')
-    tflite_opt_path = os.path.join(export_dir, 'tf', 'combined', 'model_optimized.tflite')
-    tflite_pre_path = os.path.join(export_dir, 'tf', 'preprocessing', 'model.tflite')
-    tflite_main_opt_path = os.path.join(export_dir, 'tf', 'main', 'model_optimized.tflite')
+
+    # FP16 / INT8 variants
+    torchscript_fp16_path = os.path.join(export_dir, 'torchscript', 'model_fp16.pt')
+    onnx_fp16_path = os.path.join(export_dir, 'onnx', 'model_fp16.onnx')
+    onnx_int8_path = os.path.join(export_dir, 'onnx', 'model_int8.onnx')
+    tflite_fp16_path = os.path.join(export_dir, 'tf', 'combined', 'model_fp16.tflite')
+    tflite_int8_path = os.path.join(export_dir, 'tf', 'combined', 'model_int8.tflite')
 
     audio_label = audio_path if audio_path else 'random noise (seed=42)'
     print(f"Model comparison (reference: TorchScript)  |  atol={ATOL}  rtol={RTOL}  top-{TOP_K}")
@@ -224,24 +226,30 @@ def main():
     else:
         print(f"  ONNX:        NOT FOUND — skipping")
 
+    if os.path.exists(onnx_fp16_path):
+        print(f"  ONNX fp16:   {onnx_fp16_path}")
+        models['ONNX_fp16'] = ort.InferenceSession(
+            onnx_fp16_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
+                                       if use_gpu else ['CPUExecutionProvider']))
+
+    if os.path.exists(onnx_int8_path):
+        print(f"  ONNX int8:   {onnx_int8_path}")
+        models['ONNX_int8'] = ort.InferenceSession(
+            onnx_int8_path, providers=['CPUExecutionProvider'])
+
     if os.path.exists(tflite_path):
         print(f"  LiteRT:      {tflite_path}")
         models['LiteRT'] = tflite_path
     else:
         print(f"  LiteRT:      NOT FOUND — skipping")
 
-    if os.path.exists(tflite_pre_path) and os.path.exists(tflite_main_opt_path):
-        print(f"  LiteRT part: {tflite_pre_path}")
-        print(f"             + {tflite_main_opt_path}")
-        models['LRTpart'] = (tflite_pre_path, tflite_main_opt_path)
-    else:
-        print(f"  LiteRT part: NOT FOUND — skipping")
+    if os.path.exists(tflite_fp16_path):
+        print(f"  LiteRT fp16: {tflite_fp16_path}")
+        models['LRT_fp16'] = tflite_fp16_path
 
-    if os.path.exists(tflite_opt_path):
-        print(f"  LiteRT opt:  {tflite_opt_path}")
-        models['LiteRTopt'] = tflite_opt_path
-    else:
-        print(f"  LiteRT opt:  NOT FOUND — skipping")
+    if os.path.exists(tflite_int8_path):
+        print(f"  LiteRT int8: {tflite_int8_path}")
+        models['LRT_int8'] = tflite_int8_path
 
     print("done.\n")
 
@@ -262,6 +270,26 @@ def main():
                     print(f"⚠️ ERR   ONNX        dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
 
+            # ONNX FP16
+            if 'ONNX_fp16' in models:
+                try:
+                    out, dt = run_onnx(models['ONNX_fp16'], audio)
+                    results.append(compare_and_print(
+                        'ONNX_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
+                except Exception as e:
+                    print(f"⚠️ ERR   ONNX_fp16   dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
+                    results.append('ERROR')
+
+            # ONNX INT8
+            if 'ONNX_int8' in models:
+                try:
+                    out, dt = run_onnx(models['ONNX_int8'], audio)
+                    results.append(compare_and_print(
+                        'ONNX_int8', ts_out, out, duration, batch_size, ts_dt, dt))
+                except Exception as e:
+                    print(f"⚠️ ERR   ONNX_int8   dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
+                    results.append('ERROR')
+
             # LiteRT
             if 'LiteRT' in models:
                 try:
@@ -272,25 +300,24 @@ def main():
                     print(f"⚠️ ERR   LiteRT      dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
                     results.append('ERROR')
 
-            # LiteRT partly optimized (preprocessing + main optimized)
-            if 'LRTpart' in models:
+            # LiteRT FP16
+            if 'LRT_fp16' in models:
                 try:
-                    pre_path, main_opt_path = models['LRTpart']
-                    part_out, part_dt = run_tflite_partial(pre_path, main_opt_path, audio)
+                    out, dt = run_tflite(models['LRT_fp16'], audio)
                     results.append(compare_and_print(
-                        'LRTpart', ts_out, part_out, duration, batch_size, ts_dt, part_dt))
+                        'LRT_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
                 except RuntimeError as e:
-                    print(f"⚠️ ERR   LRTpart     dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
+                    print(f"⚠️ ERR   LRT_fp16    dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
                     results.append('ERROR')
 
-            # LiteRT optimized
-            if 'LiteRTopt' in models:
+            # LiteRT INT8
+            if 'LRT_int8' in models:
                 try:
-                    tfl_opt_out, tfl_opt_dt = run_tflite(models['LiteRTopt'], audio)
+                    out, dt = run_tflite(models['LRT_int8'], audio)
                     results.append(compare_and_print(
-                        'LiteRTopt', ts_out, tfl_opt_out, duration, batch_size, ts_dt, tfl_opt_dt))
+                        'LRT_int8', ts_out, out, duration, batch_size, ts_dt, dt))
                 except RuntimeError as e:
-                    print(f"⚠️ ERR   LiteRTopt   dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
+                    print(f"⚠️ ERR   LRT_int8    dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
                     results.append('ERROR')
 
             print()

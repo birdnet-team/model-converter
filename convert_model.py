@@ -79,7 +79,7 @@ def createTfPreprocessingModel():
     # Save the model as a SavedModel and convert from that
     dstDir = outputDir + 'tf/preprocessing/'
     os.makedirs(dstDir, exist_ok=True)
-    tf.saved_model.save(model, dstDir)
+    model.export(dstDir)
     print(f'Saved model to {dstDir}')
 
     # Export the model to a TensorFlow Lite file
@@ -114,7 +114,7 @@ def loadPytorchModelAndWeights():
 
     # Load weights
     checkpointPath = modelDir + 'pytorch//Checkpoint35.pth.tar'
-    checkpoint = torch.load(checkpointPath, map_location='cpu', weights_only=False)
+    checkpoint = torch.load(checkpointPath, map_location='cpu', weights_only=True)
     state_dict = checkpoint['state_dict']
     model.load_state_dict(state_dict)
     model.eval()
@@ -362,7 +362,7 @@ def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
     # Load weights
     checkpointPath = modelDir + 'pytorch//Checkpoint35.pth.tar'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint = torch.load(checkpointPath, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
     state_dict = checkpoint['state_dict']
     model.load_state_dict(state_dict, strict=False) # strict=False to ignore missing keys for preprocessing parameters
     model.to(device)

@@ -15,6 +15,7 @@ to work around limitations in export tools (baked static shapes, unsupported ops
 - `fix_tflite_dynamic_input.py` — TFLite post-processor: patches static batch/temporal dimensions in flatbuffers.
 - `test_models.py` — Comparison harness: runs all converted formats against the TorchScript reference.
 - `models/` — Model directories containing PyTorch checkpoints and `model.py` definitions.
+- `example/` — Example audio files for testing (`soundscape.wav`).
 
 ## Architecture
 

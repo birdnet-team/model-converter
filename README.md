@@ -2,12 +2,14 @@
   <img src="birdnet-logo-circle.png" width="250" alt="BirdNET Logo">
 </p>
 
-<h1 align="center">BirdNET Model Converter</h1>
+<h1 align="center">BirdNET+ Model Converter</h1>
 
 <p align="center">
   <a href="https://github.com/birdnet-team/model-converter/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
-  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg" alt="PyTorch"></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.9+-ee4c2c.svg" alt="PyTorch 2.9+"></a>
+  <img src="https://img.shields.io/badge/model-V3.0--preview3-green.svg" alt="BirdNET+ V3.0-preview3">
+  <img src="https://img.shields.io/badge/species-11%2C560-yellow.svg" alt="11,560 species">
 </p>
 
 <p align="center">
@@ -23,10 +25,10 @@ This repository contains scripts to convert BirdNET V3.0 PyTorch models (Efficie
 
 | Format | Script | Output |
 |---|---|---|
-| TensorFlow SavedModel | `convert_model.py` | `models/.../tf/` |
-| TFLite / LiteRT | `convert_model.py` | `models/.../tf/**/*.tflite` |
-| TorchScript | `convert_model.py` | `models/.../torchscript/model.pt` |
-| ONNX | `convert_model.py` | `models/.../onnx/model.onnx` |
+| TensorFlow SavedModel | `convert_model.py` | `export/tf/` |
+| TFLite / LiteRT | `convert_model.py` | `export/tf/**/*.tflite` |
+| TorchScript | `convert_model.py` | `export/torchscript/model.pt` |
+| ONNX | `convert_model.py` | `export/onnx/model.onnx` |
 
 Additional utilities:
 
@@ -42,6 +44,14 @@ Download or clone the repository:
 git clone https://github.com/birdnet-team/model-converter.git
 cd model-converter
 ```
+
+> **Git LFS required:** Model checkpoints are stored with [Git LFS](https://git-lfs.com/). If `git lfs` is not installed, checkpoint files will be small pointer files instead of the actual weights. Install Git LFS and pull:
+>
+> ```bash
+> sudo apt install git-lfs   # or: brew install git-lfs
+> git lfs install
+> git lfs pull
+> ```
 
 Create a virtual environment (choose one):
 
@@ -61,6 +71,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> **Note:** Python 3.10 and 3.11 are also supported, but 3.12 is recommended.
+
 ## Usage
 
 Convert the PyTorch model to all supported formats:
@@ -69,7 +81,50 @@ Convert the PyTorch model to all supported formats:
 python convert_model.py
 ```
 
-This runs the full conversion pipeline:
+Converted models are written to `export/` by default. Use `-o` to change the output directory:
+
+```bash
+python convert_model.py -o output/my_export
+```
+
+Convert to specific formats only:
+
+```bash
+python convert_model.py -f onnx torchscript
+python convert_model.py -f tf tflite
+```
+
+Use a different model directory:
+
+```bash
+python convert_model.py -m models/my_custom_model
+```
+
+List available models:
+
+```bash
+python convert_model.py --list-models
+```
+
+### All Options
+
+```
+usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
+                        [--batch-size BATCH_SIZE]
+                        [--segment-duration SEGMENT_DURATION]
+                        [--list-models]
+
+  -m, --model-dir          Path to model directory (default: models/01_BirdNET+_...)
+  -o, --output-dir         Directory for converted model output (default: export/)
+  -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
+      --batch-size          Batch size baked into TFLite models (default: 1)
+      --segment-duration    Min audio segment duration in seconds for tracing (default: 3.0)
+      --list-models         List available models and exit
+```
+
+### Conversion Pipeline
+
+The full pipeline (`-f tf tflite torchscript onnx`) runs these steps:
 
 1. **TF Preprocessing** — Exports the mel-spectrogram preprocessing as a standalone TF SavedModel and TFLite model.
 2. **TF Main Model** — Converts the classifier via `litert_torch`, re-wraps with dynamic input signatures, and exports to TFLite.
@@ -84,6 +139,37 @@ Compare outputs of all converted formats against the TorchScript reference:
 ```bash
 python test_models.py
 ```
+
+Use a custom audio file or export directory:
+
+```bash
+python test_models.py -a path/to/audio.wav
+python test_models.py -e output/my_export
+```
+
+Test with different segment durations or batch sizes:
+
+```bash
+python test_models.py --durations 3.0 5.0
+python test_models.py --batch-size 2
+```
+
+```
+usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
+                      [--durations S [S ...]] [--gpu]
+
+  -e, --export-dir    Path to export directory (default: export/)
+  -a, --audio         Audio file for test input (default: example/soundscape.wav)
+      --batch-size    Batch size for test inputs (default: 1)
+      --durations     Segment durations in seconds (default: 3.0)
+      --gpu           Use GPU for TorchScript and ONNX inference
+```
+
+> **Interpreting results:** The test compares each format against TorchScript using a tight tolerance (`atol=0.025`).
+> ONNX and unoptimized LiteRT (combined) should pass at the default 3.0s duration.
+> The **optimized** TFLite variants (`LiteRTopt`, `LRTpart`) use quantization or mixed pipelines that introduce
+> larger numerical differences — failures for these are expected and do not indicate broken models.
+> Check that the top predicted species still match even when `max_diff` exceeds the threshold.
 
 ## License
 

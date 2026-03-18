@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import numpy as np
@@ -13,21 +14,42 @@ from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 
-# Adjust this path to point to the directory containing the PyTorch checkpoint and model definition (model.py)
-modelDir = os.path.dirname(os.path.abspath(__file__)) + '/models/01_BirdNET+_V3.0-preview3_Global_11K/'
+ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
+DEFAULT_MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'models', '01_BirdNET+_V3.0-preview3_Global_11K'
+)
 
+DEFAULT_OUTPUT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'export'
+)
+
+# Module-level state (set by _init_config, read by conversion functions)
+modelDir = DEFAULT_MODEL_DIR + '/'
+outputDir = DEFAULT_OUTPUT_DIR + '/'
 batchSize = 1
-# Use smallest duration that should be supported by litert
-segmentDuration = 3.0 
+segmentDuration = 3.0
+model_module = None
 
 
-# Load model definitions from model.py
-model_module_path = modelDir + 'pytorch/model.py'
-module_name = 'model_module'
-spec = importlib.util.spec_from_file_location(module_name, model_module_path)
-model_module = importlib.util.module_from_spec(spec)
-sys.modules[module_name] = model_module
-spec.loader.exec_module(model_module)
+def _init_config(model_dir, output_dir, batch_size, segment_duration):
+    """Initialise module-level config and load the model definition module."""
+    global modelDir, outputDir, batchSize, segmentDuration, model_module
+
+    modelDir = model_dir.rstrip('/') + '/'
+    outputDir = output_dir.rstrip('/') + '/'
+    batchSize = batch_size
+    segmentDuration = segment_duration
+
+    model_module_path = os.path.join(modelDir, 'pytorch', 'model.py')
+    if not os.path.isfile(model_module_path):
+        sys.exit(f'Error: model definition not found at {model_module_path}')
+
+    module_name = 'model_module'
+    spec = importlib.util.spec_from_file_location(module_name, model_module_path)
+    model_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = model_module
+    spec.loader.exec_module(model_module)
 
 
 def createTfPreprocessingModel():
@@ -55,7 +77,8 @@ def createTfPreprocessingModel():
     model.summary()
 
     # Save the model as a SavedModel and convert from that
-    dstDir = modelDir + 'tf/preprocessing/'
+    dstDir = outputDir + 'tf/preprocessing/'
+    os.makedirs(dstDir, exist_ok=True)
     model.export(dstDir)
     print(f'Saved model to {dstDir}')
 
@@ -154,7 +177,7 @@ def createTfMainModel(saveKerasModel=False):
 
     print(f"Sample input shape: {testInputTorch.shape}")
 
-    dstDir = modelDir + 'tf/main/'
+    dstDir = outputDir + 'tf/main/'
     os.makedirs(dstDir, exist_ok=True)
 
     staticDir = dstDir + '_static/'
@@ -294,15 +317,15 @@ def combineTfModels():
             return main_out
 
 
-    path_pre = modelDir + 'tf/preprocessing/'
-    path_main = modelDir + 'tf/main/'
+    path_pre = outputDir + 'tf/preprocessing/'
+    path_main = outputDir + 'tf/main/'
 
     pre = tf.saved_model.load(path_pre)
     main = tf.saved_model.load(path_main)
 
     ## Export the combined model as a SavedModel
     combined_model = CombinedModel(pre, main)
-    dstDir = modelDir + 'tf/combined/'
+    dstDir = outputDir + 'tf/combined/'
     tf.saved_model.save(
         combined_model, dstDir, 
         signatures=combined_model.__call__.get_concrete_function()
@@ -354,7 +377,7 @@ def createTorchScriptModel():
     model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
     
     scripted_module = torch.jit.script(model)
-    dstDir = modelDir + 'torchscript/'
+    dstDir = outputDir + 'torchscript/'
     os.makedirs(dstDir, exist_ok=True)
     scripted_module.save(dstDir + 'model.pt')
     print('TorchScript model saved to', dstDir + 'model.pt')
@@ -563,7 +586,7 @@ def createOnnxModel():
     batch_size = 4
     inputBatch = torch.rand(batch_size, int(segmentDuration*model_module.sampleRate)).to(next(model.parameters()).device)
 
-    dstDir = modelDir + 'onnx/'
+    dstDir = outputDir + 'onnx/'
     os.makedirs(dstDir, exist_ok=True)
 
     torch.onnx.export(
@@ -616,11 +639,123 @@ def createOnnxModel():
 ###########################################################################################
 
 
+def _list_models(base_dir):
+    """Return subdirectory names under models/ that contain pytorch/model.py."""
+    models_root = os.path.join(base_dir, 'models')
+    if not os.path.isdir(models_root):
+        return []
+    found = []
+    for name in sorted(os.listdir(models_root)):
+        candidate = os.path.join(models_root, name, 'pytorch', 'model.py')
+        if os.path.isfile(candidate):
+            found.append(name)
+    return found
+
+
+def _build_parser():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    available_models = _list_models(base_dir)
+    models_help = ', '.join(available_models) if available_models else '(none found)'
+
+    parser = argparse.ArgumentParser(
+        description='Convert BirdNET V3.0 PyTorch models to other inference formats.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'examples:\n'
+            '  %(prog)s                              # convert default model to all formats\n'
+            '  %(prog)s -f onnx torchscript           # ONNX + TorchScript only\n'
+            '  %(prog)s -m models/my_model             # use a different model directory\n'
+            '  %(prog)s -o output/                     # custom output directory\n'
+            '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
+            '  %(prog)s --list-models                  # show available models\n'
+        ),
+    )
+    parser.add_argument(
+        '-m', '--model-dir',
+        default=DEFAULT_MODEL_DIR,
+        help=(
+            'Path to the model directory containing pytorch/model.py and '
+            'a PyTorch checkpoint (default: %(default)s)'
+        ),
+    )
+    parser.add_argument(
+        '-o', '--output-dir',
+        default=DEFAULT_OUTPUT_DIR,
+        help='Directory for converted model output (default: %(default)s)',
+    )
+    parser.add_argument(
+        '-f', '--formats',
+        nargs='+',
+        choices=ALL_FORMATS,
+        default=ALL_FORMATS,
+        metavar='FMT',
+        help=(
+            'Output format(s) to produce. '
+            f'Choose from: {", ".join(ALL_FORMATS)} (default: all)'
+        ),
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=1,
+        help='Batch size baked into TFLite models (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--segment-duration',
+        type=float,
+        default=3.0,
+        help=(
+            'Minimum audio segment duration in seconds used during tracing '
+            '(default: %(default)s)'
+        ),
+    )
+    parser.add_argument(
+        '--list-models',
+        action='store_true',
+        help='List available models in the models/ directory and exit',
+    )
+    return parser
+
+
+def main():
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.list_models:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        models = _list_models(base_dir)
+        if models:
+            print('Available models:')
+            for m in models:
+                print(f'  models/{m}')
+        else:
+            print('No models found in models/.')
+        return
+
+    _init_config(args.model_dir, args.output_dir, args.batch_size, args.segment_duration)
+
+    formats = set(args.formats)
+
+    print(f'Model directory:    {modelDir}')
+    print(f'Output directory:   {outputDir}')
+    print(f'Output format(s):   {", ".join(sorted(formats))}')
+    print(f'Batch size:         {batchSize}')
+    print(f'Segment duration:   {segmentDuration}s')
+    print()
+
+    if 'tf' in formats or 'tflite' in formats:
+        createTfPreprocessingModel()
+        createTfMainModel(saveKerasModel=False)
+        combineTfModels()
+
+    if 'torchscript' in formats:
+        createTorchScriptModel()
+
+    if 'onnx' in formats:
+        createOnnxModel()
+
+    print('\nDone.')
+
+
 if __name__ == '__main__':
-
-    createTfPreprocessingModel()
-    createTfMainModel(saveKerasModel=False)
-    combineTfModels()
-
-    createTorchScriptModel()
-    createOnnxModel()
+    main()

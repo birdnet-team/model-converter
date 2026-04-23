@@ -24,6 +24,7 @@ DEFAULT_AUDIO = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'exampl
 
 # Tolerance for "match" (absolute + relative)
 ATOL = 0.025
+ATOL_INT8 = 0.25   # INT8 dynamic quantization introduces larger per-output error
 RTOL = 1e-4
 TOP_K = 3
 
@@ -59,20 +60,20 @@ def load_audio(audio_path: str, duration: float, batch_size: int) -> np.ndarray:
 
 # ── Model runners ────────────────────────────────────────────────────────────
 
-def run_torchscript(model, audio_np: np.ndarray, device: str) -> np.ndarray:
+def run_torchscript(model, audio_np: np.ndarray, device: str, input_dtype=torch.float32) -> np.ndarray:
     """Run inference with a TorchScript model.
 
     Returns:
         tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
     """
     with torch.no_grad():
-        audio_t = torch.from_numpy(audio_np).to(device)
+        audio_t = torch.from_numpy(audio_np).to(device=device, dtype=input_dtype)
         t0 = time.perf_counter()
         embeddings, predictions = model(audio_t)
         if device != 'cpu':
             torch.cuda.synchronize()
         dt = time.perf_counter() - t0
-    return predictions.cpu().numpy(), dt
+    return predictions.float().cpu().numpy(), dt
 
 
 def run_onnx(session, audio_np: np.ndarray) -> np.ndarray:
@@ -119,11 +120,12 @@ def fmt_topk(out, k=TOP_K):
     return " ".join(f"{i}({out[0][i]:.3f})" for i in topk)
 
 
-def compare_and_print(name: str, ref_out, other_out, duration, batch_size, ref_dt, other_dt):
+def compare_and_print(name: str, ref_out, other_out, duration, batch_size, ref_dt, other_dt,
+                      atol=ATOL):
     """Compare other_out against ref_out (TorchScript). Returns 'PASS'/'FAIL'."""
     max_d = np.max(np.abs(ref_out - other_out))
     mean_d = np.mean(np.abs(ref_out - other_out))
-    passed = np.allclose(ref_out, other_out, atol=ATOL, rtol=RTOL)
+    passed = np.allclose(ref_out, other_out, atol=atol, rtol=RTOL)
     icon = "✅ PASS" if passed else "❌ FAIL"
     dt_diff = other_dt - ref_dt
     sign = "+" if dt_diff >= 0 else ""
@@ -200,7 +202,7 @@ def main():
     tflite_int8_path = os.path.join(export_dir, 'tf', 'combined', 'model_int8.tflite')
 
     audio_label = audio_path if audio_path else 'random noise (seed=42)'
-    print(f"Model comparison (reference: TorchScript)  |  atol={ATOL}  rtol={RTOL}  top-{TOP_K}")
+    print(f"Model comparison (reference: TorchScript)  |  atol={ATOL} (int8: {ATOL_INT8})  rtol={RTOL}  top-{TOP_K}")
     print(f"Device: {device}" + (f"  ({torch.cuda.get_device_name()})" if use_gpu else ""))
     print(f"Audio: {audio_label}")
     print(f"Export dir: {export_dir}\n")
@@ -216,6 +218,14 @@ def main():
     ts_model = torch.jit.load(torchscript_path, map_location=device)
     ts_model.eval()
     models['TS'] = ts_model
+
+    if os.path.exists(torchscript_fp16_path):
+        print(f"  TS fp16:     {torchscript_fp16_path}")
+        ts_fp16_model = torch.jit.load(torchscript_fp16_path, map_location=device)
+        ts_fp16_model.eval()
+        models['TS_fp16'] = ts_fp16_model
+    else:
+        print(f"  TS fp16:     NOT FOUND — skipping")
 
     if os.path.exists(onnx_path):
         onnx_providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
@@ -260,6 +270,16 @@ def main():
             audio = load_audio(audio_path, duration, batch_size)
             ts_out, ts_dt = run_torchscript(ts_model, audio, device)
 
+            # TorchScript FP16
+            if 'TS_fp16' in models:
+                try:
+                    out, dt = run_torchscript(models['TS_fp16'], audio, device)
+                    results.append(compare_and_print(
+                        'TS_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
+                except Exception as e:
+                    print(f"⚠️ ERR   TS_fp16     dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
+                    results.append('ERROR')
+
             # ONNX
             if 'ONNX' in models:
                 try:
@@ -285,7 +305,8 @@ def main():
                 try:
                     out, dt = run_onnx(models['ONNX_int8'], audio)
                     results.append(compare_and_print(
-                        'ONNX_int8', ts_out, out, duration, batch_size, ts_dt, dt))
+                        'ONNX_int8', ts_out, out, duration, batch_size, ts_dt, dt,
+                        atol=ATOL_INT8))
                 except Exception as e:
                     print(f"⚠️ ERR   ONNX_int8   dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
@@ -315,7 +336,8 @@ def main():
                 try:
                     out, dt = run_tflite(models['LRT_int8'], audio)
                     results.append(compare_and_print(
-                        'LRT_int8', ts_out, out, duration, batch_size, ts_dt, dt))
+                        'LRT_int8', ts_out, out, duration, batch_size, ts_dt, dt,
+                        atol=ATOL_INT8))
                 except RuntimeError as e:
                     print(f"⚠️ ERR   LRT_int8    dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
                     results.append('ERROR')

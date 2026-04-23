@@ -542,6 +542,128 @@ def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
     return model
 
 
+class _Fp32StageWrapper(torch.nn.Module):
+    """Adapter that accepts a float16 tensor, runs a module in float32,
+    and returns float32 output.
+
+    Used to keep EfficientNetV2 stage 5 in float32 within an otherwise
+    float16 backbone.  Some stage-5 expansion conv outputs exceed the fp16
+    maximum (~65 504) even in float32 inference (e.g. 74 222 for block 5.13),
+    so fp16 computation would saturate to Inf → NaN cascade.
+    """
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.module(x.float())
+
+
+def _fold_bn_for_fp16(model: torch.nn.Module) -> int:
+    """Fold large-variance BN channels into weight/bias so they are fp16-safe.
+
+    Some EfficientNetV2 stage-5 BN layers have running_var up to 8.7 M.  In
+    fp16 that becomes Inf (> 65504), which breaks BN normalisation:
+    ``(x − mean) / sqrt(Inf) → 0``  →  output collapses to beta for those
+    channels  →  activation drift across residual connections  →  fp16 Conv
+    overflow  →  ``Inf / Inf = NaN`` cascade.
+
+    Fix: absorb (mean, var) into (weight, bias) so the effective
+    running_mean becomes 0 and running_var becomes 1 for every unsafe channel.
+    The transformation is mathematically exact::
+
+        original:  weight * (x − mean) / sqrt(var + eps) + bias
+        after:     weight_new * x + bias_new
+          where  weight_new = weight / sqrt(var + eps)
+                 bias_new   = bias − weight * mean / sqrt(var + eps)
+                 running_mean = 0,  running_var = 1 − eps
+    """
+    FP16_MAX = 65504.0
+    n_folded = 0
+    for name, m in model.named_modules():
+        if not isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d,
+                               torch.nn.BatchNorm3d)):
+            continue
+        if m.running_var is None or not m.track_running_stats:
+            continue
+        if m.weight is None or m.bias is None:
+            continue
+        unsafe = m.running_var > FP16_MAX
+        if not unsafe.any():
+            continue
+        n_ch = int(unsafe.sum().item())
+        print(f'  fold_bn_fp16: {name} — {n_ch} channel(s) with var > {FP16_MAX:.0f}')
+        eps = m.eps
+        with torch.no_grad():
+            std   = torch.sqrt(m.running_var[unsafe] + eps)
+            gamma = m.weight.data[unsafe].clone()
+            beta  = m.bias.data[unsafe].clone()
+            mean  = m.running_mean[unsafe].clone()
+            m.weight.data[unsafe]   = gamma / std
+            m.bias.data[unsafe]     = beta - gamma * mean / std
+            m.running_mean[unsafe]  = 0.0
+            m.running_var[unsafe]   = 1.0 - eps   # sqrt(1-eps+eps) = 1.0
+        n_folded += n_ch
+    return n_folded
+
+
+def _find_preprocessing_node_names(fp32_model) -> list:
+    """Return the names of every ONNX node that belongs to the preprocessing
+    sub-graph (everything before the first backbone Conv).
+
+    Strategy: BFS backward from the activation input of the first Conv whose
+    weight has shape [out_ch, 3, kH, kW]  (the EfficientNetV2 stem that takes
+    the 3-channel normalised spectrogram).  Every node visited along the way
+    is a preprocessing node.
+    """
+    graph = fp32_model.graph
+
+    # output_name → node that produces it
+    producer = {}
+    for node in graph.node:
+        for out in node.output:
+            if out:
+                producer[out] = node
+
+    initializer_names = {init.name for init in graph.initializer}
+    input_names       = {inp.name  for inp  in graph.input}
+
+    # Find the backbone stem: first Conv with weight shape [out_ch, 3, kH, kW]
+    init_shapes = {init.name: list(init.dims) for init in graph.initializer}
+    stem_input = None
+    for node in graph.node:
+        if node.op_type == 'Conv' and len(node.input) >= 2:
+            w = node.input[1]
+            if w in init_shapes:
+                shape = init_shapes[w]
+                if len(shape) == 4 and shape[1] == 3:
+                    stem_input = node.input[0]
+                    break
+
+    if stem_input is None:
+        print('  _find_preprocessing_node_names: stem Conv not found, falling back to op_block_list')
+        return []
+
+    # BFS backward from stem_input; collect non-empty node names
+    preproc_names = []
+    visited = set()
+    queue   = [stem_input]
+    while queue:
+        name = queue.pop()
+        if name in visited or name in initializer_names or name in input_names:
+            continue
+        visited.add(name)
+        if name in producer:
+            node = producer[name]
+            if node.name:          # skip unnamed nodes (they stay fp32 by default)
+                preproc_names.append(node.name)
+            for inp in node.input:
+                if inp:
+                    queue.append(inp)
+
+    return preproc_names
+
+
 def createTorchScriptModel():
     """Export the full model (with preprocessing) to TorchScript.
 
@@ -562,13 +684,79 @@ def createTorchScriptModel():
     os.makedirs(dstDir, exist_ok=True)
 
     if 'fp32' in precisions:
+        
+        ## Export CPU version
+        model = model.to('cpu')
+        model.eval()
+
         scripted_module = torch.jit.script(model)
         scripted_module.save(dstDir + 'model.pt')
         print('TorchScript model saved to', dstDir + 'model.pt')
 
     if 'fp16' in precisions:
-        model_fp16 = model.half()
-        scripted_fp16 = torch.jit.script(model_fp16)
+        import copy
+        from typing import Tuple
+
+        # STFT (inside PreprocessingLayerTorch) does not support float16:
+        # calling model.half() converts the spectrogram transform buffers too,
+        # making STFT produce ComplexHalf tensors that downstream ops can't handle.
+        # Fix: keep preprocessing in float32; convert only the backbone+head to
+        # float16; insert an explicit .half() cast in between.
+
+        # Build a backbone copy whose preprocess is replaced with Identity so
+        # it can be converted to float16 without touching the STFT layer.
+        fp16_backbone = copy.deepcopy(model)
+        fp16_backbone.preprocess = torch.nn.Identity()
+        # Fold large-variance BN channels BEFORE converting to fp16.
+        # Several EfficientNetV2 stage-5 BN layers have running_var up to 8.7 M;
+        # converting them to fp16 gives Inf which cascades into NaN.
+        n_folded = _fold_bn_for_fp16(fp16_backbone)
+        print(f'  TS FP16: folded {n_folded} BN channel(s) with var > 65504')
+        fp16_backbone = fp16_backbone.half()
+
+        # Stage 5 of EfficientNetV2 MUST stay in float32.
+        # The expansion convolutions in blocks 5.12–5.14 have large weights
+        # (max ≈ 4.4) and the residual stream reaches > 800 in float32 by
+        # stage 5.  The resulting dot products exceed the fp16 maximum
+        # (e.g. 74 222 for block 5.13) → fp16 output is Inf → PyTorch BN
+        # with Inf running_var on Inf input gives Inf/Inf = NaN cascade.
+        #
+        # Fix: wrap stage 5 with _Fp32StageWrapper so it accepts fp16 input
+        # from stages 1–4, casts to fp32 internally, and returns fp32.  All
+        # downstream modules (conv_head, bn2, act2, classifiers) also stay
+        # in fp32 (reverted by .float() after the global .half()).
+        enc = fp16_backbone.encoder
+        stage5 = enc.blocks[5]
+        stage5.float()                                   # revert to fp32
+        enc.blocks[5] = _Fp32StageWrapper(stage5)        # fp16-in / fp32-out
+        # Revert post-stage-5 encoder modules and all classifiers to fp32
+        for attr in ('conv_head', 'bn2', 'act2', 'norm'):
+            m = getattr(enc, attr, None)
+            if m is not None:
+                m.float()
+        for attr in ('global_pool', 'head', 'fc1', 'fc2',
+                     'att_block', 'att_block2', 'dropouts'):
+            m = getattr(fp16_backbone, attr, None)
+            if m is not None:
+                m.float()
+
+        class _TS_FP16Wrapper(torch.nn.Module):
+            """Accepts float32 audio; runs preprocessing in float32, then casts
+            spectrogram to float16 for backbone stages 1–4, then returns to
+            float32 for stage 5 and all classifiers. Returns float32 outputs."""
+            def __init__(self, preprocess: torch.nn.Module,
+                         backbone: torch.nn.Module) -> None:
+                super().__init__()
+                self.preprocess = preprocess   # float32 — preserves STFT
+                self.backbone = backbone       # mixed: fp16 (st1-4) + fp32 (st5+)
+
+            def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                spec = self.preprocess(x)          # float32 audio → float32 spec
+                emb, pred = self.backbone(spec.half())  # fp16 entry; fp32 exit
+                return emb, pred
+
+        wrapper = _TS_FP16Wrapper(model.preprocess, fp16_backbone)
+        scripted_fp16 = torch.jit.script(wrapper)
         scripted_fp16.save(dstDir + 'model_fp16.pt')
         print('TorchScript FP16 model saved to', dstDir + 'model_fp16.pt')
 
@@ -796,6 +984,7 @@ def createOnnxModel():
         verbose=True, 
         input_names=['input'],
         output_names=['embeddings', 'predictions'],
+        opset_version=18,
         dynamo=True,
         dynamic_shapes={'input': {0: 'batch_size', 1: 'samples'}}
     )
@@ -834,66 +1023,102 @@ def createOnnxModel():
     if os.path.exists(dstDir+'model_static_resize.onnx'):
         os.remove(dstDir+'model_static_resize.onnx')
 
-    # FP16 variant
+    # FP16 variant — post-process the fp32 ONNX graph with onnxconverter_common.
+    #
+    # Direct re-export via dynamo hangs: the STFT's complex symbolic-shape
+    # analysis (Eq / inequality guards over s27, s77) causes the torch.export
+    # tracing loop to never terminate.
+    #
+    # Post-processing pitfall: any graph output that is also consumed as a node
+    # input becomes type-mismatched after keep_io_types=True inserts a Cast —
+    # the Cast output overwrites the original name for all consumers.  Step 1
+    # decouples these dual-role tensors before conversion.
     if 'fp16' in precisions:
         from onnxconverter_common import float16
-        from onnx import TensorProto
+
         fp32_model = onnx.load(onnx_path)
-        del fp32_model.graph.value_info[:]
-        # Convert entire graph to fp16, then manually wrap I/O with Cast nodes
-        # so the model accepts float32 input and returns float32 output.
-        # (keep_io_types=True is unreliable for ops like Gemm whose outputs
-        # are also consumed internally — it breaks type homogeneity.)
-        fp16_model = float16.convert_float_to_float16(fp32_model)
-        graph = fp16_model.graph
 
-        # Wrap each float16 input: keep graph input as float32, insert
-        # Cast(float32→float16), rename all downstream consumers to the cast output.
-        for inp in graph.input:
-            if inp.type.tensor_type.elem_type == TensorProto.FLOAT16:
-                old_name = inp.name
-                cast_out = old_name + '_cast_fp16'
-                cast_node = helper.make_node('Cast', [old_name], [cast_out],
-                                             to=TensorProto.FLOAT16)
-                for node in graph.node:
-                    for i, n in enumerate(node.input):
-                        if n == old_name:
-                            node.input[i] = cast_out
-                graph.node.insert(0, cast_node)
-                inp.type.tensor_type.elem_type = TensorProto.FLOAT
+        # ── Step 1: decouple dual-role output tensors ─────────────────────
+        # Any graph output whose name also appears as a node input is dual-role.
+        # For each such tensor, insert an Identity node and redirect the graph
+        # output to the Identity's output, leaving the original name purely
+        # internal so it is converted to fp16 without type-mismatch.
+        internal_inputs = set()
+        for node in fp32_model.graph.node:
+            for inp in node.input:
+                if inp:
+                    internal_inputs.add(inp)
 
-        # Wrap each float16 output: add Cast(float16→float32) that reads
-        # from the original fp16 tensor and writes to a *new* name, then
-        # point the graph output entry at that new name.  This keeps the
-        # fp16 tensor intact for any internal consumers (e.g. Gemm reading
-        # 'embeddings' while 'embeddings' is also a graph output).
-        for out in graph.output:
-            if out.type.tensor_type.elem_type == TensorProto.FLOAT16:
-                fp16_name = out.name
-                fp32_name = fp16_name + '_fp32'
-                cast_node = helper.make_node('Cast', [fp16_name], [fp32_name],
-                                             to=TensorProto.FLOAT)
-                graph.node.append(cast_node)
-                out.name = fp32_name
-                out.type.tensor_type.elem_type = TensorProto.FLOAT
+        for out in list(fp32_model.graph.output):
+            if out.name in internal_inputs:
+                new_name = out.name + '_out'
+                identity = helper.make_node('Identity', [out.name], [new_name],
+                                            name=f'_fp16_decoupler_{out.name}')
+                fp32_model.graph.node.append(identity)
+                out.name = new_name
+                print(f'  FP16 prep: decoupled graph output → {new_name}')
+
+        # ── Step 2: shape inference so the converter has full type context ─
+        # Do NOT clear value_info before this: the converter needs it to
+        # identify fp32/fp16 boundaries and insert Cast nodes correctly.
+        try:
+            fp32_model = onnx.shape_inference.infer_shapes(fp32_model)
+        except Exception as e:
+            print(f'  Warning: shape inference failed ({e}), proceeding without it')
+
+        # ── Step 3: convert backbone to fp16, keep ALL preprocessing in fp32 ──
+        #
+        # node_block_list keeps every preprocessing node in fp32 by name.
+        # BFS backward from the backbone stem Conv (first Conv with a 3-channel
+        # weight) discovers all ~82 preprocessing nodes.  op_block_list is
+        # also passed as a belt-and-suspenders safety net — both exclusion
+        # lists are additive.  Using only op_block_list is insufficient because
+        # it acts on op types globally and misses the mel filterbank MatMul.
+        preproc_nodes = _find_preprocessing_node_names(fp32_model)
+        if preproc_nodes:
+            print(f'  ONNX FP16: blocking {len(preproc_nodes)} preprocessing nodes in fp32')
+        else:
+            print('  ONNX FP16: stem Conv not found; using op_block_list only')
+        fp16_model = float16.convert_float_to_float16(
+            fp32_model,
+            keep_io_types=True,
+            op_block_list=['STFT', 'Log', 'Pow', 'Exp'],
+            node_block_list=preproc_nodes or None,
+        )
 
         fp16_path = dstDir + 'model_fp16.onnx'
         onnx.save(fp16_model, fp16_path, save_as_external_data=False)
         print(f'ONNX FP16 model exported to {fp16_path}')
 
+
     # INT8 variant (dynamic quantization)
     if 'int8' in precisions:
         from onnxruntime.quantization import quantize_dynamic, QuantType
-        # Clear stale shape annotations that conflict with our Resize/Conv2dSame
-        # patches — shape inference inside quantize_dynamic will re-derive them.
         model_for_quant = onnx.load(onnx_path)
+        # Clear stale shape annotations left by Resize/Conv2dSame patches, then
+        # re-derive them via shape inference so quantize_dynamic has correct
+        # type/shape context for every intermediate tensor.  Without this,
+        # missing value_info causes quantize_dynamic to misclassify tensor types.
         del model_for_quant.graph.value_info[:]
+        try:
+            model_for_quant = onnx.shape_inference.infer_shapes(model_for_quant)
+        except Exception as e:
+            print(f'  Warning: shape inference failed ({e}), proceeding without it')
+        # Exclude preprocessing nodes from quantization — same reason as FP16:
+        # the mel filterbank is a MatMul whose weights must not be quantized to
+        # INT8 (it corrupts the spectrogram and collapses predictions).
+        preproc_nodes = _find_preprocessing_node_names(model_for_quant)
+        if preproc_nodes:
+            print(f'  ONNX INT8: excluding {len(preproc_nodes)} preprocessing nodes from quantization')
+        else:
+            print('  ONNX INT8: stem Conv not found; quantizing all nodes')
         temp_quant_path = dstDir + 'model_pre_quant.onnx'
         onnx.save(model_for_quant, temp_quant_path, save_as_external_data=False)
         int8_path = dstDir + 'model_int8.onnx'
         quantize_dynamic(
             temp_quant_path, int8_path,
             weight_type=QuantType.QInt8,
+            nodes_to_exclude=preproc_nodes or None,
         )
         os.remove(temp_quant_path)
         print(f'ONNX INT8 (dynamic quantization) model exported to {int8_path}')

@@ -384,8 +384,7 @@ def createTfMainModel(saveKerasModel=False):
                                 optimize=True, supported_types=[tf.float16])
     if 'int8' in precisions:
         rep_data = _make_representative_dataset()
-        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite',
-                                optimize=True, representative_dataset=rep_data)
+        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
 
 
     ## Cleanup
@@ -514,8 +513,7 @@ def combineTfModels():
                                 optimize=True, supported_types=[tf.float16])
     if 'int8' in precisions:
         rep_data = _make_combined_representative_dataset()
-        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite',
-                                optimize=True, representative_dataset=rep_data)
+        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
 
 
 def loadPytorchModelAndWeightsIncludingPreprocessingLayer():

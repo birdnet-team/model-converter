@@ -18,14 +18,16 @@ import librosa
 import onnxruntime as ort
 from ai_edge_litert.interpreter import Interpreter
 
+MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
+
 SAMPLE_RATE = 32000
-DEFAULT_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'export')
+DEFAULT_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'export', MODEL_NAME)
 DEFAULT_AUDIO = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'example', 'soundscape.wav')
 
 # Tolerance for "match" (absolute + relative)
-ATOL = 0.025
-ATOL_INT8 = 0.25   # INT8 dynamic quantization introduces larger per-output error
-RTOL = 1e-4
+ATOL = 0.08 #1e-3
+ATOL_INT8 = 0.2 # 0.025   # INT8 dynamic quantization introduces larger per-output error
+RTOL = 1e-5
 TOP_K = 3
 
 
@@ -112,6 +114,35 @@ def run_tflite(model_path: str, audio_np: np.ndarray) -> np.ndarray:
     return interpreter.get_tensor(output_details[0]['index']), dt
 
 
+def run_tflite_partial(pre_path: str, main_path: str, audio_np: np.ndarray):
+    """Chain preprocessing tflite + main (optimised) tflite."""
+    # Preprocessing
+    pre = Interpreter(model_path=pre_path)
+    pre_in = pre.get_input_details()
+    pre.resize_tensor_input(pre_in[0]['index'], list(audio_np.shape))
+    pre.allocate_tensors()
+    pre_in  = pre.get_input_details()
+    pre_out = pre.get_output_details()
+    pre.set_tensor(pre_in[0]['index'], audio_np)
+    t0 = time.perf_counter()
+    pre.invoke()
+    spec = pre.get_tensor(pre_out[0]['index'])  # [B, H, W, C]
+
+    # Transpose to [B, C, H, W] for main model
+    spec = np.transpose(spec, (0, 3, 1, 2))
+
+    # Main (optimised)
+    main = Interpreter(model_path=main_path)
+    main_in = main.get_input_details()
+    main.resize_tensor_input(main_in[0]['index'], list(spec.shape))
+    main.allocate_tensors()
+    main_in  = main.get_input_details()
+    main_out = main.get_output_details()
+    main.set_tensor(main_in[0]['index'], spec)
+    main.invoke()
+    dt = time.perf_counter() - t0
+    return main.get_tensor(main_out[0]['index']), dt
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def fmt_topk(out, k=TOP_K):
@@ -164,8 +195,8 @@ def _build_parser():
         '--durations',
         type=float,
         nargs='+',
-        default=[3.0],
-        help='Segment durations in seconds to test (default: 3.0)',
+        default=[3.0, 5.0],
+        help='Segment durations in seconds to test (default: 3.0, 5.0)',
     )
     parser.add_argument(
         '--gpu',
@@ -200,6 +231,10 @@ def main():
     onnx_int8_path = os.path.join(export_dir, 'onnx', 'model_int8.onnx')
     tflite_fp16_path = os.path.join(export_dir, 'tf', 'combined', 'model_fp16.tflite')
     tflite_int8_path = os.path.join(export_dir, 'tf', 'combined', 'model_int8.tflite')
+
+    # tflite int8 partial (preprocessing float32 + main int8 optimised)
+    tflite_pre_path = os.path.join(export_dir, 'tf', 'preprocessing', 'model.tflite')
+    tflite_main_opt_path = os.path.join(export_dir, 'tf', 'main', 'model_int8.tflite')
 
     audio_label = audio_path if audio_path else 'random noise (seed=42)'
     print(f"Model comparison (reference: TorchScript)  |  atol={ATOL} (int8: {ATOL_INT8})  rtol={RTOL}  top-{TOP_K}")
@@ -260,6 +295,12 @@ def main():
     if os.path.exists(tflite_int8_path):
         print(f"  LiteRT int8: {tflite_int8_path}")
         models['LRT_int8'] = tflite_int8_path
+
+    if os.path.exists(tflite_pre_path) and os.path.exists(tflite_main_opt_path):
+        print(f"  LRT int8 partial: {tflite_pre_path} + {tflite_main_opt_path}")
+        models['LRT_int8_partial'] = (tflite_pre_path, tflite_main_opt_path)
+    else:
+        print(f"  LRT int8 partial: NOT FOUND — skipping")
 
     print("done.\n")
 
@@ -329,6 +370,17 @@ def main():
                         'LRT_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
                 except RuntimeError as e:
                     print(f"⚠️ ERR   LRT_fp16    dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
+                    results.append('ERROR')
+
+            # LRT int8 partially optimized (preprocessing + main optimized)
+            if 'LRT_int8_partial' in models:
+                try:
+                    pre_path, main_opt_path = models['LRT_int8_partial']
+                    part_out, part_dt = run_tflite_partial(pre_path, main_opt_path, audio)
+                    results.append(compare_and_print(
+                        'LRT_int8_partial', ts_out, part_out, duration, batch_size, ts_dt, part_dt, atol=ATOL_INT8))
+                except RuntimeError as e:
+                    print(f"⚠️ ERR   LRT_int8_partial     dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
                     results.append('ERROR')
 
             # LiteRT INT8

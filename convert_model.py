@@ -121,7 +121,7 @@ def loadPytorchModelAndWeights():
     model = model_module.MultiHead01(model_module.backbone, model_module.nClasses, pretrained=False)
 
     # Load weights
-    checkpointPath = modelDir + 'pytorch//Checkpoint35.pth.tar'
+    checkpointPath = modelDir + 'pytorch/Checkpoint35.pth.tar'
     checkpoint = torch.load(checkpointPath, map_location='cpu', weights_only=True)
     state_dict = checkpoint['state_dict']
     model.load_state_dict(state_dict)
@@ -439,7 +439,7 @@ def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
     model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False)
 
     # Load weights
-    checkpointPath = modelDir + 'pytorch//Checkpoint35.pth.tar'
+    checkpointPath = modelDir + 'pytorch/Checkpoint35.pth.tar'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
     state_dict = checkpoint['state_dict']

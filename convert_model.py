@@ -13,16 +13,17 @@ from onnx import helper, numpy_helper
 from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
+MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
 DEFAULT_MODEL_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    'models', '01_BirdNET+_V3.0-preview3_Global_11K'
+    'models', MODEL_NAME
 )
 
 DEFAULT_OUTPUT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'export'
+    os.path.dirname(os.path.abspath(__file__)), 'export', MODEL_NAME
 )
 
 

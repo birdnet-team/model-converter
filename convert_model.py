@@ -25,9 +25,6 @@ DEFAULT_OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'export'
 )
 
-DEFAULT_CALIBRATION_AUDIO = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'example', 'soundscape.wav'
-)
 
 # Module-level state (set by _init_config, read by conversion functions)
 modelDir = DEFAULT_MODEL_DIR + '/'
@@ -35,7 +32,6 @@ outputDir = DEFAULT_OUTPUT_DIR + '/'
 batchSize = 1
 segmentDuration = 3.0
 precisions = set(ALL_PRECISIONS)  # default: all precisions
-calibrationAudioPath = DEFAULT_CALIBRATION_AUDIO
 model_module = None
 
 
@@ -43,14 +39,13 @@ def _init_config(model_dir, output_dir, batch_size, segment_duration,
                  precision_set=None, calibration_audio=None):
     """Initialise module-level config and load the model definition module."""
     global modelDir, outputDir, batchSize, segmentDuration, model_module
-    global precisions, calibrationAudioPath
+    global precisions
 
     modelDir = model_dir.rstrip('/') + '/'
     outputDir = output_dir.rstrip('/') + '/'
     batchSize = batch_size
     segmentDuration = segment_duration
     precisions = precision_set if precision_set else set(ALL_PRECISIONS)
-    calibrationAudioPath = calibration_audio or DEFAULT_CALIBRATION_AUDIO
 
     model_module_path = os.path.join(modelDir, 'pytorch', 'model.py')
     if not os.path.isfile(model_module_path):
@@ -193,9 +188,6 @@ def createTfMainModel(saveKerasModel=False):
         2. Re-wrap the SavedModel with a dynamic temporal dimension.
         3. Export to TFLite (fp32, and optionally fp16/int8) and fix static ops.
 
-    For INT8 calibration the preprocessing model is loaded to generate realistic
-    spectrogram data from ``calibrationAudioPath``.
-
     Args:
         saveKerasModel: If True, also save a ``.keras`` file.
 
@@ -323,58 +315,6 @@ def createTfMainModel(saveKerasModel=False):
         if n_fixed > 0:
             verify_fix(tflite_path, model_module.imageHeight, imageWidth)
 
-    def _make_representative_dataset():
-        """Generate calibration data for INT8 quantization of the main model.
-
-        The main model expects spectrogram input (batch, 3, height, width).
-        We run the preprocessing on calibration audio to produce realistic
-        spectrogram data, falling back to random if unavailable.
-        """
-        import librosa
-
-        # Try to produce real spectrograms from calibration audio
-        spectrograms = []
-        if os.path.isfile(calibrationAudioPath):
-            audio, _ = librosa.load(calibrationAudioPath, sr=model_module.sampleRate,
-                                    dtype=np.float32)
-            print(f"  INT8 calibration audio: {calibrationAudioPath} "
-                  f"({len(audio)/model_module.sampleRate:.1f}s)")
-            segment_samples = int(segmentDuration * model_module.sampleRate)
-            step = segment_samples // 2
-
-            # Load the TF preprocessing model to convert audio → spectrogram
-            pre_path = outputDir + 'tf/preprocessing/'
-            if os.path.isdir(pre_path):
-                pre_model = tf.saved_model.load(pre_path)
-                pre_fn = pre_model.signatures['serving_default']
-                pre_out_key = list(pre_fn.structured_outputs.keys())[0]
-                for start in range(0, max(1, len(audio) - segment_samples + 1), step):
-                    chunk = audio[start:start + segment_samples]
-                    if len(chunk) < segment_samples:
-                        chunk = np.pad(chunk, (0, segment_samples - len(chunk)))
-                    chunk_tf = tf.constant(chunk.reshape(batchSize, -1), dtype=tf.float32)
-                    spec = pre_fn(chunk_tf)[pre_out_key].numpy()
-                    # spec shape: (B, H, W, 3) → transpose to (B, 3, H, W)
-                    spec = np.transpose(spec, (0, 3, 1, 2))
-                    spectrograms.append(spec.astype(np.float32))
-            else:
-                print(f"  Warning: preprocessing model not found at {pre_path}, "
-                      "using random spectrogram data for calibration")
-        else:
-            print(f"  INT8 calibration: {calibrationAudioPath} not found, "
-                  "using random spectrogram data")
-
-        def representative_dataset():
-            if spectrograms:
-                for spec in spectrograms:
-                    yield [spec]
-            else:
-                rng = np.random.default_rng(seed=42)
-                for _ in range(100):
-                    yield [rng.standard_normal(inputShape).astype(np.float32)]
-
-        return representative_dataset
-
     print("Step 3: Converting and fixing TFLite models...")
 
     if 'fp32' in precisions:
@@ -383,7 +323,6 @@ def createTfMainModel(saveKerasModel=False):
         _convert_and_fix_tflite(dstDir, dstDir + 'model_fp16.tflite',
                                 optimize=True, supported_types=[tf.float16])
     if 'int8' in precisions:
-        rep_data = _make_representative_dataset()
         _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
 
 
@@ -477,34 +416,6 @@ def combineTfModels():
         if n_fixed > 0:
             verify_fix(tflite_path, model_module.imageHeight, imageWidth)
 
-    def _make_combined_representative_dataset():
-        """Generate calibration data for combined INT8 model (raw audio input)."""
-        import librosa
-        audio = None
-        if os.path.isfile(calibrationAudioPath):
-            audio, _ = librosa.load(calibrationAudioPath, sr=model_module.sampleRate,
-                                    dtype=np.float32)
-            print(f"  INT8 calibration audio: {calibrationAudioPath} "
-                  f"({len(audio)/model_module.sampleRate:.1f}s)")
-        else:
-            print(f"  INT8 calibration: {calibrationAudioPath} not found, using random data")
-
-        segment_samples = int(segmentDuration * model_module.sampleRate)
-
-        def representative_dataset():
-            if audio is not None:
-                step = segment_samples // 2
-                for start in range(0, max(1, len(audio) - segment_samples + 1), step):
-                    chunk = audio[start:start + segment_samples]
-                    if len(chunk) < segment_samples:
-                        chunk = np.pad(chunk, (0, segment_samples - len(chunk)))
-                    yield [chunk.reshape(batchSize, -1).astype(np.float32)]
-            else:
-                rng = np.random.default_rng(seed=42)
-                for _ in range(100):
-                    yield [rng.standard_normal((batchSize, segment_samples)).astype(np.float32)]
-
-        return representative_dataset
 
     if 'fp32' in precisions:
         _convert_and_fix_tflite(dstDir, dstDir + 'model.tflite')
@@ -512,7 +423,6 @@ def combineTfModels():
         _convert_and_fix_tflite(dstDir, dstDir + 'model_fp16.tflite',
                                 optimize=True, supported_types=[tf.float16])
     if 'int8' in precisions:
-        rep_data = _make_combined_representative_dataset()
         _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
 
 
@@ -1203,14 +1113,6 @@ def _build_parser():
         ),
     )
     parser.add_argument(
-        '--calibration-audio',
-        default=DEFAULT_CALIBRATION_AUDIO,
-        help=(
-            'Audio file for INT8 calibration data '
-            '(default: %(default)s)'
-        ),
-    )
-    parser.add_argument(
         '--segment-duration',
         type=float,
         default=3.0,
@@ -1254,8 +1156,6 @@ def main():
     print(f'Precision(s):       {", ".join(sorted(precisions))}')
     print(f'Batch size:         {batchSize}')
     print(f'Segment duration:   {segmentDuration}s')
-    if 'int8' in precisions:
-        print(f'Calibration audio:  {calibrationAudioPath}')
     print()
 
     if 'tf' in formats or 'tflite' in formats:

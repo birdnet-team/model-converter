@@ -35,8 +35,7 @@ precisions = set(ALL_PRECISIONS)  # default: all precisions
 model_module = None
 
 
-def _init_config(model_dir, output_dir, batch_size, segment_duration,
-                 precision_set=None, calibration_audio=None):
+def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_set=None):
     """Initialise module-level config and load the model definition module."""
     global modelDir, outputDir, batchSize, segmentDuration, model_module
     global precisions
@@ -1145,8 +1144,7 @@ def main():
             print('No models found in models/.')
         return
 
-    _init_config(args.model_dir, args.output_dir, args.batch_size, args.segment_duration,
-                 precision_set=set(args.precisions), calibration_audio=args.calibration_audio)
+    _init_config(args.model_dir, args.output_dir, args.batch_size, args.segment_duration, precision_set=set(args.precisions))
 
     formats = set(args.formats)
 

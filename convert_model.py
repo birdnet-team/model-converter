@@ -118,10 +118,12 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
 
     # Load model
     if includePreprocessing:
-        model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False, device=device)
+        #model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False, device=device)
+        model = model_module.MultiHead02(model_module.backbone, model_module.nClasses, pretrained=False, includePreprocessing=True, device=device)
         strict = False
     else:
-        model = model_module.MultiHead01(model_module.backbone, model_module.nClasses, pretrained=False)
+        #model = model_module.MultiHead01(model_module.backbone, model_module.nClasses, pretrained=False)
+        model = model_module.MultiHead02(model_module.backbone, model_module.nClasses, pretrained=False, includePreprocessing=False, device=device)
         strict = True  
 
     # Load weights
@@ -222,8 +224,23 @@ def createTfMainModel(saveKerasModel=False):
 
     print("Step 1: Converting PyTorch model to static TF SavedModel...")
 
+    # # Define a simple wrapper to strip out the embeddings so the resulting
+    # # TFLite model keeps the same single-output signature as before.
+    # class _SingleOutputWrapper(torch.nn.Module):
+    #     def __init__(self, core_model):
+    #         super().__init__()
+    #         self.core_model = core_model
+
+    #     def forward(self, x):
+    #         preds, embs = self.core_model(x)
+    #         return preds
+
+    # single_output_model = _SingleOutputWrapper(model)
+    # single_output_model.eval()
+
     edge_model = litert_torch.convert(
         model,
+        #single_output_model,
         sample_inputs,
         _saved_model_dir=staticDir,
     )
@@ -256,7 +273,14 @@ def createTfMainModel(saveKerasModel=False):
         ])
         def serve(self, x):
             result = self._fn(**{input_keys[0]: x})
-            return result[output_keys[0]]
+            #return result[output_keys[0]]
+            #return result
+            # Map the generic litert_torch output names to explicit dict keys
+            return {
+                'predictions': result['output_0'],
+                'embeddings': result['output_1']
+            }
+
 
     wrapper = DynamicWrapper(static_model, static_fn)
 
@@ -372,8 +396,13 @@ def combineTfModels():
             pre_out = self.pre.signatures['serving_default'](x)['output_0']
             # reshape pre_out to match input shape of main model: (B, 224, W, 3) --> (B, 3, 224, W)
             pre_out = tf.transpose(pre_out, perm=[0, 3, 1, 2])
-            main_out = self.main.signatures['serving_default'](pre_out)['output_0']
-            return main_out
+            #main_out = self.main.signatures['serving_default'](pre_out)['output_0']
+            main_out = self.main.signatures['serving_default'](pre_out)
+            #return main_out
+            return {
+                'predictions': main_out['predictions'],
+                'embeddings': main_out['embeddings']
+            }
 
 
     path_pre = outputDir + 'tf/preprocessing/'
@@ -629,6 +658,11 @@ def createTorchScriptModel():
             if m is not None:
                 m.float()
 
+        # Revert the avg_kernel buffer used in pooling back to float32
+        if hasattr(fp16_backbone, '_avg_kernel'):
+            fp16_backbone._avg_kernel = fp16_backbone._avg_kernel.float()
+
+
         class _TS_FP16Wrapper(torch.nn.Module):
             """Accepts float32 audio; runs preprocessing in float32, then casts
             spectrogram to float16 for backbone stages 1–4, then returns to
@@ -641,8 +675,10 @@ def createTorchScriptModel():
 
             def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 spec = self.preprocess(x)          # float32 audio → float32 spec
-                emb, pred = self.backbone(spec.half())  # fp16 entry; fp32 exit
-                return emb, pred
+                #emb, pred = self.backbone(spec.half())  # fp16 entry; fp32 exit
+                #return emb, pred
+                pred, emb = self.backbone(spec.half())  # <-- Flipped order
+                return pred, emb # <-- Flipped order
 
         wrapper = _TS_FP16Wrapper(model.preprocess, fp16_backbone)
         scripted_fp16 = torch.jit.script(wrapper)
@@ -872,7 +908,8 @@ def createOnnxModel():
         dstDir+'temp.onnx', 
         verbose=True, 
         input_names=['input'],
-        output_names=['embeddings', 'predictions'],
+        #output_names=['embeddings', 'predictions'],
+        output_names=['predictions', 'embeddings'],
         opset_version=18,
         dynamo=True,
         dynamic_shapes={'input': {0: 'batch_size', 1: 'samples'}}

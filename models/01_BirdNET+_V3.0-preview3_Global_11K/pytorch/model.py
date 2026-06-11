@@ -132,167 +132,6 @@ class GeM(torch.nn.Module):
         return x
 
 
-class MultiHead01(nn.Module):
-
-    #def __init__(self, backbone, nClasses, pretrained=True):
-    def __init__(self, backbone, nClasses, pretrained=False):
-        super().__init__()
-
-
-        self.encoder = timm.create_model(backbone, pretrained=pretrained, num_classes=0, global_pool='')
-
-
-        # Get number of input features for the classifier
-        #dummyInput = torch.randn(1, 3, imageHeight, imageWidth)
-        dummyInput = torch.randn(1, 3, 64, 64)
-        dummyOutput = self.encoder(dummyInput)
-        in_features = dummyOutput.shape[1]
-        print('in_features', in_features)
-        print('dummyOutput.shape', dummyOutput.shape)
-
-        # print('self.encoder')
-        # print(self.encoder)
-
-        # Head 1 (Bc24Cnn)
-        self.global_pool = GeM()
-        self.dropouts = torch.nn.ModuleList([torch.nn.Dropout(p) for p in np.linspace(0.1, 0.5, 5)])
-        self.head = torch.nn.Linear(in_features, nClasses)
-
-
-        # Head 2 (FED wihout BatchNorm)
-        self.fc1 = nn.Linear(in_features, 2048, bias=True)
-        self.att_block = AttBlock(2048, nClasses, activation="linear")
-
-        # Head 3 (SED with BatchNorm)
-        self.fc2 = nn.Linear(in_features, 2048, bias=True)
-        self.att_block2 = AttBlock(2048, nClasses, activation="linear")
-        
-        
-        self.init_weight()
-
-        # Fixed depthwise conv kernel for avg_pool1d (used by _pool1d_avg)
-        # persistent=False: not saved/loaded from checkpoints (not a learned parameter)
-        self.register_buffer('_avg_kernel', torch.ones(in_features, 1, 3) / 3.0, persistent=False)
-
-    ## 1D pooling — avoiding both SLICE ops and unsupported StableHLO lowerings:
-    ## - F.max_pool1d  → tfl.max_pool_2d ✅ (works natively)
-    ## - F.avg_pool1d  → vhlo.reduce_window ❌ (not supported by TFLite converter)
-    ## - Manual slicing → tfl.slice ❌ (bakes batch=1 during tracing)
-    ## Solution: avg_pool1d via depthwise conv1d with fixed 1/3 weights.
-    def _pool1d_avg(self, x):
-        """avg_pool1d via depthwise conv1d with uniform 1/3 weights. x: [B, C, T]"""
-        return F.conv1d(x, self._avg_kernel, padding=1, groups=self._avg_kernel.shape[0])
-
-    def _pool1d_max(self, x):
-        """max_pool1d with kernel_size=3, stride=1, padding=1. x: [B, C, T]"""
-        return F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-
-
-    
-    def init_weight(self):
-        init_layer(self.fc1)
-        init_layer(self.fc2)
-    
-    def forward(self, input):
-
-        x = input
-        #print('input', x.shape) # torch.Size([48, 3, 224, 557])
-
-
-        # Not needed if already 3 channel
-        #x = x.expand(x.shape[0], 3, x.shape[2], x.shape[3]) # torch.Size([48, 1, 224, 557]) --> torch.Size([48, 3, 224, 557])
-        #print('expand', x.shape) # torch.Size([48, 3, 224, 557])
-        
-        features = self.encoder(x)
-        #print('x = self.encoder(x)', x.shape) # torch.Size([48, 1408, 7, 18])
-
-        ## Head 1
-        x = self.global_pool(features)
-        logitsHead1 = sum([self.head(dropout(x)) for dropout in self.dropouts]) / 5
-
-
-        ## Head 2 
-        
-        #print('self.encoder.forward_features', x.shape)     # torch.Size([48, 1408, 7, 18]) 
-        x = torch.mean(features, dim=3)
-        #print('torch.mean(x, dim=3)', x.shape)              # torch.Size([48, 1408, 7])     
-
-        ## Custom 1D pooling (for tflite compatibility)
-        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x1 = self._pool1d_max(x)
-        x2 = self._pool1d_avg(x)
-
-        x = x1 + x2 # ToCheck if concat or using only max or avg is better
-        #print('x = x1 + x2', x.shape)  # torch.Size([48, 1408, 7]) 
-
-        x = F.dropout(x, p=0.4, training=self.training)
-        #print('01', x.shape) # torch.Size([8, 1408, 7])
-        x = x.transpose(1, 2)
-        #print('02', x.shape) # torch.Size([8, 7, 1408])
-        x = F.relu_(self.fc1(x))
-        #print('03', x.shape) # torch.Size([8, 7, 2048])
-        x = x.transpose(1, 2)
-        #print('04', x.shape) # torch.Size([8, 2048, 7])
-        x = F.dropout(x, p=0.4, training=self.training)
-        #print('F.dropou', x.shape) # torch.Size([8, 2048, 7])
-
-        (clipwise_output, norm_att, segmentwise_output) = self.att_block(x)
-        logit = torch.sum(norm_att * self.att_block.cla(x), dim=2)
-        #print('logit', logit.shape) # torch.Size([8, 254])
-        segmentwise_output = segmentwise_output.transpose(1, 2)
-        #print('segmentwise_output', segmentwise_output.shape) # torch.Size([8, 7, 254])
-
-        logitsHead2 = logit
-        logitsHead2PerTime = segmentwise_output
-
-        ## Head 3
-
-        #print('self.encoder.forward_features', x.shape)     # torch.Size([48, 1408, 7, 18]) 
-        x = torch.mean(features, dim=2)
-        #print('torch.mean(x, dim=2)', x.shape)              # torch.Size([8, 1408, 18])   
-
-        ## Custom 1D pooling (for tflite compatibility)
-        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x1 = self._pool1d_max(x)
-        x2 = self._pool1d_avg(x)
-
-        x = x1 + x2
-
-
-        x = F.dropout(x, p=0.4, training=self.training)
-        x = x.transpose(1, 2)
-        x = F.relu_(self.fc2(x))
-        x = x.transpose(1, 2)
-        x = F.dropout(x, p=0.4, training=self.training)
-
-        (clipwise_output, norm_att, segmentwise_output) = self.att_block2(x)
-        logit = torch.sum(norm_att * self.att_block2.cla(x), dim=2)
-        #print('logit', logit.shape) # torch.Size([8, 254])
-        segmentwise_output = segmentwise_output.transpose(1, 2)
-        #print('segmentwise_output', segmentwise_output.shape) # torch.Size([8, 18, 254])
-
-        logitsHead3 = logit
-        logitsHead3PerTime = segmentwise_output
-
-
-        # output_dict = {
-        #     'logitsHead1' : logitsHead1,
-        #     'logitsHead2' : logitsHead2,
-        #     'logitsHead2PerTime' : logitsHead2PerTime,
-        #     'probsHead2Max': torch.sigmoid(torch.max(logitsHead2PerTime, dim=1)[0]),
-        #     'logitsHead3' : logitsHead3,
-        #     'logitsHead3PerTime' : logitsHead3PerTime,
-        #     'probsHead3Max': torch.sigmoid(torch.max(logitsHead3PerTime, dim=1)[0])
-        # }
-
-        # return output_dict
-    
-        # Single output for TorchScript export
-        return torch.sigmoid((logitsHead1 + logitsHead2 + logitsHead3) / 3.0)
-
-
 # Approximates tf preprocessing
 class PreprocessingLayerTorch(nn.Module):
     def __init__(
@@ -421,11 +260,15 @@ class PreprocessingLayerTorch(nn.Module):
         return (melSpec - self.mean) / self.std  # Manual normalization for onnx export
 
 
-class MultiHead01WithPreprocessing(nn.Module):
+class MultiHead02(nn.Module):
 
-    #def __init__(self, backbone, nClasses, pretrained=True):
-    def __init__(self, backbone, nClasses, pretrained=False, device='cpu'):
+    def __init__(self, backbone, nClasses, pretrained=False, includePreprocessing=False, device='cpu'):
         super().__init__()
+
+        if includePreprocessing:
+            self.preprocess = PreprocessingLayerTorch(device=device)
+        else:
+            self.preprocess = torch.nn.Identity()
 
 
         self.encoder = timm.create_model(backbone, pretrained=pretrained, num_classes=0, global_pool='')
@@ -459,9 +302,22 @@ class MultiHead01WithPreprocessing(nn.Module):
         
         self.init_weight()
 
-        # Preprocessing
-        #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.preprocess = PreprocessingLayerTorch(device=device)
+        # Fixed depthwise conv kernel for avg_pool1d (used by _pool1d_avg)
+        # persistent=False: not saved/loaded from checkpoints (not a learned parameter)
+        self.register_buffer('_avg_kernel', torch.ones(in_features, 1, 3) / 3.0, persistent=False)
+
+    ## 1D pooling — avoiding both SLICE ops and unsupported StableHLO lowerings:
+    ## - F.max_pool1d  → tfl.max_pool_2d ✅ (works natively)
+    ## - F.avg_pool1d  → vhlo.reduce_window ❌ (not supported by TFLite converter)
+    ## - Manual slicing → tfl.slice ❌ (bakes batch=1 during tracing)
+    ## Solution: avg_pool1d via depthwise conv1d with fixed 1/3 weights.
+    def _pool1d_avg(self, x):
+        """avg_pool1d via depthwise conv1d with uniform 1/3 weights. x: [B, C, T]"""
+        return F.conv1d(x, self._avg_kernel, padding=1, groups=self._avg_kernel.shape[0])
+
+    def _pool1d_max(self, x):
+        """max_pool1d with kernel_size=3, stride=1, padding=1. x: [B, C, T]"""
+        return F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
 
 
     
@@ -471,18 +327,13 @@ class MultiHead01WithPreprocessing(nn.Module):
     
     def forward(self, input):
 
-        # x = input
-        # #print('input', x.shape) # torch.Size([48, 3, 224, 557])
+        #x = input
+        #print('input', x.shape) # torch.Size([48, 3, 224, 557])
 
-
-        # # Not needed if already 3 channel
-        # x = x.expand(x.shape[0], 3, x.shape[2], x.shape[3]) # torch.Size([48, 1, 224, 557]) --> torch.Size([48, 3, 224, 557])
-        # #print('expand', x.shape) # torch.Size([48, 3, 224, 557])
-        
-        # Preprocessing
+        # If include_preprocessing is False, this operates as x = input
         x = self.preprocess(input)
 
-        
+
         features = self.encoder(x)
         #print('x = self.encoder(x)', x.shape) # torch.Size([48, 1408, 7, 18])
 
@@ -504,8 +355,13 @@ class MultiHead01WithPreprocessing(nn.Module):
         x = torch.mean(features, dim=3)
         #print('torch.mean(x, dim=3)', x.shape)              # torch.Size([48, 1408, 7])     
 
-        x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+
+        ## Custom 1D pooling (for tflite compatibility)
+        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
+        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x1 = self._pool1d_max(x)
+        x2 = self._pool1d_avg(x)
+
         x = x1 + x2 # ToCheck if concat or using only max or avg is better
         #print('x = x1 + x2', x.shape)  # torch.Size([48, 1408, 7]) 
 
@@ -535,8 +391,13 @@ class MultiHead01WithPreprocessing(nn.Module):
         x = torch.mean(features, dim=2)
         #print('torch.mean(x, dim=2)', x.shape)              # torch.Size([8, 1408, 18])   
 
-        x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+
+        ## Custom 1D pooling (for tflite compatibility)
+        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
+        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
+        x1 = self._pool1d_max(x)
+        x2 = self._pool1d_avg(x)
+
         x = x1 + x2
 
 
@@ -571,8 +432,7 @@ class MultiHead01WithPreprocessing(nn.Module):
         # Single output for TorchScript export
         #return torch.sigmoid((logitsHead1 + logitsHead2 + logitsHead3) / 3.0)
 
-        return embeddings, torch.sigmoid((logitsHead1 + logitsHead2 + logitsHead3) / 3.0)
-
+        return torch.sigmoid((logitsHead1 + logitsHead2 + logitsHead3) / 3.0), embeddings
 
 # Tf preprocessing as Keras layer
 class Preprocessing(Layer):

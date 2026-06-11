@@ -71,7 +71,8 @@ def run_torchscript(model, audio_np: np.ndarray, device: str, input_dtype=torch.
     with torch.no_grad():
         audio_t = torch.from_numpy(audio_np).to(device=device, dtype=input_dtype)
         t0 = time.perf_counter()
-        embeddings, predictions = model(audio_t)
+        #embeddings, predictions = model(audio_t)
+        predictions, embeddings = model(audio_t)
         if device != 'cpu':
             torch.cuda.synchronize()
         dt = time.perf_counter() - t0
@@ -88,8 +89,8 @@ def run_onnx(session, audio_np: np.ndarray) -> np.ndarray:
     t0 = time.perf_counter()
     outputs = session.run(None, {input_name: audio_np})
     dt = time.perf_counter() - t0
-    # outputs[0] = embeddings, outputs[1] = predictions
-    return outputs[1], dt
+    # outputs[0] = predictions, outputs[1] = embeddings
+    return outputs[0], dt  # Return index 0 for predictions
 
 
 def run_tflite(model_path: str, audio_np: np.ndarray) -> np.ndarray:
@@ -111,6 +112,13 @@ def run_tflite(model_path: str, audio_np: np.ndarray) -> np.ndarray:
     t0 = time.perf_counter()
     interpreter.invoke()
     dt = time.perf_counter() - t0
+    
+    # Grab the tensor explicitly named 'predictions'
+    for detail in output_details:
+        if 'predictions' in detail['name']:
+            return interpreter.get_tensor(detail['index']), dt
+            
+    # Fallback just in case
     return interpreter.get_tensor(output_details[0]['index']), dt
 
 
@@ -141,6 +149,12 @@ def run_tflite_partial(pre_path: str, main_path: str, audio_np: np.ndarray):
     main.set_tensor(main_in[0]['index'], spec)
     main.invoke()
     dt = time.perf_counter() - t0
+    # Grab the tensor explicitly named 'predictions'
+    for detail in main_out:
+        if 'predictions' in detail['name']:
+            return main.get_tensor(detail['index']), dt
+            
+    # Fallback
     return main.get_tensor(main_out[0]['index']), dt
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

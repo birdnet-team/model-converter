@@ -110,21 +110,25 @@ def createTfPreprocessingModel():
         f.write(tflite_model)
     print('Exported preprocessing tflite model to', dstPath)
 
-    
-def loadPytorchModelAndWeights():
-    """Load the MultiHead01 classifier (without preprocessing) and its checkpoint weights.
 
-    Returns:
-        torch.nn.Module: The model in eval mode on CPU.
-    """
+def loadPytorchModelAndWeights(includePreprocessing=True):
+
+    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = 'cpu'
+
     # Load model
-    model = model_module.MultiHead01(model_module.backbone, model_module.nClasses, pretrained=False)
+    if includePreprocessing:
+        model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False, device=device)
+        strict = False
+    else:
+        model = model_module.MultiHead01(model_module.backbone, model_module.nClasses, pretrained=False)
+        strict = True  
 
     # Load weights
     checkpointPath = modelDir + 'pytorch/Checkpoint35.pth.tar'
-    checkpoint = torch.load(checkpointPath, map_location='cpu', weights_only=True)
+    checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
     state_dict = checkpoint['state_dict']
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=strict)
     model.eval()
 
     return model
@@ -141,7 +145,7 @@ def get_expected_t_dims():
     Returns:
         list[int]: Sorted list of temporal dimension sizes at ``segmentDuration``.
     """
-    model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
+    model = loadPytorchModelAndWeights(includePreprocessing=True)
     device = next(model.parameters()).device
     
     def get_shapes_for_duration(duration):
@@ -194,7 +198,7 @@ def createTfMainModel(saveKerasModel=False):
     Output: ``{outputDir}/tf/main/`` (SavedModel + TFLite variants)
     """
     expected_t_dims = get_expected_t_dims()
-    model = loadPytorchModelAndWeights()
+    model = loadPytorchModelAndWeights(includePreprocessing=False)
 
     imageWidth = int(model_module.imageWidthResizeFactor * segmentDuration * model_module.sampleRate / model_module.fftHopSizeInSamples)
 
@@ -426,29 +430,6 @@ def combineTfModels():
         _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
 
 
-def loadPytorchModelAndWeightsIncludingPreprocessingLayer():
-    """Load the full model (preprocessing + classifier) and its checkpoint weights.
-
-    Uses ``strict=False`` because the preprocessing layer parameters are not
-    stored in the checkpoint — they are initialised from layer defaults.
-
-    Returns:
-        torch.nn.Module: The model in eval mode on GPU (if available) or CPU.
-    """
-    # Load model
-    model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False)
-
-    # Load weights
-    checkpointPath = modelDir + 'pytorch/Checkpoint35.pth.tar'
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
-    state_dict = checkpoint['state_dict']
-    model.load_state_dict(state_dict, strict=False) # strict=False to ignore missing keys for preprocessing parameters
-    model.to(device)
-    model.eval()
-
-    return model
-
 
 class _Fp32StageWrapper(torch.nn.Module):
     """Adapter that accepts a float16 tensor, runs a module in float32,
@@ -586,7 +567,7 @@ def createTorchScriptModel():
     Output: ``{outputDir}/torchscript/model[_fp16].pt``
     """
     # Load model and weights
-    model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
+    model = loadPytorchModelAndWeights(includePreprocessing=True)
     
     dstDir = outputDir + 'torchscript/'
     os.makedirs(dstDir, exist_ok=True)
@@ -876,7 +857,7 @@ def createOnnxModel():
     Output: ``{outputDir}/onnx/model[_fp16|_int8].onnx``
     """
     # Load model and weights
-    model = loadPytorchModelAndWeightsIncludingPreprocessingLayer()
+    model = loadPytorchModelAndWeights(includePreprocessing=True)
 
     # Create dummy input (but model should be able to handle dynamic batch size and input length, so this is just for export)
     batch_size = 4

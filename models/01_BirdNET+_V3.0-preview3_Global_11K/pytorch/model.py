@@ -134,7 +134,8 @@ class GeM(torch.nn.Module):
 
 class MultiHead01(nn.Module):
 
-    def __init__(self, backbone, nClasses, pretrained=True):
+    #def __init__(self, backbone, nClasses, pretrained=True):
+    def __init__(self, backbone, nClasses, pretrained=False):
         super().__init__()
 
 
@@ -422,7 +423,8 @@ class PreprocessingLayerTorch(nn.Module):
 
 class MultiHead01WithPreprocessing(nn.Module):
 
-    def __init__(self, backbone, nClasses, pretrained=True):
+    #def __init__(self, backbone, nClasses, pretrained=True):
+    def __init__(self, backbone, nClasses, pretrained=False, device='cpu'):
         super().__init__()
 
 
@@ -458,7 +460,7 @@ class MultiHead01WithPreprocessing(nn.Module):
         self.init_weight()
 
         # Preprocessing
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.preprocess = PreprocessingLayerTorch(device=device)
 
 

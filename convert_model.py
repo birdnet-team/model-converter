@@ -15,6 +15,12 @@ from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
 
+# Weights for the three heads in model. 
+# Adjusting these allows to export a single-head model (e.g. Head 1 only with [1.0, 0.0, 0.0]) without modifying the model code or checkpoint.
+
+HEAD_WEIGHTS = [0.4, 0.35, 0.25]
+#HEAD_WEIGHTS = [1.0, 0.0, 0.0]
+
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
 DEFAULT_MODEL_DIR = os.path.join(
@@ -117,20 +123,27 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
     device = 'cpu'
 
     # Load model
-    if includePreprocessing:
-        #model = model_module.MultiHead01WithPreprocessing(model_module.backbone, model_module.nClasses, pretrained=False, device=device)
-        model = model_module.MultiHead02(model_module.backbone, model_module.nClasses, pretrained=False, includePreprocessing=True, device=device)
-        strict = False
-    else:
-        #model = model_module.MultiHead01(model_module.backbone, model_module.nClasses, pretrained=False)
-        model = model_module.MultiHead02(model_module.backbone, model_module.nClasses, pretrained=False, includePreprocessing=False, device=device)
-        strict = True  
+    model = model_module.MultiHead02(
+        model_module.backbone, 
+        model_module.nClasses, 
+        pretrained=False, 
+        includePreprocessing=includePreprocessing, 
+        device=device, 
+        headWeights=HEAD_WEIGHTS
+        )
 
     # Load weights
     checkpointPath = modelDir + 'pytorch/Checkpoint35.pth.tar'
     checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
     state_dict = checkpoint['state_dict']
+    if includePreprocessing:
+        strict = False
+    else:
+        strict = True  
     model.load_state_dict(state_dict, strict=strict)
+
+    model.prune_unused_weights()
+
     model.eval()
 
     return model
@@ -895,6 +908,9 @@ def createOnnxModel():
     # Load model and weights
     model = loadPytorchModelAndWeights(includePreprocessing=True)
 
+    # Pre-fold dangerous BN variances so they don't blow up the ONNX FP16 conversion Cast
+    _fold_bn_for_fp16(model)
+
     # Create dummy input (but model should be able to handle dynamic batch size and input length, so this is just for export)
     batch_size = 4
     inputBatch = torch.rand(batch_size, int(segmentDuration*model_module.sampleRate)).to(next(model.parameters()).device)
@@ -1008,7 +1024,7 @@ def createOnnxModel():
         fp16_model = float16.convert_float_to_float16(
             fp32_model,
             keep_io_types=True,
-            op_block_list=['STFT', 'Log', 'Pow', 'Exp'],
+            op_block_list=['STFT', 'Log', 'Pow', 'Exp', 'GlobalAveragePool', 'ReduceMean', 'AveragePool'],
             node_block_list=preproc_nodes or None,
         )
 

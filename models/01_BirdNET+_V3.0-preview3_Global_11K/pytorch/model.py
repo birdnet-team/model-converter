@@ -10,6 +10,7 @@ from tensorflow import keras
 from tensorflow.python.keras.engine.base_layer import Layer
 
 import torchaudio
+from typing import Optional
 
 backbone = 'tf_efficientnetv2_s_in21k'
 nClasses = 11560 # 1225
@@ -262,8 +263,17 @@ class PreprocessingLayerTorch(nn.Module):
 
 class MultiHead02(nn.Module):
 
-    def __init__(self, backbone, nClasses, pretrained=False, includePreprocessing=False, device='cpu'):
+    # Tell TorchScript to treat these attributes as static constants during compilation
+    __constants__ = ['w0', 'w1', 'w2']
+
+    def __init__(self, backbone, nClasses, pretrained=False, includePreprocessing=False, device='cpu', headWeights=[1.0/3.0, 1.0/3.0, 1.0/3.0]):
         super().__init__()
+
+        # Must cast to built-in float for TorchScript constants
+        self.w0 = float(headWeights[0])
+        self.w1 = float(headWeights[1])
+        self.w2 = float(headWeights[2])
+
 
         if includePreprocessing:
             self.preprocess = PreprocessingLayerTorch(device=device)
@@ -285,26 +295,27 @@ class MultiHead02(nn.Module):
         # print('self.encoder')
         # print(self.encoder)
 
-        # Head 1 (Bc24Cnn)
+        # Unconditionally instantiate all parameters to satisfy load_state_dict() perfectly
+        # TorchScript's dead-code elimination in forward() will strip unused branches from the final export
+        
         self.global_pool = GeM()
         self.dropouts = torch.nn.ModuleList([torch.nn.Dropout(p) for p in np.linspace(0.1, 0.5, 5)])
         self.head = torch.nn.Linear(in_features, nClasses)
 
-
-        # Head 2 (FED wihout BatchNorm)
         self.fc1 = nn.Linear(in_features, 2048, bias=True)
         self.att_block = AttBlock(2048, nClasses, activation="linear")
 
-        # Head 3 (SED with BatchNorm)
         self.fc2 = nn.Linear(in_features, 2048, bias=True)
         self.att_block2 = AttBlock(2048, nClasses, activation="linear")
-        
-        
+
+
         self.init_weight()
 
         # Fixed depthwise conv kernel for avg_pool1d (used by _pool1d_avg)
         # persistent=False: not saved/loaded from checkpoints (not a learned parameter)
+        # Always define this buffer so TorchScript doesn't crash when compiling _pool1d_avg
         self.register_buffer('_avg_kernel', torch.ones(in_features, 1, 3) / 3.0, persistent=False)
+
 
     ## 1D pooling — avoiding both SLICE ops and unsupported StableHLO lowerings:
     ## - F.max_pool1d  → tfl.max_pool_2d ✅ (works natively)
@@ -318,121 +329,101 @@ class MultiHead02(nn.Module):
     def _pool1d_max(self, x):
         """max_pool1d with kernel_size=3, stride=1, padding=1. x: [B, C, T]"""
         return F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
+    
 
 
     
+    # def init_weight(self):
+    #     init_layer(self.fc1)
+    #     init_layer(self.fc2)
     def init_weight(self):
-        init_layer(self.fc1)
-        init_layer(self.fc2)
-    
+        if hasattr(self, 'fc1'): init_layer(self.fc1)
+        if hasattr(self, 'fc2'): init_layer(self.fc2)
+
+
+    def prune_unused_weights(self):
+        """Call this AFTER model.load_state_dict() but BEFORE torch.jit.script()"""
+        # Replace unused giant layers with microscopic 1x1 dummy layers.
+        # TorchScript will still see the attributes exist for parsing, but their 
+        # serialized file size will be basically 0 bytes.
+        
+        if self.w0 == 0.0:
+            self.head = torch.nn.Linear(1, 1)
+            
+        if self.w1 == 0.0:
+            self.fc1 = nn.Linear(1, 1, bias=True)
+            self.att_block = AttBlock(1, 1, activation="linear")
+            
+        if self.w2 == 0.0:
+            self.fc2 = nn.Linear(1, 1, bias=True)
+            self.att_block2 = AttBlock(1, 1, activation="linear")    
+
     def forward(self, input):
 
-        #x = input
-        #print('input', x.shape) # torch.Size([48, 3, 224, 557])
-
-        # If include_preprocessing is False, this operates as x = input
         x = self.preprocess(input)
-
-
         features = self.encoder(x)
-        #print('x = self.encoder(x)', x.shape) # torch.Size([48, 1408, 7, 18])
+        embeddings: Optional[torch.Tensor] = None # Hint for TorchScript
+        
+        # Accumulate final un-sigmoidized logits here
+        final_logits = torch.zeros((1,), device=features.device) # Dummy tensor, will be broadcasted
 
         ## Head 1
-        embeddings = self.global_pool(features)
-        #print('embeddings.shape', embeddings.shape) # torch.Size([s31, 1408])
-        
-        #logitsHead1 = sum([self.head(dropout(x)) for dropout in self.dropouts]) / 5
-        
-        # Use enumeration for TorchScript compatibility
-        logitsHead1 = torch.zeros_like(self.head(self.dropouts[0](embeddings)))
-        for dropout in self.dropouts:
-            logitsHead1 = logitsHead1 + self.head(dropout(embeddings))
-        logitsHead1 = logitsHead1 / len(self.dropouts)
+        if self.w0 > 0.0:
+            embeddings = self.global_pool(features)
+            logitsHead1 = torch.zeros_like(self.head(self.dropouts[0](embeddings)))
+            for dropout in self.dropouts:
+                logitsHead1 = logitsHead1 + self.head(dropout(embeddings))
+            logitsHead1 = logitsHead1 / len(self.dropouts)
+            
+            # Start accumulating
+            final_logits = self.w0 * logitsHead1
 
         ## Head 2 
-        
-        #print('self.encoder.forward_features', x.shape)     # torch.Size([48, 1408, 7, 18]) 
-        x = torch.mean(features, dim=3)
-        #print('torch.mean(x, dim=3)', x.shape)              # torch.Size([48, 1408, 7])     
+        if self.w1 > 0.0:
+            x_h2 = torch.mean(features, dim=3)
+            x1 = self._pool1d_max(x_h2)
+            x2 = self._pool1d_avg(x_h2)
+            x_h2 = x1 + x2
 
+            x_h2 = F.dropout(x_h2, p=0.4, training=self.training)
+            x_h2 = x_h2.transpose(1, 2)
+            x_h2 = F.relu_(self.fc1(x_h2))
+            x_h2 = x_h2.transpose(1, 2)
+            x_h2 = F.dropout(x_h2, p=0.4, training=self.training)
 
-        ## Custom 1D pooling (for tflite compatibility)
-        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x1 = self._pool1d_max(x)
-        x2 = self._pool1d_avg(x)
+            (_, norm_att, _) = self.att_block(x_h2)
+            logitsHead2 = torch.sum(norm_att * self.att_block.cla(x_h2), dim=2)
+            
+            # Add to accumulation
+            final_logits = final_logits + self.w1 * logitsHead2
 
-        x = x1 + x2 # ToCheck if concat or using only max or avg is better
-        #print('x = x1 + x2', x.shape)  # torch.Size([48, 1408, 7]) 
+        ## Head 3
+        if self.w2 > 0.0:
+            x_h3 = torch.mean(features, dim=2)
+            x1 = self._pool1d_max(x_h3)
+            x2 = self._pool1d_avg(x_h3)
+            x_h3 = x1 + x2
 
-        x = F.dropout(x, p=0.4, training=self.training)
-        #print('01', x.shape) # torch.Size([8, 1408, 7])
-        x = x.transpose(1, 2)
-        #print('02', x.shape) # torch.Size([8, 7, 1408])
-        x = F.relu_(self.fc1(x))
-        #print('03', x.shape) # torch.Size([8, 7, 2048])
-        x = x.transpose(1, 2)
-        #print('04', x.shape) # torch.Size([8, 2048, 7])
-        x = F.dropout(x, p=0.4, training=self.training)
-        #print('F.dropou', x.shape) # torch.Size([8, 2048, 7])
+            x_h3 = F.dropout(x_h3, p=0.4, training=self.training)
+            x_h3 = x_h3.transpose(1, 2)
+            x_h3 = F.relu_(self.fc2(x_h3))
+            x_h3 = x_h3.transpose(1, 2)
+            x_h3 = F.dropout(x_h3, p=0.4, training=self.training)
 
-        (clipwise_output, norm_att, segmentwise_output) = self.att_block(x)
-        logit = torch.sum(norm_att * self.att_block.cla(x), dim=2)
-        #print('logit', logit.shape) # torch.Size([8, 254])
-        segmentwise_output = segmentwise_output.transpose(1, 2)
-        #print('segmentwise_output', segmentwise_output.shape) # torch.Size([8, 7, 254])
+            (_, norm_att, _) = self.att_block2(x_h3)
+            logitsHead3 = torch.sum(norm_att * self.att_block2.cla(x_h3), dim=2)
+            
+            # Add to accumulation
+            final_logits = final_logits + self.w2 * logitsHead3
 
-        logitsHead2 = logit
-        logitsHead2PerTime = segmentwise_output
+        # Return predictions and embeddings
+        # If Head 1 was disabled, 'embeddings' will legitimately be None (or you can calculate it independently)
+        if embeddings is None:
+            # Fallback embedding mapping if Head 1 is pruned but you still want embeddings
+            embeddings = torch.nn.functional.adaptive_avg_pool2d(features, (1,1)).flatten(start_dim=1)
+            
+        return torch.sigmoid(final_logits), embeddings
 
-        ## Head 3model-converter/models/01_BirdNET+_V3.0-preview3_Global_11K/pytorch/model_bu4.py
-
-        #print('self.encoder.forward_features', x.shape)     # torch.Size([48, 1408, 7, 18]) 
-        x = torch.mean(features, dim=2)
-        #print('torch.mean(x, dim=2)', x.shape)              # torch.Size([8, 1408, 18])   
-
-
-        ## Custom 1D pooling (for tflite compatibility)
-        # x1 = F.max_pool1d(x, kernel_size=3, stride=1, padding=1)
-        # x2 = F.avg_pool1d(x, kernel_size=3, stride=1, padding=1)
-        x1 = self._pool1d_max(x)
-        x2 = self._pool1d_avg(x)
-
-        x = x1 + x2
-
-
-        x = F.dropout(x, p=0.4, training=self.training)
-        x = x.transpose(1, 2)
-        x = F.relu_(self.fc2(x))
-        x = x.transpose(1, 2)
-        x = F.dropout(x, p=0.4, training=self.training)
-
-        (clipwise_output, norm_att, segmentwise_output) = self.att_block2(x)
-        logit = torch.sum(norm_att * self.att_block2.cla(x), dim=2)
-        #print('logit', logit.shape) # torch.Size([8, 254])
-        segmentwise_output = segmentwise_output.transpose(1, 2)
-        #print('segmentwise_output', segmentwise_output.shape) # torch.Size([8, 18, 254])
-
-        logitsHead3 = logit
-        logitsHead3PerTime = segmentwise_output
-
-
-        # output_dict = {
-        #     'logitsHead1' : logitsHead1,
-        #     'logitsHead2' : logitsHead2,
-        #     'logitsHead2PerTime' : logitsHead2PerTime,
-        #     'probsHead2Max': torch.sigmoid(torch.max(logitsHead2PerTime, dim=1)[0]),
-        #     'logitsHead3' : logitsHead3,
-        #     'logitsHead3PerTime' : logitsHead3PerTime,
-        #     'probsHead3Max': torch.sigmoid(torch.max(logitsHead3PerTime, dim=1)[0])
-        # }
-
-        # return output_dict
-
-        # Single output for TorchScript export
-        #return torch.sigmoid((logitsHead1 + logitsHead2 + logitsHead3) / 3.0)
-
-        return torch.sigmoid((logitsHead1 + logitsHead2 + logitsHead3) / 3.0), embeddings
 
 # Tf preprocessing as Keras layer
 class Preprocessing(Layer):

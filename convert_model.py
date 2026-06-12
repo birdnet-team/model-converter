@@ -15,11 +15,6 @@ from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
 
-# Weights for the three heads in model. 
-# Adjusting these allows to export a single-head model (e.g. Head 1 only with [1.0, 0.0, 0.0]) without modifying the model code or checkpoint.
-
-HEAD_WEIGHTS = [0.4, 0.35, 0.25]
-#HEAD_WEIGHTS = [1.0, 0.0, 0.0]
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
@@ -40,13 +35,14 @@ batchSize = 1
 segmentDuration = 3.0
 precisions = set(ALL_PRECISIONS)  # default: all precisions
 experimentalMode = False  # default: experimental mode off
+headWeights = None  # default: use model_module.headWeights
 model_module = None
 
 
-def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False):
+def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False, head_weights=None):
     """Initialise module-level config and load the model definition module."""
     global modelDir, outputDir, batchSize, segmentDuration, model_module
-    global precisions, experimentalMode
+    global precisions, experimentalMode, headWeights
 
     modelDir = model_dir.rstrip('/') + '/'
     outputDir = output_dir.rstrip('/') + '/'
@@ -65,6 +61,8 @@ def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_
     sys.modules[module_name] = model_module
     spec.loader.exec_module(model_module)
 
+    # Set headWeights after model_module is loaded so we can fall back to its default
+    headWeights = head_weights if head_weights is not None else model_module.headWeights
 
 def _is_experimental():
     """Check whether INT8 export is allowed (requires experimental mode)."""
@@ -124,6 +122,7 @@ def createTfPreprocessingModel():
     print('Exported preprocessing tflite model to', dstPath)
 
 
+
 def loadPytorchModelAndWeights(includePreprocessing=True):
 
     #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -136,7 +135,7 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
         pretrained=False, 
         includePreprocessing=includePreprocessing, 
         device=device, 
-        headWeights=HEAD_WEIGHTS
+        headWeights=headWeights
         )
 
     # Load weights
@@ -154,7 +153,6 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
     model.eval()
 
     return model
-
 
 def get_expected_t_dims():
     """Discover temporal dimension sizes that change with input duration.
@@ -1112,12 +1110,12 @@ def _build_parser():
             '  %(prog)s -f onnx torchscript           # ONNX + TorchScript only\n'
             '  %(prog)s -p fp32                        # FP32 only (skip FP16/INT8)\n'
             '  %(prog)s -f onnx -p fp16               # ONNX FP16 only\n'
-            '  %(prog)s --calibration-audio file.wav   # custom INT8 calibration audio\n'
             '  %(prog)s -m models/my_model             # use a different model directory\n'
             '  %(prog)s -o output/                     # custom output directory\n'
             '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
             '  %(prog)s --list-models                  # show available models\n'
-            '  %(prog)s --experimental-mode            # enable INT8 export for ONNX and TFLite\n'
+            '  %(prog)s --head-weights 1.0 0.0 0.0     # use only Head 1 for predictions and reduce model size\n'
+            '  %(prog)s --experimental-mode            # enable full INT8 export for ONNX and TFLite\n'
         ),
     )
     parser.add_argument(
@@ -1176,16 +1174,28 @@ def _build_parser():
         help='List available models in the models/ directory and exit',
     )
     parser.add_argument(
+        '--head-weights',
+        type=float,
+        nargs=3,
+        default=None,
+        metavar='W',
+        help=(
+            'Weights for the three classifier heads, e.g. --head-weights 1.0 0.0 0.0 '
+            'to use only Head 1. (default: from model definition, typically [0.4, 0.35, 0.25])'
+        ),
+    )
+    parser.add_argument(
         '--experimental-mode',
         action='store_true',
         default=False,
         help=(
-            'Enable experimental features such as INT8 quantization for ONNX '
-            'and TFLite. Without this flag, INT8 variants are skipped. '
+            'Enable experimental features such as full INT8 quantization for ONNX '
+            'and TFLite. Without this flag, full INT8 variants are skipped. '
             '(default: disabled)'
         ),
     )
     return parser
+
 
 
 def main():
@@ -1211,6 +1221,7 @@ def main():
         args.segment_duration,
         precision_set=set(args.precisions),
         experimental_mode=args.experimental_mode,
+        head_weights=args.head_weights,
     )
 
     formats = set(args.formats)
@@ -1221,6 +1232,7 @@ def main():
     print(f'Precision(s):       {", ".join(sorted(precisions))}')
     print(f'Batch size:         {batchSize}')
     print(f'Segment duration:   {segmentDuration}s')
+    print(f'Head weights:       {headWeights}')
     print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 
@@ -1236,7 +1248,6 @@ def main():
         createOnnxModel()
 
     print('\nDone.')
-
 
 if __name__ == '__main__':
     main()

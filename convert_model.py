@@ -61,8 +61,25 @@ def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_
     sys.modules[module_name] = model_module
     spec.loader.exec_module(model_module)
 
+
     # Set headWeights after model_module is loaded so we can fall back to its default
-    headWeights = head_weights if head_weights is not None else model_module.headWeights
+    headWeights = head_weights if head_weights is not None else list(model_module.headWeights)
+
+    # Validate and normalize head weights
+    if len(headWeights) != 3:
+        sys.exit(f'Error: --head-weights must have exactly 3 values, got {len(headWeights)}')
+    if any(w < 0.0 for w in headWeights):
+        sys.exit(f'Error: --head-weights must be non-negative, got {headWeights}')
+    if all(w == 0.0 for w in headWeights):
+        sys.exit(f'Error: --head-weights must not all be zero')
+
+    weight_sum = sum(headWeights)
+    if abs(weight_sum - 1.0) > 1e-6:
+        normalized = [w / weight_sum for w in headWeights]
+        print(f'⚠️  Head weights sum to {weight_sum:.4f}, normalizing: '
+              f'{headWeights} → {[round(w, 6) for w in normalized]}')
+        headWeights = normalized
+
 
 def _is_experimental():
     """Check whether INT8 export is allowed (requires experimental mode)."""
@@ -634,78 +651,83 @@ def createTorchScriptModel():
         print('TorchScript model saved to', dstDir + 'model.pt')
 
     if 'fp16' in precisions:
-        import copy
-        from typing import Tuple
 
-        # STFT (inside PreprocessingLayerTorch) does not support float16:
-        # calling model.half() converts the spectrogram transform buffers too,
-        # making STFT produce ComplexHalf tensors that downstream ops can't handle.
-        # Fix: keep preprocessing in float32; convert only the backbone+head to
-        # float16; insert an explicit .half() cast in between.
+        if _is_experimental():
 
-        # Build a backbone copy whose preprocess is replaced with Identity so
-        # it can be converted to float16 without touching the STFT layer.
-        fp16_backbone = copy.deepcopy(model)
-        fp16_backbone.preprocess = torch.nn.Identity()
-        # Fold large-variance BN channels BEFORE converting to fp16.
-        # Several EfficientNetV2 stage-5 BN layers have running_var up to 8.7 M;
-        # converting them to fp16 gives Inf which cascades into NaN.
-        n_folded = _fold_bn_for_fp16(fp16_backbone)
-        print(f'  TS FP16: folded {n_folded} BN channel(s) with var > 65504')
-        fp16_backbone = fp16_backbone.half()
+            import copy
+            from typing import Tuple
 
-        # Stage 5 of EfficientNetV2 MUST stay in float32.
-        # The expansion convolutions in blocks 5.12–5.14 have large weights
-        # (max ≈ 4.4) and the residual stream reaches > 800 in float32 by
-        # stage 5.  The resulting dot products exceed the fp16 maximum
-        # (e.g. 74 222 for block 5.13) → fp16 output is Inf → PyTorch BN
-        # with Inf running_var on Inf input gives Inf/Inf = NaN cascade.
-        #
-        # Fix: wrap stage 5 with _Fp32StageWrapper so it accepts fp16 input
-        # from stages 1–4, casts to fp32 internally, and returns fp32.  All
-        # downstream modules (conv_head, bn2, act2, classifiers) also stay
-        # in fp32 (reverted by .float() after the global .half()).
-        enc = fp16_backbone.encoder
-        stage5 = enc.blocks[5]
-        stage5.float()                                   # revert to fp32
-        enc.blocks[5] = _Fp32StageWrapper(stage5)        # fp16-in / fp32-out
-        # Revert post-stage-5 encoder modules and all classifiers to fp32
-        for attr in ('conv_head', 'bn2', 'act2', 'norm'):
-            m = getattr(enc, attr, None)
-            if m is not None:
-                m.float()
-        for attr in ('global_pool', 'head', 'fc1', 'fc2',
-                     'att_block', 'att_block2', 'dropouts'):
-            m = getattr(fp16_backbone, attr, None)
-            if m is not None:
-                m.float()
+            # STFT (inside PreprocessingLayerTorch) does not support float16:
+            # calling model.half() converts the spectrogram transform buffers too,
+            # making STFT produce ComplexHalf tensors that downstream ops can't handle.
+            # Fix: keep preprocessing in float32; convert only the backbone+head to
+            # float16; insert an explicit .half() cast in between.
 
-        # Revert the avg_kernel buffer used in pooling back to float32
-        if hasattr(fp16_backbone, '_avg_kernel'):
-            fp16_backbone._avg_kernel = fp16_backbone._avg_kernel.float()
+            # Build a backbone copy whose preprocess is replaced with Identity so
+            # it can be converted to float16 without touching the STFT layer.
+            fp16_backbone = copy.deepcopy(model)
+            fp16_backbone.preprocess = torch.nn.Identity()
+            # Fold large-variance BN channels BEFORE converting to fp16.
+            # Several EfficientNetV2 stage-5 BN layers have running_var up to 8.7 M;
+            # converting them to fp16 gives Inf which cascades into NaN.
+            n_folded = _fold_bn_for_fp16(fp16_backbone)
+            print(f'  TS FP16: folded {n_folded} BN channel(s) with var > 65504')
+            fp16_backbone = fp16_backbone.half()
+
+            # Stage 5 of EfficientNetV2 MUST stay in float32.
+            # The expansion convolutions in blocks 5.12–5.14 have large weights
+            # (max ≈ 4.4) and the residual stream reaches > 800 in float32 by
+            # stage 5.  The resulting dot products exceed the fp16 maximum
+            # (e.g. 74 222 for block 5.13) → fp16 output is Inf → PyTorch BN
+            # with Inf running_var on Inf input gives Inf/Inf = NaN cascade.
+            #
+            # Fix: wrap stage 5 with _Fp32StageWrapper so it accepts fp16 input
+            # from stages 1–4, casts to fp32 internally, and returns fp32.  All
+            # downstream modules (conv_head, bn2, act2, classifiers) also stay
+            # in fp32 (reverted by .float() after the global .half()).
+            enc = fp16_backbone.encoder
+            stage5 = enc.blocks[5]
+            stage5.float()                                   # revert to fp32
+            enc.blocks[5] = _Fp32StageWrapper(stage5)        # fp16-in / fp32-out
+            # Revert post-stage-5 encoder modules and all classifiers to fp32
+            for attr in ('conv_head', 'bn2', 'act2', 'norm'):
+                m = getattr(enc, attr, None)
+                if m is not None:
+                    m.float()
+            for attr in ('global_pool', 'head', 'fc1', 'fc2',
+                        'att_block', 'att_block2', 'dropouts'):
+                m = getattr(fp16_backbone, attr, None)
+                if m is not None:
+                    m.float()
+
+            # Revert the avg_kernel buffer used in pooling back to float32
+            if hasattr(fp16_backbone, '_avg_kernel'):
+                fp16_backbone._avg_kernel = fp16_backbone._avg_kernel.float()
 
 
-        class _TS_FP16Wrapper(torch.nn.Module):
-            """Accepts float32 audio; runs preprocessing in float32, then casts
-            spectrogram to float16 for backbone stages 1–4, then returns to
-            float32 for stage 5 and all classifiers. Returns float32 outputs."""
-            def __init__(self, preprocess: torch.nn.Module,
-                         backbone: torch.nn.Module) -> None:
-                super().__init__()
-                self.preprocess = preprocess   # float32 — preserves STFT
-                self.backbone = backbone       # mixed: fp16 (st1-4) + fp32 (st5+)
+            class _TS_FP16Wrapper(torch.nn.Module):
+                """Accepts float32 audio; runs preprocessing in float32, then casts
+                spectrogram to float16 for backbone stages 1–4, then returns to
+                float32 for stage 5 and all classifiers. Returns float32 outputs."""
+                def __init__(self, preprocess: torch.nn.Module,
+                            backbone: torch.nn.Module) -> None:
+                    super().__init__()
+                    self.preprocess = preprocess   # float32 — preserves STFT
+                    self.backbone = backbone       # mixed: fp16 (st1-4) + fp32 (st5+)
 
-            def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-                spec = self.preprocess(x)          # float32 audio → float32 spec
-                #emb, pred = self.backbone(spec.half())  # fp16 entry; fp32 exit
-                #return emb, pred
-                pred, emb = self.backbone(spec.half())  # <-- Flipped order
-                return pred, emb # <-- Flipped order
+                def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                    spec = self.preprocess(x)          # float32 audio → float32 spec
+                    #emb, pred = self.backbone(spec.half())  # fp16 entry; fp32 exit
+                    #return emb, pred
+                    pred, emb = self.backbone(spec.half())  # <-- Flipped order
+                    return pred, emb # <-- Flipped order
 
-        wrapper = _TS_FP16Wrapper(model.preprocess, fp16_backbone)
-        scripted_fp16 = torch.jit.script(wrapper)
-        scripted_fp16.save(dstDir + 'model_fp16.pt')
-        print('TorchScript FP16 model saved to', dstDir + 'model_fp16.pt')
+            wrapper = _TS_FP16Wrapper(model.preprocess, fp16_backbone)
+            scripted_fp16 = torch.jit.script(wrapper)
+            scripted_fp16.save(dstDir + 'model_fp16.pt')
+            print('TorchScript FP16 model saved to', dstDir + 'model_fp16.pt')
+        else:
+            print("  ⚠️  Skipping TorchScript FP16 — this is only supported in experimental mode. Use --experimental-mode to enable.")
 
 
 

@@ -28,10 +28,12 @@ This repository contains scripts to convert BirdNET V3.0 PyTorch models (Efficie
 | TF SavedModel (preprocessing) | `export/tf/preprocessing/` | — | — |
 | TF SavedModel (main) | `export/tf/main/` | — | — |
 | TFLite — preprocessing | `export/tf/preprocessing/model.tflite` | — | — |
-| TFLite — main (spectrogram in) | `export/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` |
-| TFLite — combined (audio in) | `export/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` |
-| TorchScript | `export/torchscript/model.pt` | `model_fp16.pt` | — |
-| ONNX | `export/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` |
+| TFLite — main (spectrogram in) | `export/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
+| TFLite — combined (audio in) | `export/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
+| TorchScript | `export/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
+| ONNX | `export/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` ¹ |
+
+¹ Requires `--experimental-mode` (see [Experimental Mode](#experimental-mode)).
 
 Additional utilities:
 
@@ -109,12 +111,17 @@ Export only ONNX in FP16:
 python convert_model.py -f onnx -p fp16
 ```
 
-Use a custom audio file for INT8 calibration (TFLite):
+Use only Head 1 for predictions (reduces model size by pruning unused heads):
 
 ```bash
-python convert_model.py -p int8 --calibration-audio path/to/audio.wav
+python convert_model.py --head-weights 1.0 0.0 0.0
 ```
 
+Enable full INT8 quantization for ONNX and TFLite (experimental):
+
+```bash
+python convert_model.py -p int8 --experimental-mode
+```
 Use a different model directory:
 
 ```bash
@@ -131,33 +138,97 @@ python convert_model.py --list-models
 
 ```
 usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
-                        [-p PREC [PREC ...]] [--calibration-audio FILE]
+                        [-p PREC [PREC ...]]
                         [--batch-size BATCH_SIZE]
                         [--segment-duration SEGMENT_DURATION]
+                        [--head-weights W W W]
+                        [--experimental-mode]
                         [--list-models]
 
-  -m, --model-dir          Path to model directory (default: models/01_BirdNET+_...)
-  -o, --output-dir         Directory for converted model output (default: export/)
-  -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
-  -p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)
-      --calibration-audio  Audio file for INT8 calibration (default: example/soundscape.wav)
-      --batch-size          Batch size baked into TFLite models (default: 1)
-      --segment-duration    Min audio segment duration in seconds for tracing (default: 3.0)
-      --list-models         List available models and exit
+-m, --model-dir          Path to model directory (default: models/01_BirdNET+_...)
+-o, --output-dir         Directory for converted model output (default: export/)
+-f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
+-p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)
+--batch-size             Batch size baked into TFLite models (default: 1)
+--segment-duration       Min audio segment duration in seconds for tracing (default: 3.0)
+--head-weights W W W     Weights for the three classifier heads (default: from model definition)
+--experimental-mode      Enable experimental features like full INT8
+--list-models            List available models and exit
 ```
+
+### Head Weights and Pruning
+
+The BirdNET V3.0 model uses a **multi-head architecture** with three classifier heads whose outputs are combined as a weighted sum of logits before applying sigmoid:
+
+```
+predictions = sigmoid(w0 * head1_logits + w1 * head2_logits + w2 * head3_logits)
+```
+
+The default weights are `[0.4, 0.35, 0.25]` as defined in the model definition. You can override them at export time with `--head-weights`:
+
+```bash
+# Use default weights [0.4, 0.35, 0.25]
+python convert_model.py
+
+# Use only Head 1
+python convert_model.py --head-weights 1.0 0.0 0.0
+
+# Use Heads 1 and 2 equally
+python convert_model.py --head-weights 0.5 0.5 0.0
+
+# Custom blend
+python convert_model.py --head-weights 0.6 0.3 0.1
+```
+
+
+**Automatic pruning:** When a head weight is set to `0.0`, the corresponding head's layers (fully connected layers, attention blocks) are replaced with tiny 1×1 dummy layers after loading the checkpoint. This significantly reduces the exported model size:
+
+| Configuration | Approximate model size |
+|---|---|
+| All heads `[0.4, 0.35, 0.25]` | ~520 MB |
+| Head 1 only `[1.0, 0.0, 0.0]` | ~155 MB |
+
+This is useful for deploying smaller models on edge devices when only a single head's predictions are needed.
+
+### Experimental Mode
+
+Some features are gated behind `--experimental-mode` because they are unstable or produce models with significant accuracy degradation:
+
+```bash
+python convert_model.py --experimental-mode
+```
+
+Features requiring experimental mode:
+
+| Feature | Why experimental |
+|---|---|
+| **ONNX INT8** (dynamic quantization) | Severe numerical differences; changes top predicted species entirely |
+| **TFLite INT8** (dynamic range quantization) | Same quantization instability; not recommended for production |
+| **TorchScript FP16** (mixed-precision) | Requires careful BN folding and stage-5 fp32 fallback; may produce NaN on untested models |
+
+Without `--experimental-mode`, these variants are skipped with an informational message:
+
+```
+⚠️  Skipping ONNX INT8 — this is only supported in experimental mode. Use --experimental-mode to enable.
+```
+
+**Default behavior (without `--experimental-mode`):**
+
+| Precision | TF/TFLite | TorchScript | ONNX |
+|---|---|---|---|
+| FP32 | ✅ Exported | ✅ Exported | ✅ Exported |
+| FP16 | ✅ Exported | ⚠️ Skipped | ✅ Exported |
+| INT8 | ⚠️ Skipped | — | ⚠️ Skipped |
 
 ### Precision Variants
 
-By default all precision variants are exported. Use `-p` to select specific ones:
+By default all *non-experimental* precision variants are exported. Use `-p` to select specific ones:
 
 | Precision | Method | Notes |
 |---|---|---|
 | `fp32` | Standard export | Full precision, used as reference |
 | `fp16` | Weight conversion to float16 | ~2× smaller, minimal accuracy loss |
-| `int8` | Dynamic quantization (ONNX, TorchScript) / representative-dataset quantization (TFLite) | **Currently unstable** — ~4× smaller but significant accuracy loss; not recommended at the moment |
-
-For TFLite INT8, calibration data is generated from an audio file (default: `example/soundscape.wav`).
-Pass `--calibration-audio` to use a different file.
+| `int8` | Dynamic quantization (ONNX) / dynamic range quantization (TFLite) | **Experimental** — ~4× smaller but significant accuracy loss; requires `--experimental-mode` |
 
 ### Conversion Pipeline
 
@@ -199,11 +270,11 @@ python test_models.py --batch-size 2
 usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
                       [--durations S [S ...]] [--gpu]
 
-  -e, --export-dir    Path to export directory (default: export/)
-  -a, --audio         Audio file for test input (default: example/soundscape.wav)
-      --batch-size    Batch size for test inputs (default: 1)
-      --durations     Segment durations in seconds (default: 3.0)
-      --gpu           Use GPU for TorchScript and ONNX inference
+-e, --export-dir    Path to export directory (default: export/)
+-a, --audio         Audio file for test input (default: example/soundscape.wav)
+--batch-size        Batch size for test inputs (default: 1)
+--durations         Segment durations in seconds (default: 3.0)
+--gpu               Use GPU for TorchScript and ONNX inference
 ```
 
 > **Interpreting results:** The test compares each format against TorchScript using a tight tolerance (`atol=0.025`).

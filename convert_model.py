@@ -39,19 +39,21 @@ outputDir = DEFAULT_OUTPUT_DIR + '/'
 batchSize = 1
 segmentDuration = 3.0
 precisions = set(ALL_PRECISIONS)  # default: all precisions
+experimentalMode = False  # default: experimental mode off
 model_module = None
 
 
-def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_set=None):
+def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False):
     """Initialise module-level config and load the model definition module."""
     global modelDir, outputDir, batchSize, segmentDuration, model_module
-    global precisions
+    global precisions, experimentalMode
 
     modelDir = model_dir.rstrip('/') + '/'
     outputDir = output_dir.rstrip('/') + '/'
     batchSize = batch_size
     segmentDuration = segment_duration
     precisions = precision_set if precision_set else set(ALL_PRECISIONS)
+    experimentalMode = experimental_mode
 
     model_module_path = os.path.join(modelDir, 'pytorch', 'model.py')
     if not os.path.isfile(model_module_path):
@@ -62,6 +64,11 @@ def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_
     model_module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = model_module
     spec.loader.exec_module(model_module)
+
+
+def _is_experimental():
+    """Check whether INT8 export is allowed (requires experimental mode)."""
+    return experimentalMode
 
 
 def createTfPreprocessingModel():
@@ -469,7 +476,11 @@ def combineTfModels():
         _convert_and_fix_tflite(dstDir, dstDir + 'model_fp16.tflite',
                                 optimize=True, supported_types=[tf.float16])
     if 'int8' in precisions:
-        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
+        
+        if _is_experimental():
+            _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
+        else:
+            print("  ⚠️  Skipping TFLite INT8 (combined) — this is only supported in experimental mode. Use --experimental-mode to enable.")
 
 
 
@@ -1035,35 +1046,38 @@ def createOnnxModel():
 
     # INT8 variant (dynamic quantization)
     if 'int8' in precisions:
-        from onnxruntime.quantization import quantize_dynamic, QuantType
-        model_for_quant = onnx.load(onnx_path)
-        # Clear stale shape annotations left by Resize/Conv2dSame patches, then
-        # re-derive them via shape inference so quantize_dynamic has correct
-        # type/shape context for every intermediate tensor.  Without this,
-        # missing value_info causes quantize_dynamic to misclassify tensor types.
-        del model_for_quant.graph.value_info[:]
-        try:
-            model_for_quant = onnx.shape_inference.infer_shapes(model_for_quant)
-        except Exception as e:
-            print(f'  Warning: shape inference failed ({e}), proceeding without it')
-        # Exclude preprocessing nodes from quantization — same reason as FP16:
-        # the mel filterbank is a MatMul whose weights must not be quantized to
-        # INT8 (it corrupts the spectrogram and collapses predictions).
-        preproc_nodes = _find_preprocessing_node_names(model_for_quant)
-        if preproc_nodes:
-            print(f'  ONNX INT8: excluding {len(preproc_nodes)} preprocessing nodes from quantization')
+        if _is_experimental():
+            from onnxruntime.quantization import quantize_dynamic, QuantType
+            model_for_quant = onnx.load(onnx_path)
+            # Clear stale shape annotations left by Resize/Conv2dSame patches, then
+            # re-derive them via shape inference so quantize_dynamic has correct
+            # type/shape context for every intermediate tensor.  Without this,
+            # missing value_info causes quantize_dynamic to misclassify tensor types.
+            del model_for_quant.graph.value_info[:]
+            try:
+                model_for_quant = onnx.shape_inference.infer_shapes(model_for_quant)
+            except Exception as e:
+                print(f'  Warning: shape inference failed ({e}), proceeding without it')
+            # Exclude preprocessing nodes from quantization — same reason as FP16:
+            # the mel filterbank is a MatMul whose weights must not be quantized to
+            # INT8 (it corrupts the spectrogram and collapses predictions).
+            preproc_nodes = _find_preprocessing_node_names(model_for_quant)
+            if preproc_nodes:
+                print(f'  ONNX INT8: excluding {len(preproc_nodes)} preprocessing nodes from quantization')
+            else:
+                print('  ONNX INT8: stem Conv not found; quantizing all nodes')
+            temp_quant_path = dstDir + 'model_pre_quant.onnx'
+            onnx.save(model_for_quant, temp_quant_path, save_as_external_data=False)
+            int8_path = dstDir + 'model_int8.onnx'
+            quantize_dynamic(
+                temp_quant_path, int8_path,
+                weight_type=QuantType.QInt8,
+                nodes_to_exclude=preproc_nodes or None,
+            )
+            os.remove(temp_quant_path)
+            print(f'ONNX INT8 (dynamic quantization) model exported to {int8_path}')
         else:
-            print('  ONNX INT8: stem Conv not found; quantizing all nodes')
-        temp_quant_path = dstDir + 'model_pre_quant.onnx'
-        onnx.save(model_for_quant, temp_quant_path, save_as_external_data=False)
-        int8_path = dstDir + 'model_int8.onnx'
-        quantize_dynamic(
-            temp_quant_path, int8_path,
-            weight_type=QuantType.QInt8,
-            nodes_to_exclude=preproc_nodes or None,
-        )
-        os.remove(temp_quant_path)
-        print(f'ONNX INT8 (dynamic quantization) model exported to {int8_path}')
+            print("  ⚠️  Skipping ONNX INT8 — this is only supported in experimental mode. Use --experimental-mode to enable.")
 
 ###########################################################################################
 ###########################################################################################
@@ -1103,6 +1117,7 @@ def _build_parser():
             '  %(prog)s -o output/                     # custom output directory\n'
             '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
             '  %(prog)s --list-models                  # show available models\n'
+            '  %(prog)s --experimental-mode            # enable INT8 export for ONNX and TFLite\n'
         ),
     )
     parser.add_argument(
@@ -1160,6 +1175,16 @@ def _build_parser():
         action='store_true',
         help='List available models in the models/ directory and exit',
     )
+    parser.add_argument(
+        '--experimental-mode',
+        action='store_true',
+        default=False,
+        help=(
+            'Enable experimental features such as INT8 quantization for ONNX '
+            'and TFLite. Without this flag, INT8 variants are skipped. '
+            '(default: disabled)'
+        ),
+    )
     return parser
 
 
@@ -1179,7 +1204,14 @@ def main():
             print('No models found in models/.')
         return
 
-    _init_config(args.model_dir, args.output_dir, args.batch_size, args.segment_duration, precision_set=set(args.precisions))
+    _init_config(
+        args.model_dir,
+        args.output_dir,
+        args.batch_size,
+        args.segment_duration,
+        precision_set=set(args.precisions),
+        experimental_mode=args.experimental_mode,
+    )
 
     formats = set(args.formats)
 
@@ -1189,6 +1221,7 @@ def main():
     print(f'Precision(s):       {", ".join(sorted(precisions))}')
     print(f'Batch size:         {batchSize}')
     print(f'Segment duration:   {segmentDuration}s')
+    print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 
     if 'tf' in formats or 'tflite' in formats:

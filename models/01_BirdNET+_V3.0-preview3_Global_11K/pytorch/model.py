@@ -30,6 +30,7 @@ nHighFreqsInPixelToCutMax=4
 specImageMean = [0.5, 0.4, 0.3]
 specImageStd = [0.5, 0.3, 0.1]
 
+headWeights = [0.4, 0.35, 0.25]
 
 
 def init_layer(layer):
@@ -266,7 +267,7 @@ class MultiHead02(nn.Module):
     # Tell TorchScript to treat these attributes as static constants during compilation
     __constants__ = ['w0', 'w1', 'w2']
 
-    def __init__(self, backbone, nClasses, pretrained=False, includePreprocessing=False, device='cpu', headWeights=[1.0/3.0, 1.0/3.0, 1.0/3.0]):
+    def __init__(self, backbone, nClasses, pretrained=False, includePreprocessing=False, device='cpu', headWeights=headWeights):
         super().__init__()
 
         # Must cast to built-in float for TorchScript constants

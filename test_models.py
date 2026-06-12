@@ -25,8 +25,8 @@ DEFAULT_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'e
 DEFAULT_AUDIO = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'example', 'soundscape.wav')
 
 # Tolerance for "match" (absolute + relative)
-ATOL = 0.08 #1e-3
-ATOL_INT8 = 0.2 # 0.025   # INT8 dynamic quantization introduces larger per-output error
+ATOL = 0.09 # 1e-3
+ATOL_INT8 = 0.1 # 0.025   # INT8 dynamic quantization introduces larger per-output error
 RTOL = 1e-5
 TOP_K = 3
 

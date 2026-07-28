@@ -155,15 +155,19 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
         headWeights=headWeights
         )
 
-    # Load weights
-    checkpointPath = modelDir + 'pytorch/Checkpoint35.pth.tar'
+
+    ## Load weights
+
+    # Get the latest checkpoint file in the model's pytorch directory
+    checkpointDir = os.path.join(modelDir, 'pytorch')
+    checkpointFiles = [f for f in os.listdir(checkpointDir) if f.endswith('.pth.tar')]
+    if not checkpointFiles:
+        sys.exit(f'Error: No checkpoint files found in {checkpointDir}')
+    checkpointFiles.sort()  # Sort to get the latest checkpoint (assuming naming convention includes epoch or timestamp)
+    checkpointPath = os.path.join(checkpointDir, checkpointFiles[-1])
+    
     checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
-    state_dict = checkpoint['state_dict']
-    if includePreprocessing:
-        strict = False
-    else:
-        strict = True  
-    model.load_state_dict(state_dict, strict=strict)
+    model.load_state_dict(checkpoint['state_dict'], strict=False)
 
     model.prune_unused_weights()
 

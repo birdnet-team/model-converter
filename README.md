@@ -25,15 +25,19 @@ This repository contains scripts to convert BirdNET V3.0 PyTorch models (Efficie
 
 | Format | Output (FP32) | FP16 | INT8 |
 |---|---|---|---|
-| TF SavedModel (preprocessing) | `export/tf/preprocessing/` | — | — |
-| TF SavedModel (main) | `export/tf/main/` | — | — |
+| TorchScript | `export/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
+| ONNX | `export/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` ¹ |
 | TFLite — preprocessing | `export/tf/preprocessing/model.tflite` | — | — |
 | TFLite — main (spectrogram in) | `export/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
 | TFLite — combined (audio in) | `export/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
-| TorchScript | `export/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
-| ONNX | `export/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` ¹ |
+| TF SavedModel — preprocessing | `export/tf/preprocessing/` | — | — |
+| TF SavedModel — main (spectrogram in) | `export/tf/main/` ² | — | — |
+| TF SavedModel — combined (audio in) | `export/tf/combined/` ² | — | — |
 
-¹ Requires `--experimental-mode` (see [Experimental Mode](#experimental-mode)).
+
+¹ Requires `--experimental-mode` (see [Experimental Mode](#experimental-mode)).  
+² Intermediate TF model currently not supporting dynamic inputs.
+
 
 Additional utilities:
 

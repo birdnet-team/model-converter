@@ -51,7 +51,7 @@ def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_
     precisions = precision_set if precision_set else set(ALL_PRECISIONS)
     experimentalMode = experimental_mode
 
-    model_module_path = os.path.join(modelDir, 'pytorch', 'model.py')
+    model_module_path = os.path.join(modelDir, 'model.py')
     if not os.path.isfile(model_module_path):
         sys.exit(f'Error: model definition not found at {model_module_path}')
 
@@ -158,13 +158,12 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
 
     ## Load weights
 
-    # Get the latest checkpoint file in the model's pytorch directory
-    checkpointDir = os.path.join(modelDir, 'pytorch')
-    checkpointFiles = [f for f in os.listdir(checkpointDir) if f.endswith('.pth.tar')]
+    # Get the latest checkpoint file in the model's directory
+    checkpointFiles = [f for f in os.listdir(modelDir) if f.endswith('.pth.tar')]
     if not checkpointFiles:
-        sys.exit(f'Error: No checkpoint files found in {checkpointDir}')
+        sys.exit(f'Error: No checkpoint files found in {modelDir}')
     checkpointFiles.sort()  # Sort to get the latest checkpoint (assuming naming convention includes epoch or timestamp)
-    checkpointPath = os.path.join(checkpointDir, checkpointFiles[-1])
+    checkpointPath = os.path.join(modelDir, checkpointFiles[-1])
     
     checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint['state_dict'], strict=False)
@@ -1109,13 +1108,13 @@ def createOnnxModel():
 
 
 def _list_models(base_dir):
-    """Return subdirectory names under models/ that contain pytorch/model.py."""
+    """Return subdirectory names under models/ that contain model.py."""
     models_root = os.path.join(base_dir, 'models')
     if not os.path.isdir(models_root):
         return []
     found = []
     for name in sorted(os.listdir(models_root)):
-        candidate = os.path.join(models_root, name, 'pytorch', 'model.py')
+        candidate = os.path.join(models_root, name, 'model.py')
         if os.path.isfile(candidate):
             found.append(name)
     return found
@@ -1148,7 +1147,7 @@ def _build_parser():
         '-m', '--model-dir',
         default=DEFAULT_MODEL_DIR,
         help=(
-            'Path to the model directory containing pytorch/model.py and '
+            'Path to the model directory containing model.py and '
             'a PyTorch checkpoint (default: %(default)s)'
         ),
     )

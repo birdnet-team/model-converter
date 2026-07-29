@@ -13,24 +13,22 @@ from onnx import helper, numpy_helper
 from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
-MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
 
+DEFAULT_MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
-DEFAULT_MODEL_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    'models', MODEL_NAME
-)
+
 
 DEFAULT_OUTPUT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'export', MODEL_NAME
+    os.path.dirname(os.path.abspath(__file__)), 'export'
 )
 
 
 # Module-level state (set by _init_config, read by conversion functions)
-modelDir = DEFAULT_MODEL_DIR + '/'
-outputDir = DEFAULT_OUTPUT_DIR + '/'
+modelDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', DEFAULT_MODEL_NAME) + '/'
+
+outputDir = os.path.join(DEFAULT_OUTPUT_DIR, DEFAULT_MODEL_NAME) + '/'
 batchSize = 1
 segmentDuration = 3.0
 precisions = set(ALL_PRECISIONS)  # default: all precisions
@@ -39,13 +37,14 @@ headWeights = None  # default: use model_module.headWeights
 model_module = None
 
 
-def _init_config(model_dir, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False, head_weights=None):
+def _init_config(model_name, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False, head_weights=None):
     """Initialise module-level config and load the model definition module."""
     global modelDir, outputDir, batchSize, segmentDuration, model_module
     global precisions, experimentalMode, headWeights
 
-    modelDir = model_dir.rstrip('/') + '/'
-    outputDir = output_dir.rstrip('/') + '/'
+    modelDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', model_name) + '/'
+    outputDir = os.path.join(output_dir.rstrip('/'), model_name) + '/'
+
     batchSize = batch_size
     segmentDuration = segment_duration
     precisions = precision_set if precision_set else set(ALL_PRECISIONS)
@@ -1135,7 +1134,7 @@ def _build_parser():
             '  %(prog)s -f onnx torchscript           # ONNX + TorchScript only\n'
             '  %(prog)s -p fp32                        # FP32 only (skip FP16/INT8)\n'
             '  %(prog)s -f onnx -p fp16               # ONNX FP16 only\n'
-            '  %(prog)s -m models/my_model             # use a different model directory\n'
+            '  %(prog)s -m my_model                     # use a different model\n'
             '  %(prog)s -o output/                     # custom output directory\n'
             '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
             '  %(prog)s --list-models                  # show available models\n'
@@ -1144,10 +1143,10 @@ def _build_parser():
         ),
     )
     parser.add_argument(
-        '-m', '--model-dir',
-        default=DEFAULT_MODEL_DIR,
+        '-m', '--model-name',
+        default=DEFAULT_MODEL_NAME,
         help=(
-            'Path to the model directory containing model.py and '
+            'Model directory name in models/ containing model.py and '
             'a PyTorch checkpoint (default: %(default)s)'
         ),
     )
@@ -1234,13 +1233,13 @@ def main():
         if models:
             print('Available models:')
             for m in models:
-                print(f'  models/{m}')
+                print(f'  {m}')
         else:
             print('No models found in models/.')
         return
 
     _init_config(
-        args.model_dir,
+        args.model_name,
         args.output_dir,
         args.batch_size,
         args.segment_duration,

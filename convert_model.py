@@ -14,7 +14,7 @@ from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 
-DEFAULT_MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
+DEFAULT_MODEL_NAME = '03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0' # 01_BirdNET+_V3.0-preview3_Global_11K 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
@@ -1057,7 +1057,7 @@ def createOnnxModel():
         fp16_model = float16.convert_float_to_float16(
             fp32_model,
             keep_io_types=True,
-            op_block_list=['STFT', 'Log', 'Pow', 'Exp', 'GlobalAveragePool', 'ReduceMean', 'AveragePool'],
+            op_block_list=['STFT', 'Log', 'Pow', 'Exp', 'GlobalAveragePool', 'ReduceMean', 'AveragePool', 'ConstantOfShape'],
             node_block_list=preproc_nodes or None,
         )
 

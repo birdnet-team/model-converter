@@ -18,7 +18,7 @@ import librosa
 import onnxruntime as ort
 from ai_edge_litert.interpreter import Interpreter
 
-MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
+MODEL_NAME = '03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0' # 01_BirdNET+_V3.0-preview3_Global_11K 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0
 
 SAMPLE_RATE = 32000
 DEFAULT_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'export', MODEL_NAME)

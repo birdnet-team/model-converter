@@ -8,8 +8,9 @@ onnx==1.20.1
 onnxruntime-gpu==1.24.1
 onnxconverter-common==1.16.0
 onnxscript==0.6.2
-# For inference tests
+# For inference tests and --class-pruning
 pandas
+openpyxl
 torchmetrics
 ffmpeg-python
 # For TensorRT

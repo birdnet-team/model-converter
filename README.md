@@ -121,6 +121,12 @@ Use only Head 1 for predictions (reduces model size by pruning unused heads):
 python convert_model.py --head-weights 1.0 0.0 0.0
 ```
 
+Keep only classes marked `selected=1` in an Excel label file (`ix` column). A `labels.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. Omit the flag to export every class:
+
+```bash
+python convert_model.py --class-pruning models/03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0/labels_selection_01_wabad_europe.xlsx
+```
+
 Enable full INT8 quantization for ONNX and TFLite (experimental):
 
 ```bash
@@ -146,6 +152,7 @@ usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--batch-size BATCH_SIZE]
                         [--segment-duration SEGMENT_DURATION]
                         [--head-weights W W W]
+                        [--class-pruning XLSX]
                         [--experimental-mode]
                         [--list-models]
 
@@ -156,6 +163,7 @@ usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
 --batch-size             Batch size baked into TFLite models (default: 1)
 --segment-duration       Min audio segment duration in seconds for tracing (default: 3.0)
 --head-weights W W W     Weights for the three classifier heads (default: from model definition)
+--class-pruning XLSX     Keep classes whose selected column is 1 (default: all classes)
 --experimental-mode      Enable experimental features like full INT8
 --list-models            List available models and exit
 ```

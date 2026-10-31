@@ -36,8 +36,7 @@ experimentalMode = False  # default: experimental mode off
 headWeights = None  # default: use model_module.headWeights
 model_module = None
 
-classIxsSelection = [96, 122, 123, 149, 162, 312, 357, 596, 660, 755, 762, 765, 874, 888, 992, 997, 1178, 1515, 1561, 1577, 1683, 1897, 1918, 1934, 1935, 1936, 1941, 2129, 2131, 2156, 2244, 2311, 2417,2422, 2494, 2611, 2665, 2694, 2736, 2823, 2844, 2847, 3025, 3026, 3027, 3116, 3285, 3312, 3313, 3314, 3316, 3319, 3320, 3324, 3334, 3347, 3403, 3583, 3585, 3586, 3587, 3840, 4013, 4016, 4019, 4020, 4040, 4168, 4414, 4428, 4442, 4447, 4528, 4530, 4539, 4581, 4587, 4613, 4638, 4691, 4710, 4826, 4961,5060, 5286, 5290, 5300, 5321, 5538, 5687, 5843, 5849, 5858, 5869, 5876, 6154, 6158, 6211, 6272, 6289, 6293, 6294, 6320, 6618, 6729, 6848, 6849, 6954, 6969, 6974, 7003, 7531, 7554, 7667, 7677, 7794, 7908, 8102, 8112, 8118, 8125, 8169, 8273, 8313, 8413, 8494, 8512, 8513, 8604, 8616, 8629, 8664, 8673,8699, 8705, 8747, 8751, 9008, 9009, 9171, 9288, 9293, 9497, 9759, 9760, 9772, 9823, 9886, 9889, 9891, 9899, 10055, 10161, 10162, 10361, 10462, 10749, 10758, 10768, 10801, 10802, 10831, 10934, 10958, 10959, 11117, 11450, 11454, 11455, 11458, 11459, 11501, 11579, 11595, 11613, 11638, 11706]
-#classIxsSelection = None
+classIxsSelection = None  # set from --class-pruning; None means keep every class
 
 def _init_config(model_name, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False, head_weights=None):
     """Initialise module-level config and load the model definition module."""
@@ -197,10 +196,7 @@ def prune_to_selected_classes(model, class_ixs, n_classes):
     if len(class_ixs) != len(set(class_ixs)):
         raise ValueError('classIxsSelection contains duplicates')
     if any(i < 0 or i >= n_classes for i in class_ixs):
-        raise ValueError(
-            f'classIxsSelection is outside 0..{n_classes - 1}; '
-            'this list is only valid for the 12K model'
-        )
+        raise ValueError(f'classIxsSelection is outside 0..{n_classes - 1}')
 
     index = torch.tensor(class_ixs, dtype=torch.long)
     replaced = []
@@ -1194,6 +1190,44 @@ def createOnnxModel():
 ###########################################################################################
 
 
+def load_class_ixs_from_excel(path):
+    """Return ix values for rows whose selected column is 1, in sheet order."""
+    if not os.path.isfile(path):
+        print(f'⚠️  Class pruning file not found: {path}')
+        sys.exit(1)
+
+    import pandas as pd
+    try:
+        df = pd.read_excel(path)
+    except ImportError:
+        sys.exit('Error: openpyxl is required to read --class-pruning Excel files')
+
+    missing = [name for name in ('ix', 'selected') if name not in df.columns]
+    if missing:
+        sys.exit(f'Error: {path} is missing column(s): {", ".join(missing)}')
+
+    selected = pd.to_numeric(df['selected'], errors='coerce')
+    ixs = pd.to_numeric(df.loc[selected == 1, 'ix'], errors='coerce')
+    if ixs.isna().any():
+        sys.exit(f'Error: {path} has a non-numeric ix in a selected row')
+    class_ixs = [int(i) for i in ixs.tolist()]
+    if not class_ixs:
+        sys.exit(f'Error: {path} has no rows with selected == 1')
+    return class_ixs
+
+
+def write_pruned_labels(src_path, dst_path):
+    """Write selected rows to dst_path and renumber ix to the exported output order."""
+    import pandas as pd
+    df = pd.read_excel(src_path)
+    selected = pd.to_numeric(df['selected'], errors='coerce')
+    labels = df.loc[selected == 1].copy()
+    labels['ix'] = range(len(labels))
+    os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
+    labels.to_excel(dst_path, index=False)
+    print(f'Wrote pruned labels to {dst_path}')
+
+
 def _list_models(base_dir):
     """Return subdirectory names under models/ that contain model.py."""
     models_root = os.path.join(base_dir, 'models')
@@ -1227,6 +1261,7 @@ def _build_parser():
             '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
             '  %(prog)s --list-models                  # show available models\n'
             '  %(prog)s --head-weights 1.0 0.0 0.0     # use only Head 1 for predictions and reduce model size\n'
+            '  %(prog)s --class-pruning labels.xlsx    # keep only rows with selected=1\n'
             '  %(prog)s --experimental-mode            # enable full INT8 export for ONNX and TFLite\n'
         ),
     )
@@ -1297,6 +1332,15 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        '--class-pruning',
+        default=None,
+        metavar='XLSX',
+        help=(
+            'Excel file of class labels. Rows with selected=1 are kept, using the ix column. '
+            'If omitted, all classes are exported.'
+        ),
+    )
+    parser.add_argument(
         '--experimental-mode',
         action='store_true',
         default=False,
@@ -1312,6 +1356,7 @@ def _build_parser():
 
 def main():
     """Entry point: parse CLI arguments, configure globals, and run conversions."""
+    global classIxsSelection
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -1337,6 +1382,9 @@ def main():
     )
 
     formats = set(args.formats)
+    classIxsSelection = load_class_ixs_from_excel(args.class_pruning) if args.class_pruning else None
+    if classIxsSelection:
+        write_pruned_labels(args.class_pruning, os.path.join(outputDir, 'labels_pruned.xlsx'))
 
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')
@@ -1345,6 +1393,8 @@ def main():
     print(f'Batch size:         {batchSize}')
     print(f'Segment duration:   {segmentDuration}s')
     print(f'Head weights:       {headWeights}')
+    print(f'Class pruning:      {len(classIxsSelection) if classIxsSelection else "disabled"}'
+          + (f' classes from {args.class_pruning}' if classIxsSelection else ''))
     print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 

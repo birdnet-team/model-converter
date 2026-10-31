@@ -36,6 +36,8 @@ experimentalMode = False  # default: experimental mode off
 headWeights = None  # default: use model_module.headWeights
 model_module = None
 
+classIxsSelection = [96, 122, 123, 149, 162, 312, 357, 596, 660, 755, 762, 765, 874, 888, 992, 997, 1178, 1515, 1561, 1577, 1683, 1897, 1918, 1934, 1935, 1936, 1941, 2129, 2131, 2156, 2244, 2311, 2417,2422, 2494, 2611, 2665, 2694, 2736, 2823, 2844, 2847, 3025, 3026, 3027, 3116, 3285, 3312, 3313, 3314, 3316, 3319, 3320, 3324, 3334, 3347, 3403, 3583, 3585, 3586, 3587, 3840, 4013, 4016, 4019, 4020, 4040, 4168, 4414, 4428, 4442, 4447, 4528, 4530, 4539, 4581, 4587, 4613, 4638, 4691, 4710, 4826, 4961,5060, 5286, 5290, 5300, 5321, 5538, 5687, 5843, 5849, 5858, 5869, 5876, 6154, 6158, 6211, 6272, 6289, 6293, 6294, 6320, 6618, 6729, 6848, 6849, 6954, 6969, 6974, 7003, 7531, 7554, 7667, 7677, 7794, 7908, 8102, 8112, 8118, 8125, 8169, 8273, 8313, 8413, 8494, 8512, 8513, 8604, 8616, 8629, 8664, 8673,8699, 8705, 8747, 8751, 9008, 9009, 9171, 9288, 9293, 9497, 9759, 9760, 9772, 9823, 9886, 9889, 9891, 9899, 10055, 10161, 10162, 10361, 10462, 10749, 10758, 10768, 10801, 10802, 10831, 10934, 10958, 10959, 11117, 11450, 11454, 11455, 11458, 11459, 11501, 11579, 11595, 11613, 11638, 11706]
+#classIxsSelection = None
 
 def _init_config(model_name, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False, head_weights=None):
     """Initialise module-level config and load the model definition module."""
@@ -139,6 +141,88 @@ def createTfPreprocessingModel():
 
 
 
+def prune_to_selected_classes(model, class_ixs, n_classes):
+    """Shrink every class-sized output layer to class_ixs. Shared layers are left alone.
+
+    Output column k is the original class class_ixs[k], in list order. Heads already
+    replaced by 1x1 dummies (weight 0) are skipped because their width is not n_classes.
+    """
+    def _sliced_linear(layer, index):
+        sliced = torch.nn.Linear(
+            layer.in_features, index.numel(), bias=layer.bias is not None
+        ).to(device=layer.weight.device, dtype=layer.weight.dtype)
+        with torch.no_grad():
+            sliced.weight.copy_(layer.weight.index_select(0, index))
+            if layer.bias is not None:
+                sliced.bias.copy_(layer.bias.index_select(0, index))
+        return sliced
+
+    def _sliced_conv1d(layer, index):
+        sliced = torch.nn.Conv1d(
+            layer.in_channels, index.numel(),
+            kernel_size=layer.kernel_size,
+            stride=layer.stride,
+            padding=layer.padding,
+            dilation=layer.dilation,
+            groups=layer.groups,
+            bias=layer.bias is not None,
+            padding_mode=layer.padding_mode,
+        ).to(device=layer.weight.device, dtype=layer.weight.dtype)
+        with torch.no_grad():
+            sliced.weight.copy_(layer.weight.index_select(0, index))
+            if layer.bias is not None:
+                sliced.bias.copy_(layer.bias.index_select(0, index))
+        return sliced
+
+    def _sliced_batchnorm1d(layer, index):
+        sliced = torch.nn.BatchNorm1d(
+            index.numel(), eps=layer.eps, momentum=layer.momentum,
+            affine=layer.affine, track_running_stats=layer.track_running_stats,
+        )
+        ref = layer.weight if layer.affine else layer.running_mean
+        sliced = sliced.to(device=ref.device, dtype=ref.dtype)
+        with torch.no_grad():
+            if layer.affine:
+                sliced.weight.copy_(layer.weight.index_select(0, index))
+                sliced.bias.copy_(layer.bias.index_select(0, index))
+            if layer.track_running_stats:
+                sliced.running_mean.copy_(layer.running_mean.index_select(0, index))
+                sliced.running_var.copy_(layer.running_var.index_select(0, index))
+                sliced.num_batches_tracked.copy_(layer.num_batches_tracked)
+        return sliced
+
+    if not class_ixs:
+        return model
+    class_ixs = [int(i) for i in class_ixs]
+    if len(class_ixs) != len(set(class_ixs)):
+        raise ValueError('classIxsSelection contains duplicates')
+    if any(i < 0 or i >= n_classes for i in class_ixs):
+        raise ValueError(
+            f'classIxsSelection is outside 0..{n_classes - 1}; '
+            'this list is only valid for the 12K model'
+        )
+
+    index = torch.tensor(class_ixs, dtype=torch.long)
+    replaced = []
+    for parent in model.modules():
+        for name, child in list(parent.named_children()):
+            if isinstance(child, torch.nn.Linear) and child.out_features == n_classes:
+                setattr(parent, name, _sliced_linear(child, index.to(child.weight.device)))
+            elif isinstance(child, torch.nn.Conv1d) and child.out_channels == n_classes and child.groups == 1:
+                setattr(parent, name, _sliced_conv1d(child, index.to(child.weight.device)))
+            elif isinstance(child, torch.nn.BatchNorm1d) and child.num_features == n_classes:
+                ref = child.weight if child.affine else child.running_mean
+                setattr(parent, name, _sliced_batchnorm1d(child, index.to(ref.device)))
+            else:
+                continue
+            replaced.append(f'{child.__class__.__name__} {name}')
+
+    if not replaced:
+        raise RuntimeError('no class-sized layers found to prune')
+    print(f'Pruned classifier to {len(class_ixs)}/{n_classes} classes: {", ".join(replaced)}')
+    return model
+
+
 def loadPytorchModelAndWeights(includePreprocessing=True):
 
     #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -168,6 +252,10 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
     model.load_state_dict(checkpoint['state_dict'], strict=False)
 
     model.prune_unused_weights()
+
+    # Prune model to selected classes using class indices in classIxsSelection
+    if classIxsSelection:
+        prune_to_selected_classes(model, classIxsSelection, model_module.nClasses)
 
     model.eval()
 

@@ -90,7 +90,7 @@ Convert the PyTorch model to all supported formats and precisions:
 python convert_model.py
 ```
 
-Converted models are written to `export/` by default. Use `-o` to change the output directory:
+Converted models are written to `export/<model name>/` by default. Use `-o` to change the output directory:
 
 ```bash
 python convert_model.py -o output/my_export
@@ -121,7 +121,7 @@ Use only Head 1 for predictions (reduces model size by pruning unused heads):
 python convert_model.py --head-weights 1.0 0.0 0.0
 ```
 
-Keep only classes marked `selected=1` in an Excel label file (`ix` column). A `labels.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. Omit the flag to export every class:
+Keep only classes marked `selected=1` in an Excel label file (`ix` column). A `labels_pruned.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. Omit the flag to export every class:
 
 ```bash
 python convert_model.py --class-pruning models/03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0/labels_selection_01_wabad_europe.xlsx
@@ -132,10 +132,11 @@ Enable full INT8 quantization for ONNX and TFLite (experimental):
 ```bash
 python convert_model.py -p int8 --experimental-mode
 ```
-Use a different model directory:
+Use a different model, by its directory name in `models/` or by a path (the export goes to a folder named after the directory):
 
 ```bash
-python convert_model.py -m models/my_custom_model
+python convert_model.py -m my_custom_model
+python convert_model.py -m /path/to/my_custom_model
 ```
 
 List available models:
@@ -147,7 +148,7 @@ python convert_model.py --list-models
 ### All Options
 
 ```
-usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
+usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [-p PREC [PREC ...]]
                         [--batch-size BATCH_SIZE]
                         [--segment-duration SEGMENT_DURATION]
@@ -156,7 +157,7 @@ usage: convert_model.py [-h] [-m MODEL_DIR] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--experimental-mode]
                         [--list-models]
 
--m, --model-dir          Path to model directory (default: models/01_BirdNET+_...)
+-m, --model-name         Model directory: a name in models/ or a path (default: 05_BiophonyNET_26.10.1)
 -o, --output-dir         Directory for converted model output (default: export/)
 -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
 -p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)

@@ -2,14 +2,17 @@ torch==2.9.0
 torchvision==0.24.0
 torchaudio==2.9.0
 litert-torch==0.8.0
+# litert-torch does not pin torchao; 0.14.1 works with torch 2.9, 0.18 fails on import there
+torchao==0.14.1
 timm==1.0.24
 librosa==0.11.0
 onnx==1.20.1
 onnxruntime-gpu==1.24.1
 onnxconverter-common==1.16.0
 onnxscript==0.6.2
-# For inference tests
+# For inference tests and --class-pruning
 pandas
+openpyxl
 torchmetrics
 ffmpeg-python
 # For TensorRT

@@ -43,6 +43,9 @@ def _init_config(model_name, output_dir, batch_size, segment_duration, precision
     global modelDir, outputDir, batchSize, segmentDuration, model_module
     global precisions, experimentalMode, headWeights
 
+    # Accept a path such as models/<name> as well as the bare directory name
+    model_name = os.path.basename(os.path.normpath(model_name))
+
     modelDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', model_name) + '/'
     outputDir = os.path.join(output_dir.rstrip('/'), model_name) + '/'
 

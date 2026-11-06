@@ -5,10 +5,10 @@
 <h1 align="center">BirdNET+ Model Converter</h1>
 
 <p align="center">
-  <a href="https://github.com/birdnet-team/model-converter/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <a href="MODEL_LICENSE.md"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Model license: Apache 2.0"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.9+-ee4c2c.svg" alt="PyTorch 2.9+"></a>
-  <img src="https://img.shields.io/badge/model-V3.0--preview3-green.svg" alt="BirdNET+ V3.0-preview3">
+  <img src="https://img.shields.io/badge/model-V3.0-green.svg" alt="BirdNET+ V3.0">
   <img src="https://img.shields.io/badge/species-11%2C560-yellow.svg" alt="11,560 species">
 </p>
 
@@ -301,7 +301,11 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 
 The source code is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
-Trained model weights are licensed under [Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/). See [TERMS_OF_USE.md](TERMS_OF_USE.md) for full terms.
+Trained model weights are licensed under the [Apache License, Version 2.0](MODEL_LICENSE.md).
+
+## Acceptable Use
+
+BirdNET is built to support biodiversity research and conservation. See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) for how we expect the BirdNET V3.0 models to be used, including uses we consider unacceptable and guidance on branding derivative work.
 
 ## Funding
 

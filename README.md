@@ -5,54 +5,55 @@
 <h1 align="center">BirdNET+ Model Converter</h1>
 
 <p align="center">
-  <a href="MODEL_LICENSE.md"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Model license: Apache 2.0"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="MODEL_LICENSE.md"><img src="https://img.shields.io/badge/model%20license-Apache--2.0-blue.svg" alt="Model license: Apache 2.0"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.9+-ee4c2c.svg" alt="PyTorch 2.9+"></a>
   <img src="https://img.shields.io/badge/model-V3.0-green.svg" alt="BirdNET+ V3.0">
   <img src="https://img.shields.io/badge/species-11%2C709-yellow.svg" alt="11,709 animal species">
 </p>
 
 <p align="center">
-  Convert BirdNET V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, and ONNX formats.<br>
-  Handles dynamic input lengths and batch sizes, including post-conversion fixes and TFLite static ops.
+  Convert BirdNET+ V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, and ONNX formats.<br>
+  Supports variable-length audio input, with post-conversion fixes for ONNX and TFLite.
 </p>
 
 ## Overview
 
-This repository contains scripts to convert BirdNET V3.0 PyTorch models (EfficientNetV2-S backbone, multi-head architecture, ~11K species) into deployment-ready formats:
+`convert_model.py` converts a BirdNET+ V3.0 PyTorch model (multi-head classifier on an EfficientNet backbone) into these formats:
 
 | Format | Output (FP32) | FP16 | INT8 |
 |---|---|---|---|
 | TorchScript | `export/<model name>/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
 | ONNX | `export/<model name>/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` ¹ |
 | TFLite — preprocessing | `export/<model name>/tf/preprocessing/model.tflite` | — | — |
-| TFLite — main (spectrogram in) | `export/<model name>/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
+| TFLite — main (spectrogram in) | `export/<model name>/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` |
 | TFLite — combined (audio in) | `export/<model name>/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
 | TF SavedModel — preprocessing | `export/<model name>/tf/preprocessing/` | — | — |
 | TF SavedModel — main (spectrogram in) | `export/<model name>/tf/main/` ² | — | — |
 | TF SavedModel — combined (audio in) | `export/<model name>/tf/combined/` ² | — | — |
 
+¹ Requires `--experimental-mode` (see [Precision Variants](#precision-variants)).  
+² Intermediate model; does not support dynamic inputs.
 
-¹ Requires `--experimental-mode` (see [Experimental Mode](#experimental-mode)).  
-² Intermediate TF model currently not supporting dynamic inputs.
-
+TorchScript and ONNX models accept any batch size; TFLite models use the batch size set with `--batch-size`. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)).
 
 Additional utilities:
 
 - **`fix_conv2dsame.py`** — Replaces baked-in static Conv2dSame padding in ONNX exports with dynamic padding subgraphs.
 - **`fix_tflite_dynamic_input.py`** — Patches TFLite flatbuffers to fix static batch/temporal dimensions after `litert_torch` conversion.
-- **`test_models.py`** — Compares converted model outputs (ONNX, LiteRT, TorchScript) against the PyTorch reference across different batch sizes and segment durations.
+- **`test_models.py`** — Compares each converted format against the exported TorchScript model across batch sizes and segment durations.
 
 ## Setup
 
-Download or clone the repository:
+Clone the repository:
 
 ```bash
 git clone https://github.com/birdnet-team/model-converter.git
 cd model-converter
 ```
 
-> **Git LFS required:** Model checkpoints are stored with [Git LFS](https://git-lfs.com/). If `git lfs` is not installed, checkpoint files will be small pointer files instead of the actual weights. Install Git LFS and pull:
+> **Git LFS required:** Model checkpoints and the BirdNET taxonomy are stored with [Git LFS](https://git-lfs.com/). Without it, they are small pointer files:
 >
 > ```bash
 > sudo apt install git-lfs   # or: brew install git-lfs
@@ -60,9 +61,7 @@ cd model-converter
 > git lfs pull
 > ```
 
-Create a virtual environment (choose one):
-
-**Option A — conda:**
+Create an environment and install the requirements, with conda:
 
 ```bash
 conda create --name model-converter python=3.12
@@ -70,7 +69,7 @@ conda activate model-converter
 pip install -r requirements.txt
 ```
 
-**Option B — venv:**
+or with venv:
 
 ```bash
 python3 -m venv .venv
@@ -78,80 +77,45 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> **Note:** Python 3.10 and 3.11 are also supported, but 3.12 is recommended.
+> **Note:** Python 3.11 also works. Python 3.10 is not supported because `onnxruntime-gpu` has no 3.10 wheels.
 
 ## Usage
 
-Convert the PyTorch model to all supported formats and precisions:
+Convert the default model (`02_BirdNET+_V3.0_Global_12K`) to all formats and all non-experimental precisions:
 
 ```bash
 python convert_model.py
 ```
 
-Converted models are written to `export/<model name>/` by default. Use `-o` to change the output directory; the model's folder is created inside it:
+Common variations:
 
 ```bash
-python convert_model.py -o output/my_export
+python convert_model.py -f onnx torchscript    # selected formats only
+python convert_model.py -p fp32                # FP32 only
+python convert_model.py -f onnx -p fp16        # ONNX FP16 only
+python convert_model.py -o output/my_export    # write to output/my_export/<model name>/
+python convert_model.py -m my_custom_model     # another model: a name in models/ or a path
+python convert_model.py --list-models          # list the models in models/
 ```
 
-Convert to specific formats only:
+### Class Pruning and Labels
+
+A class pruning sheet is an Excel file listing the model's classes, with an `ix` column (the model's output index) and a `selected` column. Only rows with `selected=1` are exported. If the model directory has a `labels_pruning.xlsx`, it is used by default:
 
 ```bash
-python convert_model.py -f onnx torchscript
-python convert_model.py -f tf tflite
+python convert_model.py                                     # uses labels_pruning.xlsx if present
+python convert_model.py --class-pruning my_selection.xlsx   # use another sheet
+python convert_model.py --no-class-pruning                  # export every class
 ```
 
-Export FP32 only (skip FP16 and INT8):
+For `02_BirdNET+_V3.0_Global_12K`, `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id, drops classes with fewer than 10 training samples (`nParts`), and keeps 23 non-animal sound classes such as gun, chainsaw, engine and siren. That leaves 11,732 of 16,852 classes, 11,709 of them animal species. The sheet's `pruning_note` column says why each other class was dropped.
 
-```bash
-python convert_model.py -p fp32
-```
+The export directory gets one label file, with one row per model output:
 
-Export only ONNX in FP16:
+- **`labels.csv`** when the sheet has a `birdnet_id` column: `ix`, `birdnet_id`, `scientific_name`, `common_name`, `taxon_group`, `inat_id`, `ebird_code` and every `common_name_<lang>` translation, taken from the BirdNET taxonomy (`BirdNET_Taxonomy_v0.5-Nov2026.csv`; override with `--taxonomy`). The conversion stops before writing anything if a kept class has no `birdnet_id`, shares one with another kept class, or has one the taxonomy doesn't list.
+- **`labels_pruned.xlsx`** otherwise: the selected rows, with `ix` renumbered to `0..n-1`.
 
-```bash
-python convert_model.py -f onnx -p fp16
-```
-
-Use only Head 1 for predictions (reduces model size by pruning unused heads):
-
-```bash
-python convert_model.py --head-weights 1.0 0.0 0.0
-```
-
-Keep only classes marked `selected=1` in an Excel label file (`ix` column). If the sheet has no `birdnet_id` column, a `labels_pruned.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. If the model directory has a `labels_pruning.xlsx`, it is applied by default; pass `--class-pruning` to use a different file:
-
-```bash
-python convert_model.py -m 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0 --class-pruning models/03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0/labels_selection_01_wabad_europe.xlsx
-```
-
-For BirdNET+ V3.0 (`02_BirdNET+_V3.0_Global_12K`), `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id, leaves out classes with fewer than 10 training samples (`nParts`), and keeps only 23 non-animal sound classes, such as gun, chainsaw, engine and siren. That leaves 11,732 of 16,852 classes: 11,709 animal species and the 23 sound classes. The `pruning_note` column says why each other class was dropped.
-
-When the label sheet has a `birdnet_id` column, as the V3.0 model's does, the export directory gets a `labels.csv` instead, with one row per model output: `ix`, `birdnet_id`, `scientific_name`, `common_name`, `taxon_group`, `inat_id`, `ebird_code` and every `common_name_<lang>` translation, taken from the BirdNET taxonomy (`BirdNET_Taxonomy_v0.5-Nov2026.csv` in the repository root; pass `--taxonomy` to use another version). The conversion stops before writing anything if a kept class has no `birdnet_id`, shares one with another kept class, or has one the taxonomy doesn't list.
-
-Export every class instead (no `labels.csv` or `labels_pruned.xlsx` is written, and copies left by an earlier run are removed):
-
-```bash
-python convert_model.py --no-class-pruning
-```
-
-Enable full INT8 quantization for ONNX and TFLite (experimental):
-
-```bash
-python convert_model.py -p int8 --experimental-mode
-```
-Use a different model, by its directory name in `models/` or by a path (the export goes to a folder named after the directory):
-
-```bash
-python convert_model.py -m my_custom_model
-python convert_model.py -m /path/to/my_custom_model
-```
-
-List available models:
-
-```bash
-python convert_model.py --list-models
-```
+Label files that a run doesn't write are removed from the export directory, so `--no-class-pruning` leaves none behind.
 
 ### All Options
 
@@ -176,118 +140,68 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
 --class-pruning XLSX     Keep classes whose selected column is 1 (default: labels_pruning.xlsx in the model directory if present, else all classes)
 --no-class-pruning       Export every class, ignoring labels_pruning.xlsx
 --taxonomy CSV           BirdNET taxonomy for labels.csv (default: BirdNET_Taxonomy_v0.5-Nov2026.csv)
---experimental-mode      Enable experimental features like full INT8
+--experimental-mode      Enable experimental variants (see Precision Variants)
 --list-models            List available models and exit
 ```
 
-### Head Weights and Pruning
+### Head Weights
 
-The BirdNET V3.0 model uses a **multi-head architecture** with three classifier heads whose outputs are combined as a weighted sum of logits before applying sigmoid:
+The model has three classifier heads whose logits are combined as a weighted sum before the sigmoid:
 
 ```
 predictions = sigmoid(w0 * head1_logits + w1 * head2_logits + w2 * head3_logits)
 ```
 
-The default weights are `[0.4, 0.35, 0.25]` as defined in the model definition. You can override them at export time with `--head-weights`:
+The default weights `[0.4, 0.35, 0.25]` come from the model definition. Override them with `--head-weights`:
 
 ```bash
-# Use default weights [0.4, 0.35, 0.25]
-python convert_model.py
-
-# Use only Head 1
-python convert_model.py --head-weights 1.0 0.0 0.0
-
-# Use Heads 1 and 2 equally
-python convert_model.py --head-weights 0.5 0.5 0.0
-
-# Custom blend
-python convert_model.py --head-weights 0.6 0.3 0.1
+python convert_model.py --head-weights 1.0 0.0 0.0   # Head 1 only
+python convert_model.py --head-weights 0.5 0.5 0.0   # Heads 1 and 2 equally
 ```
 
-
-**Automatic pruning:** When a head weight is set to `0.0`, the corresponding head's layers (fully connected layers, attention blocks) are replaced with tiny 1×1 dummy layers after loading the checkpoint. This significantly reduces the exported model size:
-
-| Configuration | Approximate model size |
-|---|---|
-| All heads `[0.4, 0.35, 0.25]` | ~520 MB |
-| Head 1 only `[1.0, 0.0, 0.0]` | ~155 MB |
-
-This is useful for deploying smaller models on edge devices when only a single head's predictions are needed.
-
-### Experimental Mode
-
-Some features are gated behind `--experimental-mode` because they are unstable or produce models with significant accuracy degradation:
-
-```bash
-python convert_model.py --experimental-mode
-```
-
-Features requiring experimental mode:
-
-| Feature | Why experimental |
-|---|---|
-| **ONNX INT8** (dynamic quantization) | Severe numerical differences; changes top predicted species entirely |
-| **TFLite INT8** (dynamic range quantization) | Same quantization instability; not recommended for production |
-| **TorchScript FP16** (mixed-precision) | Requires careful BN folding and stage-5 fp32 fallback; may produce NaN on untested models |
-
-Without `--experimental-mode`, these variants are skipped with an informational message:
-
-```
-⚠️  Skipping ONNX INT8 — this is only supported in experimental mode. Use --experimental-mode to enable.
-```
-
-**Default behavior (without `--experimental-mode`):**
-
-| Precision | TF/TFLite | TorchScript | ONNX |
-|---|---|---|---|
-| FP32 | ✅ Exported | ✅ Exported | ✅ Exported |
-| FP16 | ✅ Exported | ⚠️ Skipped | ✅ Exported |
-| INT8 | ⚠️ Skipped | — | ⚠️ Skipped |
+Heads with weight `0.0` are replaced with 1×1 dummy layers, which shrinks the export. For the default model at FP32, all three heads take about 345 MB and Head 1 alone about 140 MB, which suits edge devices.
 
 ### Precision Variants
 
-By default all *non-experimental* precision variants are exported. Use `-p` to select specific ones:
+All non-experimental precisions are exported by default. Use `-p` to pick specific ones:
 
 | Precision | Method | Notes |
 |---|---|---|
-| `fp32` | Standard export | Full precision, used as reference |
-| `fp16` | Weight conversion to float16 | ~2× smaller, minimal accuracy loss |
-| `int8` | Dynamic quantization (ONNX) / dynamic range quantization (TFLite) | **Experimental** — ~4× smaller but significant accuracy loss; requires `--experimental-mode` |
+| `fp32` | Standard export | Full precision, used as the reference |
+| `fp16` | Weights converted to float16 | ~2× smaller, minimal accuracy loss |
+| `int8` | Dynamic quantization (ONNX) / dynamic range quantization (TFLite) | ~4× smaller, significant accuracy loss |
+
+Variants that are unstable or lose significant accuracy are only exported with `--experimental-mode`; otherwise they are skipped with a message:
+
+| Variant | Why experimental |
+|---|---|
+| ONNX INT8 | Severe numerical differences; changes the top predicted species |
+| TFLite INT8, combined model | Same quantization instability; not recommended for production |
+| TorchScript FP16 | Needs BN folding and a stage-5 FP32 fallback; may produce NaN on untested models |
+
+The INT8 version of the main TFLite model (weights-only quantization) is exported by default.
 
 ### Conversion Pipeline
 
 The full pipeline (`-f tf tflite torchscript onnx`) runs these steps:
 
 1. **TF Preprocessing** — Exports the mel-spectrogram preprocessing as a standalone TF SavedModel and TFLite model.
-2. **TF Main Model** — Converts the classifier via `litert_torch`, re-wraps with dynamic input signatures, and exports to TFLite.
-3. **TF Combined** — Chains preprocessing + main model into a single end-to-end TFLite model (audio → predictions).
-4. **TorchScript** — Exports the full model (with preprocessing) via `torch.jit.script`.
+2. **TF Main Model** — Converts the classifier via `litert_torch`, re-wraps it with dynamic input signatures, and exports to TFLite.
+3. **TF Combined** — Chains preprocessing and main model into a single end-to-end TFLite model (audio → predictions).
+4. **TorchScript** — Exports the full model, preprocessing included, via `torch.jit.script`.
 5. **ONNX** — Exports via `torch.onnx.export` with `dynamo=True`, then patches Resize and Conv2dSame ops for dynamic inputs.
 
-The TFLite preprocessing and main models are exported **separately** in addition to the combined model.
-This lets users plug in their own spectrogram pipeline or run the classifier independently —
-for example, pre-computing spectrograms on a server and sending only the images to an edge device running the main model.
+The separate preprocessing and main TFLite models let you plug in your own spectrogram pipeline or run the classifier on its own, for example computing spectrograms on a server and running only the main model on an edge device.
 
 ### Testing Converted Models
 
-Compare outputs of all converted formats against the TorchScript reference:
+Compare all converted formats against the TorchScript model:
 
 ```bash
 python test_models.py
-```
-
-Use a custom audio file or export directory:
-
-```bash
 python test_models.py -a path/to/audio.wav
 python test_models.py -e output/my_export/<model name>
-```
-
-Test with different segment durations or batch sizes:
-
-```bash
-python test_models.py --durations 3.0 5.0
-python test_models.py --batch-size 2
+python test_models.py --durations 3.0 5.0 --batch-size 2
 ```
 
 ```
@@ -301,12 +215,7 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 --gpu               Use GPU for TorchScript and ONNX inference
 ```
 
-> **Interpreting results:** The test compares each format against TorchScript with `atol=0.09` (`0.1` for INT8).
-> ONNX and LiteRT (combined) should pass at the default durations.
-> **FP16** variants typically show slightly larger differences but should still pass.
-> **INT8** variants are **unstable** — dynamic quantization introduces severe numerical
-> differences that change the top predicted species entirely. INT8 is included as an
-> experimental option and is **not recommended** for production use.
+> **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations. INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
 
 ## License
 
@@ -316,7 +225,7 @@ Trained model weights are licensed under the [Apache License, Version 2.0](MODEL
 
 ## Acceptable Use
 
-BirdNET is built to support biodiversity research and conservation. See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) for how we expect the BirdNET V3.0 models to be used, including uses we consider unacceptable and guidance on branding derivative work.
+BirdNET is built to support biodiversity research and conservation. See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) for how we expect the BirdNET+ V3.0 models to be used, including uses we consider unacceptable and guidance on branding derivative work.
 
 ## Funding
 

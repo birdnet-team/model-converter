@@ -192,7 +192,7 @@ def _build_parser():
     parser.add_argument(
         '-e', '--export-dir',
         default=DEFAULT_EXPORT_DIR,
-        help='Path to export directory containing converted models (default: export/)',
+        help="Path to a model's export directory (default: export/<MODEL_NAME>/)",
     )
     parser.add_argument(
         '-a', '--audio',

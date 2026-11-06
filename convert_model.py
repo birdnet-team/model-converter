@@ -43,11 +43,15 @@ def _init_config(model_name, output_dir, batch_size, segment_duration, precision
     global modelDir, outputDir, batchSize, segmentDuration, model_module
     global precisions, experimentalMode, headWeights
 
-    # Accept a path such as models/<name> as well as the bare directory name
-    model_name = os.path.basename(os.path.normpath(model_name))
+    # A bare name is looked up in models/; anything with a directory part is used as the path it is
+    model_arg = model_name.rstrip('/\\')
+    if os.path.dirname(model_arg):
+        model_path = os.path.abspath(model_arg)
+    else:
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', model_arg)
 
-    modelDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', model_name) + '/'
-    outputDir = os.path.join(output_dir.rstrip('/'), model_name) + '/'
+    modelDir = model_path + '/'
+    outputDir = os.path.join(output_dir.rstrip('/'), os.path.basename(model_path)) + '/'
 
     batchSize = batch_size
     segmentDuration = segment_duration
@@ -1272,8 +1276,8 @@ def _build_parser():
         '-m', '--model-name',
         default=DEFAULT_MODEL_NAME,
         help=(
-            'Model directory name in models/ containing model.py and '
-            'a PyTorch checkpoint (default: %(default)s)'
+            'Model directory containing model.py and a PyTorch checkpoint: '
+            'a name in models/ or a path (default: %(default)s)'
         ),
     )
     parser.add_argument(

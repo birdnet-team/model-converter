@@ -132,10 +132,11 @@ Enable full INT8 quantization for ONNX and TFLite (experimental):
 ```bash
 python convert_model.py -p int8 --experimental-mode
 ```
-Use a different model directory:
+Use a different model, by its directory name in `models/` or by a path (the export goes to a folder named after the directory):
 
 ```bash
-python convert_model.py -m models/my_custom_model
+python convert_model.py -m my_custom_model
+python convert_model.py -m /path/to/my_custom_model
 ```
 
 List available models:
@@ -156,7 +157,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--experimental-mode]
                         [--list-models]
 
--m, --model-name         Model directory in models/, as a name or a path (default: 05_BiophonyNET_26.10.1)
+-m, --model-name         Model directory: a name in models/ or a path (default: 05_BiophonyNET_26.10.1)
 -o, --output-dir         Directory for converted model output (default: export/)
 -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
 -p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)

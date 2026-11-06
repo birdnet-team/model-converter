@@ -25,14 +25,14 @@ This repository contains scripts to convert BirdNET V3.0 PyTorch models (Efficie
 
 | Format | Output (FP32) | FP16 | INT8 |
 |---|---|---|---|
-| TorchScript | `export/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
-| ONNX | `export/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` ¹ |
-| TFLite — preprocessing | `export/tf/preprocessing/model.tflite` | — | — |
-| TFLite — main (spectrogram in) | `export/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
-| TFLite — combined (audio in) | `export/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
-| TF SavedModel — preprocessing | `export/tf/preprocessing/` | — | — |
-| TF SavedModel — main (spectrogram in) | `export/tf/main/` ² | — | — |
-| TF SavedModel — combined (audio in) | `export/tf/combined/` ² | — | — |
+| TorchScript | `export/<model name>/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
+| ONNX | `export/<model name>/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` ¹ |
+| TFLite — preprocessing | `export/<model name>/tf/preprocessing/model.tflite` | — | — |
+| TFLite — main (spectrogram in) | `export/<model name>/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
+| TFLite — combined (audio in) | `export/<model name>/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
+| TF SavedModel — preprocessing | `export/<model name>/tf/preprocessing/` | — | — |
+| TF SavedModel — main (spectrogram in) | `export/<model name>/tf/main/` ² | — | — |
+| TF SavedModel — combined (audio in) | `export/<model name>/tf/combined/` ² | — | — |
 
 
 ¹ Requires `--experimental-mode` (see [Experimental Mode](#experimental-mode)).  
@@ -90,7 +90,7 @@ Convert the PyTorch model to all supported formats and precisions:
 python convert_model.py
 ```
 
-Converted models are written to `export/<model name>/` by default. Use `-o` to change the output directory:
+Converted models are written to `export/<model name>/` by default. Use `-o` to change the output directory; the model's folder is created inside it:
 
 ```bash
 python convert_model.py -o output/my_export
@@ -158,7 +158,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--list-models]
 
 -m, --model-name         Model directory: a name in models/ or a path (default: 05_BiophonyNET_26.10.1)
--o, --output-dir         Directory for converted model output (default: export/)
+-o, --output-dir         Directory that receives one folder per model (default: export/)
 -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
 -p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)
 --batch-size             Batch size baked into TFLite models (default: 1)
@@ -269,7 +269,7 @@ Use a custom audio file or export directory:
 
 ```bash
 python test_models.py -a path/to/audio.wav
-python test_models.py -e output/my_export
+python test_models.py -e output/my_export/<model name>
 ```
 
 Test with different segment durations or batch sizes:
@@ -283,15 +283,15 @@ python test_models.py --batch-size 2
 usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
                       [--durations S [S ...]] [--gpu]
 
--e, --export-dir    Path to export directory (default: export/)
+-e, --export-dir    Path to a model's export directory (default: export/<model name>/)
 -a, --audio         Audio file for test input (default: example/soundscape.wav)
 --batch-size        Batch size for test inputs (default: 1)
---durations         Segment durations in seconds (default: 3.0)
+--durations         Segment durations in seconds (default: 3.0 5.0)
 --gpu               Use GPU for TorchScript and ONNX inference
 ```
 
-> **Interpreting results:** The test compares each format against TorchScript using a tight tolerance (`atol=0.025`).
-> ONNX and LiteRT (combined) should pass at the default 3.0s duration.
+> **Interpreting results:** The test compares each format against TorchScript with `atol=0.09` (`0.1` for INT8).
+> ONNX and LiteRT (combined) should pass at the default durations.
 > **FP16** variants typically show slightly larger differences but should still pass.
 > **INT8** variants are **unstable** — dynamic quantization introduces severe numerical
 > differences that change the top predicted species entirely. INT8 is included as an

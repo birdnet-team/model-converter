@@ -9,15 +9,13 @@
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.9+-ee4c2c.svg" alt="PyTorch 2.9+"></a>
   <img src="https://img.shields.io/badge/model-V3.0-green.svg" alt="BirdNET+ V3.0">
-  <img src="https://img.shields.io/badge/species-11%2C560-yellow.svg" alt="11,560 species">
+  <img src="https://img.shields.io/badge/species-11%2C709-yellow.svg" alt="11,709 animal species">
 </p>
 
 <p align="center">
   Convert BirdNET V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, and ONNX formats.<br>
-  Handles dynamic input lengths and batch sizes, including post-conversion fixes for Conv2dSame padding and TFLite static ops.
+  Handles dynamic input lengths and batch sizes, including post-conversion fixes and TFLite static ops.
 </p>
-
-> **Status:** Experimental — under active development. Things will change and break.
 
 ## Overview
 
@@ -121,13 +119,17 @@ Use only Head 1 for predictions (reduces model size by pruning unused heads):
 python convert_model.py --head-weights 1.0 0.0 0.0
 ```
 
-Keep only classes marked `selected=1` in an Excel label file (`ix` column). A `labels_pruned.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. If the model directory has a `labels_pruning.xlsx`, it is applied by default; pass `--class-pruning` to use a different file:
+Keep only classes marked `selected=1` in an Excel label file (`ix` column). If the sheet has no `birdnet_id` column, a `labels_pruned.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. If the model directory has a `labels_pruning.xlsx`, it is applied by default; pass `--class-pruning` to use a different file:
 
 ```bash
-python convert_model.py --class-pruning models/03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0/labels_selection_01_wabad_europe.xlsx
+python convert_model.py -m 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0 --class-pruning models/03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0/labels_selection_01_wabad_europe.xlsx
 ```
 
-For BiophonyNET, `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id (16,398 of 16,852 classes); the `pruning_note` column says why each other class was dropped. Export every class instead:
+For BiophonyNET, `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id, leaves out classes with fewer than 10 training samples (`nParts`), and keeps only 23 non-animal sound classes, such as gun, chainsaw, engine and siren. That leaves 11,732 of 16,852 classes: 11,709 animal species and the 23 sound classes. The `pruning_note` column says why each other class was dropped.
+
+When the label sheet has a `birdnet_id` column, as BiophonyNET's does, the export directory gets a `labels.csv` instead, with one row per model output: `ix`, `birdnet_id`, `scientific_name`, `common_name`, `taxon_group`, `inat_id`, `ebird_code` and every `common_name_<lang>` translation, taken from the BirdNET taxonomy (`BirdNET_Taxonomy_v0.5-Nov2026.csv` in the repository root; pass `--taxonomy` to use another version). The conversion stops before writing anything if a kept class has no `birdnet_id`, shares one with another kept class, or has one the taxonomy doesn't list.
+
+Export every class instead (no `labels.csv` or `labels_pruned.xlsx` is written, and copies left by an earlier run are removed):
 
 ```bash
 python convert_model.py --no-class-pruning
@@ -160,6 +162,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--segment-duration SEGMENT_DURATION]
                         [--head-weights W W W]
                         [--class-pruning XLSX | --no-class-pruning]
+                        [--taxonomy CSV]
                         [--experimental-mode]
                         [--list-models]
 
@@ -172,6 +175,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
 --head-weights W W W     Weights for the three classifier heads (default: from model definition)
 --class-pruning XLSX     Keep classes whose selected column is 1 (default: labels_pruning.xlsx in the model directory if present, else all classes)
 --no-class-pruning       Export every class, ignoring labels_pruning.xlsx
+--taxonomy CSV           BirdNET taxonomy for labels.csv (default: BirdNET_Taxonomy_v0.5-Nov2026.csv)
 --experimental-mode      Enable experimental features like full INT8
 --list-models            List available models and exit
 ```

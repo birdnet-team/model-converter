@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import numpy as np
 import importlib.util
@@ -21,6 +22,17 @@ ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
 
 # Class pruning sheet used by default when present in the model directory
 DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
+
+# BirdNET taxonomy used to write labels.csv for kept classes that have a birdnet_id
+DEFAULT_TAXONOMY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'BirdNET_Taxonomy_v0.5-Nov2026.csv'
+)
+TAXONOMY_LABEL_COLUMNS = [
+    'birdnet_id', 'scientific_name', 'common_name', 'taxon_group', 'inat_id', 'ebird_code',
+]
+# Translations are common_name_<lang> columns, e.g. common_name_de, common_name_es_MX, common_name_zh-CN
+TRANSLATION_COLUMN = re.compile(r'common_name_[a-z]{2}([_-][A-Za-z]{2})?')
+NOT_TRANSLATION_COLUMNS = {'common_name_alt', 'common_name_aliases'}
 
 
 DEFAULT_OUTPUT_DIR = os.path.join(
@@ -1226,16 +1238,78 @@ def load_class_ixs_from_excel(path):
     return class_ixs
 
 
-def write_pruned_labels(src_path, dst_path):
-    """Write selected rows to dst_path and renumber ix to the exported output order."""
+def read_pruned_labels(src_path):
+    """Return the selected rows with ix renumbered to the exported output order."""
     import pandas as pd
     df = pd.read_excel(src_path)
     selected = pd.to_numeric(df['selected'], errors='coerce')
     labels = df.loc[selected == 1].copy()
     labels['ix'] = range(len(labels))
-    os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
-    labels.to_excel(dst_path, index=False)
-    print(f'Wrote pruned labels to {dst_path}')
+    return labels
+
+
+def build_taxonomy_labels(pruned_labels, taxonomy_path):
+    """Return one row per model output with names from the BirdNET taxonomy.
+
+    pruned_labels are the kept rows in output order; their birdnet_id column links each
+    output to the taxonomy. Returns None when the sheet has no birdnet_id column, and
+    exits if an id is missing, repeated, or unknown.
+    """
+    import pandas as pd
+    if 'birdnet_id' not in pruned_labels.columns:
+        return None
+    if not os.path.isfile(taxonomy_path):
+        sys.exit(f'Error: BirdNET taxonomy not found: {taxonomy_path}')
+    with open(taxonomy_path, encoding='utf-8', errors='replace') as f:
+        if f.readline().startswith('version https://git-lfs'):
+            sys.exit(f'Error: {taxonomy_path} is a Git LFS pointer; run `git lfs pull` to fetch it')
+
+    ids = pruned_labels['birdnet_id'].fillna('').astype(str).str.strip().reset_index(drop=True)
+    if (ids == '').any():
+        sys.exit(f'Error: {(ids == "").sum()} kept class(es) have no birdnet_id')
+    repeated = ids[ids.duplicated()].unique()
+    if len(repeated):
+        sys.exit(f'Error: birdnet_id used by more than one kept class: {", ".join(repeated[:10])}')
+
+    taxonomy = pd.read_csv(taxonomy_path, dtype=str, keep_default_na=False)
+    missing = [c for c in TAXONOMY_LABEL_COLUMNS if c not in taxonomy.columns]
+    if missing:
+        sys.exit(f'Error: {taxonomy_path} is missing column(s): {", ".join(missing)}')
+    if not taxonomy['birdnet_id'].is_unique:
+        sys.exit(f'Error: {taxonomy_path} has repeated birdnet_id values')
+    unknown = ids[~ids.isin(taxonomy['birdnet_id'])]
+    if len(unknown):
+        sys.exit(f'Error: {len(unknown)} birdnet_id(s) not in {taxonomy_path}: '
+                 f'{", ".join(unknown[:10])}')
+
+    translations = [c for c in taxonomy.columns if TRANSLATION_COLUMN.fullmatch(c)]
+    unrecognised = [c for c in taxonomy.columns if c.startswith('common_name_')
+                    and c not in translations and c not in NOT_TRANSLATION_COLUMNS]
+    if unrecognised:
+        print(f'⚠️  Not a recognised translation column, left out of labels.csv: {", ".join(unrecognised)}')
+    labels = taxonomy.set_index('birdnet_id', drop=False).loc[ids, TAXONOMY_LABEL_COLUMNS + translations]
+    labels.insert(0, 'ix', range(len(labels)))
+    return labels
+
+
+def write_label_files(output_dir, pruned_labels, taxonomy_labels):
+    """Write this export's label files and delete any that an earlier run left behind.
+
+    A table that is None means this run has no such file; an existing copy is removed so
+    the export directory never holds labels for a different set of classes.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    for name, table in (('labels_pruned.xlsx', pruned_labels), ('labels.csv', taxonomy_labels)):
+        path = os.path.join(output_dir, name)
+        if table is not None:
+            if name.endswith('.xlsx'):
+                table.to_excel(path, index=False)
+            else:
+                table.to_csv(path, index=False)
+            print(f'Wrote {len(table)} labels to {path}')
+        elif os.path.exists(path):
+            os.remove(path)
+            print(f'Removed {path} left by an earlier run')
 
 
 def _list_models(base_dir):
@@ -1273,6 +1347,7 @@ def _build_parser():
             '  %(prog)s --head-weights 1.0 0.0 0.0     # use only Head 1 for predictions and reduce model size\n'
             '  %(prog)s --class-pruning labels.xlsx    # keep only rows with selected=1\n'
             '  %(prog)s --no-class-pruning             # export every class, ignoring labels_pruning.xlsx\n'
+            '  %(prog)s --taxonomy taxonomy.csv        # BirdNET taxonomy for labels.csv\n'
             '  %(prog)s --experimental-mode            # enable full INT8 export for ONNX and TFLite\n'
         ),
     )
@@ -1359,6 +1434,16 @@ def _build_parser():
         help=f'Export every class, even if the model directory has {DEFAULT_CLASS_PRUNING_FILE}.',
     )
     parser.add_argument(
+        '--taxonomy',
+        default=DEFAULT_TAXONOMY_FILE,
+        metavar='CSV',
+        help=(
+            'BirdNET taxonomy used to write labels.csv when the class pruning sheet has a '
+            f'birdnet_id column (default: {os.path.basename(DEFAULT_TAXONOMY_FILE)} in the '
+            'repository root)'
+        ),
+    )
+    parser.add_argument(
         '--experimental-mode',
         action='store_true',
         default=False,
@@ -1405,8 +1490,12 @@ def main():
     if class_pruning is None and not args.no_class_pruning and os.path.isfile(default_pruning):
         class_pruning = default_pruning
     classIxsSelection = load_class_ixs_from_excel(class_pruning) if class_pruning else None
-    if classIxsSelection:
-        write_pruned_labels(class_pruning, os.path.join(outputDir, 'labels_pruned.xlsx'))
+    # Build and check every label table before writing, so a failed check writes nothing.
+    # labels.csv replaces labels_pruned.xlsx; the latter ships only for sheets without birdnet_id.
+    pruned_labels = read_pruned_labels(class_pruning) if classIxsSelection else None
+    taxonomy_labels = (build_taxonomy_labels(pruned_labels, args.taxonomy)
+                       if pruned_labels is not None else None)
+    write_label_files(outputDir, pruned_labels if taxonomy_labels is None else None, taxonomy_labels)
 
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')
@@ -1417,6 +1506,10 @@ def main():
     print(f'Head weights:       {headWeights}')
     print(f'Class pruning:      {len(classIxsSelection) if classIxsSelection else "disabled"}'
           + (f' classes from {class_pruning}' if classIxsSelection else ''))
+    print(f'Taxonomy labels:    '
+          + (f'labels.csv from {args.taxonomy}' if taxonomy_labels is not None
+             else 'skipped (label sheet has no birdnet_id column)' if classIxsSelection
+             else 'skipped (class pruning disabled)'))
     print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 

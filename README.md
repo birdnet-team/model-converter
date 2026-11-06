@@ -125,9 +125,9 @@ Keep only classes marked `selected=1` in an Excel label file (`ix` column). If t
 python convert_model.py -m 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0 --class-pruning models/03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0/labels_selection_01_wabad_europe.xlsx
 ```
 
-For BiophonyNET, `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id, leaves out classes with fewer than 10 training samples (`nParts`), and keeps only 23 non-animal sound classes, such as gun, chainsaw, engine and siren. That leaves 11,732 of 16,852 classes: 11,709 animal species and the 23 sound classes. The `pruning_note` column says why each other class was dropped.
+For BirdNET+ V3.0 (`02_BirdNET+_V3.0_Global_12K`), `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id, leaves out classes with fewer than 10 training samples (`nParts`), and keeps only 23 non-animal sound classes, such as gun, chainsaw, engine and siren. That leaves 11,732 of 16,852 classes: 11,709 animal species and the 23 sound classes. The `pruning_note` column says why each other class was dropped.
 
-When the label sheet has a `birdnet_id` column, as BiophonyNET's does, the export directory gets a `labels.csv` instead, with one row per model output: `ix`, `birdnet_id`, `scientific_name`, `common_name`, `taxon_group`, `inat_id`, `ebird_code` and every `common_name_<lang>` translation, taken from the BirdNET taxonomy (`BirdNET_Taxonomy_v0.5-Nov2026.csv` in the repository root; pass `--taxonomy` to use another version). The conversion stops before writing anything if a kept class has no `birdnet_id`, shares one with another kept class, or has one the taxonomy doesn't list.
+When the label sheet has a `birdnet_id` column, as the V3.0 model's does, the export directory gets a `labels.csv` instead, with one row per model output: `ix`, `birdnet_id`, `scientific_name`, `common_name`, `taxon_group`, `inat_id`, `ebird_code` and every `common_name_<lang>` translation, taken from the BirdNET taxonomy (`BirdNET_Taxonomy_v0.5-Nov2026.csv` in the repository root; pass `--taxonomy` to use another version). The conversion stops before writing anything if a kept class has no `birdnet_id`, shares one with another kept class, or has one the taxonomy doesn't list.
 
 Export every class instead (no `labels.csv` or `labels_pruned.xlsx` is written, and copies left by an earlier run are removed):
 
@@ -166,7 +166,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--experimental-mode]
                         [--list-models]
 
--m, --model-name         Model directory: a name in models/ or a path (default: 05_BiophonyNET_26.10.1)
+-m, --model-name         Model directory: a name in models/ or a path (default: 02_BirdNET+_V3.0_Global_12K)
 -o, --output-dir         Directory that receives one folder per model (default: export/)
 -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
 -p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)

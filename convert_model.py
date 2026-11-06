@@ -34,6 +34,14 @@ TAXONOMY_LABEL_COLUMNS = [
 TRANSLATION_COLUMN = re.compile(r'common_name_[a-z]{2}([_-][A-Za-z]{2})?')
 NOT_TRANSLATION_COLUMNS = {'common_name_alt', 'common_name_aliases'}
 
+# Terms copied into every export directory as plain text: source in the repo root -> file name
+EXPORT_TERMS_FILES = {
+    'MODEL_LICENSE.md': 'MODEL_LICENSE.txt',
+    'ACCEPTABLE_USE.md': 'ACCEPTABLE_USE.txt',
+}
+# Paragraphs about the repository's source code license are left out of the exported terms
+REPO_ONLY_PARAGRAPH = re.compile(r'^The source code in this repository.*?(?:\n[ \t]*\n|\Z)', re.M | re.S)
+
 
 DEFAULT_OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'export'
@@ -1312,6 +1320,30 @@ def write_label_files(output_dir, pruned_labels, taxonomy_labels):
             print(f'Removed {path} left by an earlier run')
 
 
+def write_terms_files(output_dir):
+    """Copy the model license and acceptable use policy into output_dir as plain text.
+
+    Code fences, link targets, inline code marks and the paragraph about the source code
+    license are dropped, and references to the Markdown files are renamed to their .txt copies.
+    """
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(output_dir, exist_ok=True)
+    for src_name, dst_name in EXPORT_TERMS_FILES.items():
+        src = os.path.join(repo_dir, src_name)
+        if not os.path.isfile(src):
+            sys.exit(f'Error: {src} not found; it ships with every export')
+        with open(src, encoding='utf-8') as f:
+            lines = [line for line in f.read().splitlines() if line.strip() != '```']
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', '\n'.join(lines) + '\n').replace('`', '')
+        text = REPO_ONLY_PARAGRAPH.sub('', text)
+        for md_name, txt_name in EXPORT_TERMS_FILES.items():
+            text = text.replace(md_name, txt_name)
+        dst = os.path.join(output_dir, dst_name)
+        with open(dst, 'w', encoding='utf-8') as f:
+            f.write(text)
+        print(f'Wrote {dst}')
+
+
 def _list_models(base_dir):
     """Return subdirectory names under models/ that contain model.py."""
     models_root = os.path.join(base_dir, 'models')
@@ -1496,6 +1528,7 @@ def main():
     taxonomy_labels = (build_taxonomy_labels(pruned_labels, args.taxonomy)
                        if pruned_labels is not None else None)
     write_label_files(outputDir, pruned_labels if taxonomy_labels is None else None, taxonomy_labels)
+    write_terms_files(outputDir)
 
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')

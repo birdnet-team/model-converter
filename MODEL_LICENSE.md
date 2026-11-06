@@ -7,9 +7,11 @@ this project: PyTorch checkpoints and the converted TensorFlow/LiteRT,
 TorchScript, and ONNX models.
 
 The source code in this repository is licensed separately under the MIT License;
-see [`LICENSE`](LICENSE). Expectations for responsible use of the BirdNET V3.0
-models are described in [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md); that document
-is guidance and does not add conditions to this license.
+see [`LICENSE`](LICENSE).
+
+Expectations for responsible use of the BirdNET V3.0 models are described in
+[`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md); that document is guidance and does not
+add conditions to this license.
 
 ---
 

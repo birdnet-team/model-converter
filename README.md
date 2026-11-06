@@ -36,7 +36,7 @@
 ¹ Requires `--experimental-mode` (see [Precision Variants](#precision-variants)).  
 ² Intermediate model; does not support dynamic inputs.
 
-TorchScript and ONNX models accept any batch size; TFLite models use the batch size set with `--batch-size`. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)).
+TorchScript and ONNX models accept any batch size; TFLite models use the batch size set with `--batch-size`. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and plain-text copies of the model license and acceptable use policy (`MODEL_LICENSE.txt`, `ACCEPTABLE_USE.txt`).
 
 Additional utilities:
 

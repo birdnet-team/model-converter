@@ -121,10 +121,16 @@ Use only Head 1 for predictions (reduces model size by pruning unused heads):
 python convert_model.py --head-weights 1.0 0.0 0.0
 ```
 
-Keep only classes marked `selected=1` in an Excel label file (`ix` column). A `labels_pruned.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. Omit the flag to export every class:
+Keep only classes marked `selected=1` in an Excel label file (`ix` column). A `labels_pruned.xlsx` with those rows and `ix` rewritten to `0..n-1` is written to the export directory. If the model directory has a `labels_pruning.xlsx`, it is applied by default; pass `--class-pruning` to use a different file:
 
 ```bash
 python convert_model.py --class-pruning models/03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0/labels_selection_01_wabad_europe.xlsx
+```
+
+For BiophonyNET, `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id (16,398 of 16,852 classes); the `pruning_note` column says why each other class was dropped. Export every class instead:
+
+```bash
+python convert_model.py --no-class-pruning
 ```
 
 Enable full INT8 quantization for ONNX and TFLite (experimental):
@@ -153,7 +159,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--batch-size BATCH_SIZE]
                         [--segment-duration SEGMENT_DURATION]
                         [--head-weights W W W]
-                        [--class-pruning XLSX]
+                        [--class-pruning XLSX | --no-class-pruning]
                         [--experimental-mode]
                         [--list-models]
 
@@ -164,7 +170,8 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
 --batch-size             Batch size baked into TFLite models (default: 1)
 --segment-duration       Min audio segment duration in seconds for tracing (default: 3.0)
 --head-weights W W W     Weights for the three classifier heads (default: from model definition)
---class-pruning XLSX     Keep classes whose selected column is 1 (default: all classes)
+--class-pruning XLSX     Keep classes whose selected column is 1 (default: labels_pruning.xlsx in the model directory if present, else all classes)
+--no-class-pruning       Export every class, ignoring labels_pruning.xlsx
 --experimental-mode      Enable experimental features like full INT8
 --list-models            List available models and exit
 ```

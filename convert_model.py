@@ -19,6 +19,9 @@ DEFAULT_MODEL_NAME = '05_BiophonyNET_26.10.1' # 01_BirdNET+_V3.0-preview3_Global
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
 
+# Class pruning sheet used by default when present in the model directory
+DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
+
 
 DEFAULT_OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'export'
@@ -36,7 +39,7 @@ experimentalMode = False  # default: experimental mode off
 headWeights = None  # default: use model_module.headWeights
 model_module = None
 
-classIxsSelection = None  # set from --class-pruning; None means keep every class
+classIxsSelection = None  # set from the class pruning sheet; None means keep every class
 
 def _init_config(model_name, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False, head_weights=None):
     """Initialise module-level config and load the model definition module."""
@@ -1269,6 +1272,7 @@ def _build_parser():
             '  %(prog)s --list-models                  # show available models\n'
             '  %(prog)s --head-weights 1.0 0.0 0.0     # use only Head 1 for predictions and reduce model size\n'
             '  %(prog)s --class-pruning labels.xlsx    # keep only rows with selected=1\n'
+            '  %(prog)s --no-class-pruning             # export every class, ignoring labels_pruning.xlsx\n'
             '  %(prog)s --experimental-mode            # enable full INT8 export for ONNX and TFLite\n'
         ),
     )
@@ -1338,14 +1342,21 @@ def _build_parser():
             'to use only Head 1. (default: from model definition, typically [0.4, 0.35, 0.25])'
         ),
     )
-    parser.add_argument(
+    pruning = parser.add_mutually_exclusive_group()
+    pruning.add_argument(
         '--class-pruning',
         default=None,
         metavar='XLSX',
         help=(
             'Excel file of class labels. Rows with selected=1 are kept, using the ix column. '
-            'If omitted, all classes are exported.'
+            f'If omitted, {DEFAULT_CLASS_PRUNING_FILE} in the model directory is used when '
+            'present; otherwise all classes are exported.'
         ),
+    )
+    pruning.add_argument(
+        '--no-class-pruning',
+        action='store_true',
+        help=f'Export every class, even if the model directory has {DEFAULT_CLASS_PRUNING_FILE}.',
     )
     parser.add_argument(
         '--experimental-mode',
@@ -1389,9 +1400,13 @@ def main():
     )
 
     formats = set(args.formats)
-    classIxsSelection = load_class_ixs_from_excel(args.class_pruning) if args.class_pruning else None
+    class_pruning = args.class_pruning
+    default_pruning = os.path.join(modelDir, DEFAULT_CLASS_PRUNING_FILE)
+    if class_pruning is None and not args.no_class_pruning and os.path.isfile(default_pruning):
+        class_pruning = default_pruning
+    classIxsSelection = load_class_ixs_from_excel(class_pruning) if class_pruning else None
     if classIxsSelection:
-        write_pruned_labels(args.class_pruning, os.path.join(outputDir, 'labels_pruned.xlsx'))
+        write_pruned_labels(class_pruning, os.path.join(outputDir, 'labels_pruned.xlsx'))
 
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')
@@ -1401,7 +1416,7 @@ def main():
     print(f'Segment duration:   {segmentDuration}s')
     print(f'Head weights:       {headWeights}')
     print(f'Class pruning:      {len(classIxsSelection) if classIxsSelection else "disabled"}'
-          + (f' classes from {args.class_pruning}' if classIxsSelection else ''))
+          + (f' classes from {class_pruning}' if classIxsSelection else ''))
     print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 

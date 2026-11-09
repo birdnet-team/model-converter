@@ -18,6 +18,7 @@ export*/
 models/*/tf/
 models/*/torchscript/
 models/*/onnx/
+cache/
 trt_cache*/
 
 # IDE

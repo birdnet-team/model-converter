@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import numpy as np
 import importlib.util
@@ -14,10 +15,32 @@ from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 
-DEFAULT_MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
+DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
+
+# Class pruning sheet used by default when present in the model directory
+DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
+
+# BirdNET taxonomy used to write labels.csv for kept classes that have a birdnet_id
+DEFAULT_TAXONOMY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'BirdNET_Taxonomy_v0.5-Nov2026.csv'
+)
+TAXONOMY_LABEL_COLUMNS = [
+    'birdnet_id', 'scientific_name', 'common_name', 'taxon_group', 'inat_id', 'ebird_code',
+]
+# Translations are common_name_<lang> columns, e.g. common_name_de, common_name_es_MX, common_name_zh-CN
+TRANSLATION_COLUMN = re.compile(r'common_name_[a-z]{2}([_-][A-Za-z]{2})?')
+NOT_TRANSLATION_COLUMNS = {'common_name_alt', 'common_name_aliases'}
+
+# Terms copied into every export directory as plain text: source in the repo root -> file name
+EXPORT_TERMS_FILES = {
+    'MODEL_LICENSE.md': 'MODEL_LICENSE.txt',
+    'ACCEPTABLE_USE.md': 'ACCEPTABLE_USE.txt',
+}
+# Paragraphs about the repository's source code license are left out of the exported terms
+REPO_ONLY_PARAGRAPH = re.compile(r'^The source code in this repository.*?(?:\n[ \t]*\n|\Z)', re.M | re.S)
 
 
 DEFAULT_OUTPUT_DIR = os.path.join(
@@ -36,14 +59,22 @@ experimentalMode = False  # default: experimental mode off
 headWeights = None  # default: use model_module.headWeights
 model_module = None
 
+classIxsSelection = None  # set from the class pruning sheet; None means keep every class
 
 def _init_config(model_name, output_dir, batch_size, segment_duration, precision_set=None, experimental_mode=False, head_weights=None):
     """Initialise module-level config and load the model definition module."""
     global modelDir, outputDir, batchSize, segmentDuration, model_module
     global precisions, experimentalMode, headWeights
 
-    modelDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', model_name) + '/'
-    outputDir = os.path.join(output_dir.rstrip('/'), model_name) + '/'
+    # A bare name is looked up in models/; anything with a directory part is used as the path it is
+    model_arg = model_name.rstrip('/\\')
+    if os.path.dirname(model_arg):
+        model_path = os.path.abspath(model_arg)
+    else:
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', model_arg)
+
+    modelDir = model_path + '/'
+    outputDir = os.path.join(output_dir.rstrip('/'), os.path.basename(model_path)) + '/'
 
     batchSize = batch_size
     segmentDuration = segment_duration
@@ -139,6 +170,85 @@ def createTfPreprocessingModel():
 
 
 
+def prune_to_selected_classes(model, class_ixs, n_classes):
+    """Shrink every class-sized output layer to class_ixs. Shared layers are left alone.
+
+    Output column k is the original class class_ixs[k], in list order. Heads already
+    replaced by 1x1 dummies (weight 0) are skipped because their width is not n_classes.
+    """
+    def _sliced_linear(layer, index):
+        sliced = torch.nn.Linear(
+            layer.in_features, index.numel(), bias=layer.bias is not None
+        ).to(device=layer.weight.device, dtype=layer.weight.dtype)
+        with torch.no_grad():
+            sliced.weight.copy_(layer.weight.index_select(0, index))
+            if layer.bias is not None:
+                sliced.bias.copy_(layer.bias.index_select(0, index))
+        return sliced
+
+    def _sliced_conv1d(layer, index):
+        sliced = torch.nn.Conv1d(
+            layer.in_channels, index.numel(),
+            kernel_size=layer.kernel_size,
+            stride=layer.stride,
+            padding=layer.padding,
+            dilation=layer.dilation,
+            groups=layer.groups,
+            bias=layer.bias is not None,
+            padding_mode=layer.padding_mode,
+        ).to(device=layer.weight.device, dtype=layer.weight.dtype)
+        with torch.no_grad():
+            sliced.weight.copy_(layer.weight.index_select(0, index))
+            if layer.bias is not None:
+                sliced.bias.copy_(layer.bias.index_select(0, index))
+        return sliced
+
+    def _sliced_batchnorm1d(layer, index):
+        sliced = torch.nn.BatchNorm1d(
+            index.numel(), eps=layer.eps, momentum=layer.momentum,
+            affine=layer.affine, track_running_stats=layer.track_running_stats,
+        )
+        ref = layer.weight if layer.affine else layer.running_mean
+        sliced = sliced.to(device=ref.device, dtype=ref.dtype)
+        with torch.no_grad():
+            if layer.affine:
+                sliced.weight.copy_(layer.weight.index_select(0, index))
+                sliced.bias.copy_(layer.bias.index_select(0, index))
+            if layer.track_running_stats:
+                sliced.running_mean.copy_(layer.running_mean.index_select(0, index))
+                sliced.running_var.copy_(layer.running_var.index_select(0, index))
+                sliced.num_batches_tracked.copy_(layer.num_batches_tracked)
+        return sliced
+
+    if not class_ixs:
+        return model
+    class_ixs = [int(i) for i in class_ixs]
+    if len(class_ixs) != len(set(class_ixs)):
+        raise ValueError('classIxsSelection contains duplicates')
+    if any(i < 0 or i >= n_classes for i in class_ixs):
+        raise ValueError(f'classIxsSelection is outside 0..{n_classes - 1}')
+
+    index = torch.tensor(class_ixs, dtype=torch.long)
+    replaced = []
+    for parent in model.modules():
+        for name, child in list(parent.named_children()):
+            if isinstance(child, torch.nn.Linear) and child.out_features == n_classes:
+                setattr(parent, name, _sliced_linear(child, index.to(child.weight.device)))
+            elif isinstance(child, torch.nn.Conv1d) and child.out_channels == n_classes and child.groups == 1:
+                setattr(parent, name, _sliced_conv1d(child, index.to(child.weight.device)))
+            elif isinstance(child, torch.nn.BatchNorm1d) and child.num_features == n_classes:
+                ref = child.weight if child.affine else child.running_mean
+                setattr(parent, name, _sliced_batchnorm1d(child, index.to(ref.device)))
+            else:
+                continue
+            replaced.append(f'{child.__class__.__name__} {name}')
+
+    if not replaced:
+        raise RuntimeError('no class-sized layers found to prune')
+    print(f'Pruned classifier to {len(class_ixs)}/{n_classes} classes: {", ".join(replaced)}')
+    return model
+
+
 def loadPytorchModelAndWeights(includePreprocessing=True):
 
     #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -168,6 +278,10 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
     model.load_state_dict(checkpoint['state_dict'], strict=False)
 
     model.prune_unused_weights()
+
+    # Prune model to selected classes using class indices in classIxsSelection
+    if classIxsSelection:
+        prune_to_selected_classes(model, classIxsSelection, model_module.nClasses)
 
     model.eval()
 
@@ -1057,7 +1171,7 @@ def createOnnxModel():
         fp16_model = float16.convert_float_to_float16(
             fp32_model,
             keep_io_types=True,
-            op_block_list=['STFT', 'Log', 'Pow', 'Exp', 'GlobalAveragePool', 'ReduceMean', 'AveragePool'],
+            op_block_list=['STFT', 'Log', 'Pow', 'Exp', 'GlobalAveragePool', 'ReduceMean', 'AveragePool', 'ConstantOfShape'],
             node_block_list=preproc_nodes or None,
         )
 
@@ -1106,6 +1220,130 @@ def createOnnxModel():
 ###########################################################################################
 
 
+def load_class_ixs_from_excel(path):
+    """Return ix values for rows whose selected column is 1, in sheet order."""
+    if not os.path.isfile(path):
+        print(f'⚠️  Class pruning file not found: {path}')
+        sys.exit(1)
+
+    import pandas as pd
+    try:
+        df = pd.read_excel(path)
+    except ImportError:
+        sys.exit('Error: openpyxl is required to read --class-pruning Excel files')
+
+    missing = [name for name in ('ix', 'selected') if name not in df.columns]
+    if missing:
+        sys.exit(f'Error: {path} is missing column(s): {", ".join(missing)}')
+
+    selected = pd.to_numeric(df['selected'], errors='coerce')
+    ixs = pd.to_numeric(df.loc[selected == 1, 'ix'], errors='coerce')
+    if ixs.isna().any():
+        sys.exit(f'Error: {path} has a non-numeric ix in a selected row')
+    class_ixs = [int(i) for i in ixs.tolist()]
+    if not class_ixs:
+        sys.exit(f'Error: {path} has no rows with selected == 1')
+    return class_ixs
+
+
+def read_pruned_labels(src_path):
+    """Return the selected rows with ix renumbered to the exported output order."""
+    import pandas as pd
+    df = pd.read_excel(src_path)
+    selected = pd.to_numeric(df['selected'], errors='coerce')
+    labels = df.loc[selected == 1].copy()
+    labels['ix'] = range(len(labels))
+    return labels
+
+
+def build_taxonomy_labels(pruned_labels, taxonomy_path):
+    """Return one row per model output with names from the BirdNET taxonomy.
+
+    pruned_labels are the kept rows in output order; their birdnet_id column links each
+    output to the taxonomy. Returns None when the sheet has no birdnet_id column, and
+    exits if an id is missing, repeated, or unknown.
+    """
+    import pandas as pd
+    if 'birdnet_id' not in pruned_labels.columns:
+        return None
+    if not os.path.isfile(taxonomy_path):
+        sys.exit(f'Error: BirdNET taxonomy not found: {taxonomy_path}')
+    with open(taxonomy_path, encoding='utf-8', errors='replace') as f:
+        if f.readline().startswith('version https://git-lfs'):
+            sys.exit(f'Error: {taxonomy_path} is a Git LFS pointer; run `git lfs pull` to fetch it')
+
+    ids = pruned_labels['birdnet_id'].fillna('').astype(str).str.strip().reset_index(drop=True)
+    if (ids == '').any():
+        sys.exit(f'Error: {(ids == "").sum()} kept class(es) have no birdnet_id')
+    repeated = ids[ids.duplicated()].unique()
+    if len(repeated):
+        sys.exit(f'Error: birdnet_id used by more than one kept class: {", ".join(repeated[:10])}')
+
+    taxonomy = pd.read_csv(taxonomy_path, dtype=str, keep_default_na=False)
+    missing = [c for c in TAXONOMY_LABEL_COLUMNS if c not in taxonomy.columns]
+    if missing:
+        sys.exit(f'Error: {taxonomy_path} is missing column(s): {", ".join(missing)}')
+    if not taxonomy['birdnet_id'].is_unique:
+        sys.exit(f'Error: {taxonomy_path} has repeated birdnet_id values')
+    unknown = ids[~ids.isin(taxonomy['birdnet_id'])]
+    if len(unknown):
+        sys.exit(f'Error: {len(unknown)} birdnet_id(s) not in {taxonomy_path}: '
+                 f'{", ".join(unknown[:10])}')
+
+    translations = [c for c in taxonomy.columns if TRANSLATION_COLUMN.fullmatch(c)]
+    unrecognised = [c for c in taxonomy.columns if c.startswith('common_name_')
+                    and c not in translations and c not in NOT_TRANSLATION_COLUMNS]
+    if unrecognised:
+        print(f'⚠️  Not a recognised translation column, left out of labels.csv: {", ".join(unrecognised)}')
+    labels = taxonomy.set_index('birdnet_id', drop=False).loc[ids, TAXONOMY_LABEL_COLUMNS + translations]
+    labels.insert(0, 'ix', range(len(labels)))
+    return labels
+
+
+def write_label_files(output_dir, pruned_labels, taxonomy_labels):
+    """Write this export's label files and delete any that an earlier run left behind.
+
+    A table that is None means this run has no such file; an existing copy is removed so
+    the export directory never holds labels for a different set of classes.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    for name, table in (('labels_pruned.xlsx', pruned_labels), ('labels.csv', taxonomy_labels)):
+        path = os.path.join(output_dir, name)
+        if table is not None:
+            if name.endswith('.xlsx'):
+                table.to_excel(path, index=False)
+            else:
+                table.to_csv(path, index=False)
+            print(f'Wrote {len(table)} labels to {path}')
+        elif os.path.exists(path):
+            os.remove(path)
+            print(f'Removed {path} left by an earlier run')
+
+
+def write_terms_files(output_dir):
+    """Copy the model license and acceptable use policy into output_dir as plain text.
+
+    Code fences, link targets, inline code marks and the paragraph about the source code
+    license are dropped, and references to the Markdown files are renamed to their .txt copies.
+    """
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(output_dir, exist_ok=True)
+    for src_name, dst_name in EXPORT_TERMS_FILES.items():
+        src = os.path.join(repo_dir, src_name)
+        if not os.path.isfile(src):
+            sys.exit(f'Error: {src} not found; it ships with every export')
+        with open(src, encoding='utf-8') as f:
+            lines = [line for line in f.read().splitlines() if line.strip() != '```']
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', '\n'.join(lines) + '\n').replace('`', '')
+        text = REPO_ONLY_PARAGRAPH.sub('', text)
+        for md_name, txt_name in EXPORT_TERMS_FILES.items():
+            text = text.replace(md_name, txt_name)
+        dst = os.path.join(output_dir, dst_name)
+        with open(dst, 'w', encoding='utf-8') as f:
+            f.write(text)
+        print(f'Wrote {dst}')
+
+
 def _list_models(base_dir):
     """Return subdirectory names under models/ that contain model.py."""
     models_root = os.path.join(base_dir, 'models')
@@ -1139,6 +1377,9 @@ def _build_parser():
             '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
             '  %(prog)s --list-models                  # show available models\n'
             '  %(prog)s --head-weights 1.0 0.0 0.0     # use only Head 1 for predictions and reduce model size\n'
+            '  %(prog)s --class-pruning labels.xlsx    # keep only rows with selected=1\n'
+            '  %(prog)s --no-class-pruning             # export every class, ignoring labels_pruning.xlsx\n'
+            '  %(prog)s --taxonomy taxonomy.csv        # BirdNET taxonomy for labels.csv\n'
             '  %(prog)s --experimental-mode            # enable full INT8 export for ONNX and TFLite\n'
         ),
     )
@@ -1146,8 +1387,8 @@ def _build_parser():
         '-m', '--model-name',
         default=DEFAULT_MODEL_NAME,
         help=(
-            'Model directory name in models/ containing model.py and '
-            'a PyTorch checkpoint (default: %(default)s)'
+            'Model directory containing model.py and a PyTorch checkpoint: '
+            'a name in models/ or a path (default: %(default)s)'
         ),
     )
     parser.add_argument(
@@ -1208,6 +1449,32 @@ def _build_parser():
             'to use only Head 1. (default: from model definition, typically [0.4, 0.35, 0.25])'
         ),
     )
+    pruning = parser.add_mutually_exclusive_group()
+    pruning.add_argument(
+        '--class-pruning',
+        default=None,
+        metavar='XLSX',
+        help=(
+            'Excel file of class labels. Rows with selected=1 are kept, using the ix column. '
+            f'If omitted, {DEFAULT_CLASS_PRUNING_FILE} in the model directory is used when '
+            'present; otherwise all classes are exported.'
+        ),
+    )
+    pruning.add_argument(
+        '--no-class-pruning',
+        action='store_true',
+        help=f'Export every class, even if the model directory has {DEFAULT_CLASS_PRUNING_FILE}.',
+    )
+    parser.add_argument(
+        '--taxonomy',
+        default=DEFAULT_TAXONOMY_FILE,
+        metavar='CSV',
+        help=(
+            'BirdNET taxonomy used to write labels.csv when the class pruning sheet has a '
+            f'birdnet_id column (default: {os.path.basename(DEFAULT_TAXONOMY_FILE)} in the '
+            'repository root)'
+        ),
+    )
     parser.add_argument(
         '--experimental-mode',
         action='store_true',
@@ -1224,6 +1491,7 @@ def _build_parser():
 
 def main():
     """Entry point: parse CLI arguments, configure globals, and run conversions."""
+    global classIxsSelection
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -1249,6 +1517,18 @@ def main():
     )
 
     formats = set(args.formats)
+    class_pruning = args.class_pruning
+    default_pruning = os.path.join(modelDir, DEFAULT_CLASS_PRUNING_FILE)
+    if class_pruning is None and not args.no_class_pruning and os.path.isfile(default_pruning):
+        class_pruning = default_pruning
+    classIxsSelection = load_class_ixs_from_excel(class_pruning) if class_pruning else None
+    # Build and check every label table before writing, so a failed check writes nothing.
+    # labels.csv replaces labels_pruned.xlsx; the latter ships only for sheets without birdnet_id.
+    pruned_labels = read_pruned_labels(class_pruning) if classIxsSelection else None
+    taxonomy_labels = (build_taxonomy_labels(pruned_labels, args.taxonomy)
+                       if pruned_labels is not None else None)
+    write_label_files(outputDir, pruned_labels if taxonomy_labels is None else None, taxonomy_labels)
+    write_terms_files(outputDir)
 
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')
@@ -1257,6 +1537,12 @@ def main():
     print(f'Batch size:         {batchSize}')
     print(f'Segment duration:   {segmentDuration}s')
     print(f'Head weights:       {headWeights}')
+    print(f'Class pruning:      {len(classIxsSelection) if classIxsSelection else "disabled"}'
+          + (f' classes from {class_pruning}' if classIxsSelection else ''))
+    print(f'Taxonomy labels:    '
+          + (f'labels.csv from {args.taxonomy}' if taxonomy_labels is not None
+             else 'skipped (label sheet has no birdnet_id column)' if classIxsSelection
+             else 'skipped (class pruning disabled)'))
     print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 

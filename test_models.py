@@ -18,7 +18,7 @@ import librosa
 import onnxruntime as ort
 from ai_edge_litert.interpreter import Interpreter
 
-MODEL_NAME = '01_BirdNET+_V3.0-preview3_Global_11K'
+MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0
 
 SAMPLE_RATE = 32000
 DEFAULT_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'export', MODEL_NAME)
@@ -192,7 +192,7 @@ def _build_parser():
     parser.add_argument(
         '-e', '--export-dir',
         default=DEFAULT_EXPORT_DIR,
-        help='Path to export directory containing converted models (default: export/)',
+        help="Path to a model's export directory (default: export/<MODEL_NAME>/)",
     )
     parser.add_argument(
         '-a', '--audio',

@@ -1,0 +1,125 @@
+# Converts the default model to every format and compares the results against TorchScript
+# (test_models.py). Runs after changes to the converter reach main, or by hand from the
+# Actions tab. The Core ML models are tested on macOS, the only OS that runs them.
+name: Conversion tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - convert_model.py
+      - fix_conv2dsame.py
+      - fix_tflite_dynamic_input.py
+      - test_models.py
+      - requirements.txt
+      - BirdNET_Taxonomy_*.csv
+      - models/02_BirdNET+_V3.0_Global_12K/**
+      - .github/workflows/conversion-tests.yml
+  workflow_dispatch:
+
+concurrency:
+  group: conversion-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MODEL: 02_BirdNET+_V3.0_Global_12K
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  convert:
+    name: Convert and test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      coreml: ${{ steps.export.outputs.coreml }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Only the default model's checkpoint and the taxonomy are needed. The LFS objects are
+      # cached, so a run only uses LFS bandwidth when one of them changes.
+      - name: List Git LFS objects
+        run: |
+          git lfs ls-files -l -I "models/$MODEL/*,BirdNET_Taxonomy_*.csv" | cut -d' ' -f1 | sort > lfs-ids.txt
+          cat lfs-ids.txt
+      - uses: actions/cache@v6
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('lfs-ids.txt') }}
+      - name: Fetch Git LFS objects
+        run: git lfs pull --include "models/$MODEL/*,BirdNET_Taxonomy_*.csv"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # CPU builds of torch keep the install small; TensorRT is not used for conversion.
+      - name: Install requirements
+        run: |
+          pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+          grep -v '^tensorrt' requirements.txt > requirements-ci.txt
+          pip install -r requirements-ci.txt
+
+      - name: Convert
+        run: python convert_model.py -m "$MODEL" -o export
+
+      - name: Test (TorchScript, ONNX, LiteRT)
+        run: python test_models.py -e "export/$MODEL"
+
+      - name: Check for Core ML models
+        id: export
+        run: |
+          if [ -d "export/$MODEL/coreml" ]; then
+            echo "coreml=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "coreml=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload TorchScript reference and Core ML models
+        if: steps.export.outputs.coreml == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coreml-test-models
+          path: |
+            export/${{ env.MODEL }}/torchscript/model.pt
+            export/${{ env.MODEL }}/coreml/
+          retention-days: 1
+
+  coreml:
+    name: Test Core ML (macOS)
+    needs: convert
+    if: needs.convert.outputs.coreml == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Just what test_models.py imports; versions follow requirements.txt
+      # (onnxruntime-gpu has no macOS build, so the CPU package stands in for it).
+      - name: Install test requirements
+        run: |
+          grep -E '^(torch|torchaudio|librosa|coremltools)==' requirements.txt > requirements-ci.txt
+          ort=$(grep -E '^onnxruntime-gpu==' requirements.txt | sed 's/-gpu//')
+          pip install -r requirements-ci.txt "$ort" ai-edge-litert
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: coreml-test-models
+          path: export/${{ env.MODEL }}
+
+      - name: Test (Core ML)
+        run: python test_models.py -e "export/$MODEL"

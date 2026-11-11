@@ -217,6 +217,10 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 
 > **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations. INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
 
+### Continuous Integration
+
+[`.github/workflows/conversion-tests.yml`](.github/workflows/conversion-tests.yml) converts the default model to every format and runs `test_models.py` on the result. It runs when a push to `main` changes the converter (`convert_model.py`, the fix scripts, `test_models.py`, `requirements.txt`, the taxonomy or the default model's directory), and can be started by hand from the repository's Actions tab. Conversion and the TorchScript, ONNX and LiteRT tests run on Linux with CPU-only PyTorch; Core ML models, when the converter produces them, are tested on a macOS runner. The model checkpoint comes from Git LFS and is cached between runs, so LFS bandwidth is only used when it changes.
+
 ## License
 
 The source code is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

@@ -217,6 +217,14 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 
 > **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations. INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
 
+### Continuous Integration
+
+[`.github/workflows/conversion-tests.yml`](.github/workflows/conversion-tests.yml) converts the default model to every format and runs `test_models.py` on the result: conversion and the TorchScript, ONNX and LiteRT tests on Linux with CPU-only PyTorch, and Core ML models, when the converter produces them, on a macOS runner.
+
+- **When it runs:** on every pull request and push to `main`, but it only converts when the change touches the converter (`convert_model.py`, the fix scripts, `test_models.py`, `requirements.txt`, the taxonomy or the default model's directory; see `CONVERTER_FILES`). It can also be started by hand from the Actions tab.
+- **Required check:** the `Conversion tests` job always reports a result, passing when the tests passed or had nothing to test, so it can be a required status check for `main` (*Settings → Rules* or *Branches*). Require that job, not the individual ones, which are skipped for unrelated changes.
+- **Git LFS bandwidth:** the checkpoint (~470 MB with the taxonomy) is downloaded once into the Actions cache and restored from there. Pull requests read the cache saved on `main`, and a weekly run keeps it from expiring, so LFS bandwidth is only used when the checkpoint or taxonomy changes.
+
 ## License
 
 The source code is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

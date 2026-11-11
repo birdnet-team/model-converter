@@ -1,0 +1,192 @@
+# Converts the default model to every format and compares the results against TorchScript
+# (test_models.py). The Core ML models are tested on macOS, the only OS that runs them.
+#
+# Runs on pull requests and pushes to main, but only converts when converter files changed
+# (CONVERTER_FILES). The "Conversion tests" job always reports a result, so it can be a
+# required status check: it passes when the tests passed or had nothing to test.
+#
+# The Git LFS checkpoint is downloaded once into the Actions cache and restored from there.
+# The weekly run keeps that cache on main alive (unused caches are deleted after 7 days);
+# pull requests read main's cache, so LFS bandwidth is only used when the checkpoint changes.
+name: Conversion tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * 1'  # Mondays: refresh the LFS cache only
+  workflow_dispatch:      # Run everything by hand from the Actions tab
+
+concurrency:
+  group: conversion-tests-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  MODEL: 02_BirdNET+_V3.0_Global_12K
+  PYTHON_VERSION: '3.11'
+  LFS_FILES: models/02_BirdNET+_V3.0_Global_12K/*,BirdNET_Taxonomy_*.csv
+  # Changes to these files (extended regex over repository paths) trigger a conversion
+  CONVERTER_FILES: >-
+    ^(convert_model\.py|fix_conv2dsame\.py|fix_tflite_dynamic_input\.py|test_models\.py|requirements\.txt|BirdNET_Taxonomy_.*\.csv|models/02_BirdNET\+_V3\.0_Global_12K/.*|\.github/workflows/conversion-tests\.yml)$
+
+jobs:
+  changes:
+    name: Detect converter changes
+    runs-on: ubuntu-latest
+    outputs:
+      converter: ${{ steps.diff.outputs.converter }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          case "$EVENT" in
+            workflow_dispatch) converter=true ;;
+            schedule) converter=false ;;
+            *)
+              if git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+                git diff --name-only "$BASE...$HEAD" | tee changed.txt
+                grep -qE "$CONVERTER_FILES" changed.txt && converter=true || converter=false
+              else
+                converter=true  # base unknown (e.g. after a force push): test to be safe
+              fi ;;
+          esac
+          echo "converter=$converter" | tee -a "$GITHUB_OUTPUT"
+
+  lfs:
+    name: Cache Git LFS checkpoint
+    needs: changes
+    if: needs.changes.outputs.converter == 'true' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: key
+        run: |
+          git lfs ls-files -l -I "$LFS_FILES" | cut -d' ' -f1 | sort | tee lfs-ids.txt
+          echo "key=lfs-$(sha256sum lfs-ids.txt | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@v6
+        with:
+          path: .git/lfs/objects
+          key: ${{ steps.key.outputs.key }}
+      - name: Download from Git LFS (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: git lfs fetch --include "$LFS_FILES"
+
+  convert:
+    name: Convert and test (Linux)
+    needs: [changes, lfs]
+    if: needs.changes.outputs.converter == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      coreml: ${{ steps.export.outputs.coreml }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: .git/lfs/objects
+          key: ${{ needs.lfs.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Check out Git LFS files from the cache (no download)
+        run: git lfs checkout
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # CPU builds of torch keep the install small; TensorRT is not used for conversion.
+      - name: Install requirements
+        run: |
+          pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+          grep -v '^tensorrt' requirements.txt > requirements-ci.txt
+          pip install -r requirements-ci.txt
+
+      - name: Convert
+        run: python convert_model.py -m "$MODEL" -o export
+
+      - name: Test (TorchScript, ONNX, LiteRT)
+        run: python test_models.py -e "export/$MODEL"
+
+      - name: Check for Core ML models
+        id: export
+        run: |
+          if [ -d "export/$MODEL/coreml" ]; then
+            echo "coreml=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "coreml=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload TorchScript reference and Core ML models
+        if: steps.export.outputs.coreml == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coreml-test-models
+          path: |
+            export/${{ env.MODEL }}/torchscript/model.pt
+            export/${{ env.MODEL }}/coreml/
+          retention-days: 1
+
+  coreml:
+    name: Test Core ML (macOS)
+    needs: convert
+    if: needs.convert.outputs.coreml == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Just what test_models.py imports; versions follow requirements.txt
+      # (onnxruntime-gpu has no macOS build, so the CPU package stands in for it).
+      - name: Install test requirements
+        run: |
+          grep -E '^(torch|torchaudio|librosa|coremltools)==' requirements.txt > requirements-ci.txt
+          ort=$(grep -E '^onnxruntime-gpu==' requirements.txt | sed 's/-gpu//')
+          pip install -r requirements-ci.txt "$ort" ai-edge-litert
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: coreml-test-models
+          path: export/${{ env.MODEL }}
+
+      - name: Test (Core ML)
+        run: python test_models.py -e "export/$MODEL"
+
+  result:
+    name: Conversion tests
+    needs: [changes, lfs, convert, coreml]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed or was cancelled (skipped jobs are fine)
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac

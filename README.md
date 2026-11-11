@@ -219,7 +219,11 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 
 ### Continuous Integration
 
-[`.github/workflows/conversion-tests.yml`](.github/workflows/conversion-tests.yml) converts the default model to every format and runs `test_models.py` on the result. It runs when a push to `main` changes the converter (`convert_model.py`, the fix scripts, `test_models.py`, `requirements.txt`, the taxonomy or the default model's directory), and can be started by hand from the repository's Actions tab. Conversion and the TorchScript, ONNX and LiteRT tests run on Linux with CPU-only PyTorch; Core ML models, when the converter produces them, are tested on a macOS runner. The model checkpoint comes from Git LFS and is cached between runs, so LFS bandwidth is only used when it changes.
+[`.github/workflows/conversion-tests.yml`](.github/workflows/conversion-tests.yml) converts the default model to every format and runs `test_models.py` on the result: conversion and the TorchScript, ONNX and LiteRT tests on Linux with CPU-only PyTorch, and Core ML models, when the converter produces them, on a macOS runner.
+
+- **When it runs:** on every pull request and push to `main`, but it only converts when the change touches the converter (`convert_model.py`, the fix scripts, `test_models.py`, `requirements.txt`, the taxonomy or the default model's directory; see `CONVERTER_FILES`). It can also be started by hand from the Actions tab.
+- **Required check:** the `Conversion tests` job always reports a result, passing when the tests passed or had nothing to test, so it can be a required status check for `main` (*Settings → Rules* or *Branches*). Require that job, not the individual ones, which are skipped for unrelated changes.
+- **Git LFS bandwidth:** the checkpoint (~470 MB with the taxonomy) is downloaded once into the Actions cache and restored from there. Pull requests read the cache saved on `main`, and a weekly run keeps it from expiring, so LFS bandwidth is only used when the checkpoint or taxonomy changes.
 
 ## License
 

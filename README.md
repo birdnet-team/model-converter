@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  Convert BirdNET+ V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, and ONNX formats.<br>
+  Convert BirdNET+ V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, ONNX, and Core ML formats.<br>
   Supports variable-length audio input, with post-conversion fixes for ONNX and TFLite.
 </p>
 
@@ -32,11 +32,13 @@
 | TF SavedModel — preprocessing | `export/<model name>/tf/preprocessing/` | — | — |
 | TF SavedModel — main (spectrogram in) | `export/<model name>/tf/main/` ² | — | — |
 | TF SavedModel — combined (audio in) | `export/<model name>/tf/combined/` ² | — | — |
+| Core ML (audio in) | `export/<model name>/coreml/model.mlpackage` ³ | `model_fp16.mlpackage` | `model_int8.mlpackage` ¹ |
 
 ¹ Requires `--experimental-mode` (see [Precision Variants](#precision-variants)).  
-² Intermediate model; does not support dynamic inputs.
+² Intermediate model; does not support dynamic inputs.  
+³ Fixed input shape; see [Core ML](#core-ml).
 
-TorchScript and ONNX models accept any batch size; TFLite models use the batch size set with `--batch-size`. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and plain-text copies of the model license and acceptable use policy (`MODEL_LICENSE.txt`, `ACCEPTABLE_USE.txt`).
+TorchScript and ONNX models accept any batch size; TFLite and Core ML models use the batch size set with `--batch-size`, and Core ML models also take a fixed audio length set with `--segment-duration`. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and plain-text copies of the model license and acceptable use policy (`MODEL_LICENSE.txt`, `ACCEPTABLE_USE.txt`).
 
 Additional utilities:
 
@@ -93,6 +95,7 @@ Common variations:
 python convert_model.py -f onnx torchscript    # selected formats only
 python convert_model.py -p fp32                # FP32 only
 python convert_model.py -f onnx -p fp16        # ONNX FP16 only
+python convert_model.py -f coreml              # Core ML only
 python convert_model.py -o output/my_export    # write to output/my_export/<model name>/
 python convert_model.py -m my_custom_model     # another model: a name in models/ or a path
 python convert_model.py --list-models          # list the models in models/
@@ -132,10 +135,10 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
 
 -m, --model-name         Model directory: a name in models/ or a path (default: 02_BirdNET+_V3.0_Global_12K)
 -o, --output-dir         Directory that receives one folder per model (default: export/)
--f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx (default: all)
+-f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx, coreml (default: all)
 -p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)
---batch-size             Batch size baked into TFLite models (default: 1)
---segment-duration       Min audio segment duration in seconds for tracing (default: 3.0)
+--batch-size             Batch size baked into TFLite and Core ML models (default: 1)
+--segment-duration       Audio segment duration in seconds for tracing; the fixed input length of Core ML models (default: 3.0)
 --head-weights W W W     Weights for the three classifier heads (default: from model definition)
 --class-pruning XLSX     Keep classes whose selected column is 1 (default: labels_pruning.xlsx in the model directory if present, else all classes)
 --no-class-pruning       Export every class, ignoring labels_pruning.xlsx
@@ -168,8 +171,8 @@ All non-experimental precisions are exported by default. Use `-p` to pick specif
 | Precision | Method | Notes |
 |---|---|---|
 | `fp32` | Standard export | Full precision, used as the reference |
-| `fp16` | Weights converted to float16 | ~2× smaller, minimal accuracy loss |
-| `int8` | Dynamic quantization (ONNX) / dynamic range quantization (TFLite) | ~4× smaller, significant accuracy loss |
+| `fp16` | Weights converted to float16 (Core ML: float16 compute, see [Core ML](#core-ml)) | ~2× smaller, minimal accuracy loss |
+| `int8` | Dynamic quantization (ONNX) / dynamic range quantization (TFLite) / weight-only quantization (Core ML) | ~4× smaller, significant accuracy loss |
 
 Variants that are unstable or lose significant accuracy are only exported with `--experimental-mode`; otherwise they are skipped with a message:
 
@@ -178,6 +181,7 @@ Variants that are unstable or lose significant accuracy are only exported with `
 | ONNX INT8 | Severe numerical differences; changes the top predicted species |
 | TFLite INT8, combined model | Same quantization instability; not recommended for production |
 | TorchScript FP16 | Needs BN folding and a stage-5 FP32 fallback; may produce NaN on untested models |
+| Core ML INT8 | Treated like the other INT8 variants; weight-only, ~0.02 max prediction difference in conversion checks |
 
 The INT8 version of the main TFLite model (weights-only quantization) is exported by default.
 
@@ -190,8 +194,28 @@ The full pipeline (`-f tf tflite torchscript onnx`) runs these steps:
 3. **TF Combined** — Chains preprocessing and main model into a single end-to-end TFLite model (audio → predictions).
 4. **TorchScript** — Exports the full model, preprocessing included, via `torch.jit.script`.
 5. **ONNX** — Exports via `torch.onnx.export` with `dynamo=True`, then patches Resize and Conv2dSame ops for dynamic inputs.
+6. **Core ML** — Traces the full model, preprocessing included, with `torch.jit.trace` and converts it with `coremltools` (see [Core ML](#core-ml)).
 
 The separate preprocessing and main TFLite models let you plug in your own spectrogram pipeline or run the classifier on its own, for example computing spectrograms on a server and running only the main model on an edge device.
+
+### Core ML
+
+`-f coreml` writes Core ML ML Programs (`.mlpackage`) for iOS 16 / macOS 13 and later. Like the TorchScript and ONNX models, they take raw audio and run the preprocessing themselves:
+
+- **Input** `input`: float32 `[batch, samples]`, mono 32 kHz audio. The shape is fixed at `--batch-size` × `--segment-duration` × 32000 (default `[1, 96000]`, 3 s), because the preprocessing computes the spectrogram width with Python integers that the trace bakes in. A fixed shape also lets Core ML run the model on the Neural Engine. Export again with other values for another shape.
+- **Outputs** `predictions` (per-class sigmoid scores, in `labels.csv` order) and `embeddings`.
+- **Precisions:** `model.mlpackage` computes in float32. `model_fp16.mlpackage` computes in float16, except the preprocessing (the power spectrum exceeds the float16 range) and the GeM pooling layers (the `x**p` and p-th root lose too much precision); both stay float32 and have no large weights. `model_int8.mlpackage` (`--experimental-mode` only) stores weights as per-channel int8 and computes in float32; the preprocessing weights stay float32.
+- The model metadata records the sample rate, segment duration and head weights.
+
+`coremltools` converts on any OS, but Core ML models only run on macOS (or iOS). For example, in Python on a Mac:
+
+```python
+import coremltools as ct
+model = ct.models.MLModel('export/02_BirdNET+_V3.0_Global_12K/coreml/model.mlpackage')
+scores = model.predict({'input': audio})['predictions']   # audio: float32 [1, 96000]
+```
+
+`convert_model.py` registers its own converters for three torch ops that `coremltools` 9.0 lacks or mishandles: `tensordot` (mel filterbank), `aminmax` (per-sample normalisation) and `int` (Conv2dSame padding, under NumPy 2.4).
 
 ### Testing Converted Models
 
@@ -214,6 +238,8 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 --durations         Segment durations in seconds (default: 3.0 5.0)
 --gpu               Use GPU for TorchScript and ONNX inference
 ```
+
+Core ML models are tested only on macOS, and only for the batch size and duration they were exported with; other combinations are skipped.
 
 > **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations. INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
 

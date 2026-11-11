@@ -17,8 +17,16 @@ from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0
 
-ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx']
+ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx', 'coreml']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
+
+# Oldest OS the Core ML models load on (ML Program format; iOS16 = macOS 13)
+COREML_DEPLOYMENT_TARGET = 'iOS16'
+# Torch modules that stay fp32 in the Core ML FP16 model: the preprocessing (its power
+# spectrum exceeds the fp16 range) and the GeM pools (x**p with p up to ~7, then the p-th
+# root, loses too much precision in fp16; max error 0.1 instead of 0.002). Neither has
+# large weights, so the model stays half the fp32 size.
+COREML_FP32_MODULES = ['preprocess', 'global_pool', 'gem_pool_time', 'gem_pool_freq']
 
 # Class pruning sheet used by default when present in the model directory
 DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
@@ -1215,6 +1223,137 @@ def createOnnxModel():
         else:
             print("  ⚠️  Skipping ONNX INT8 — this is only supported in experimental mode. Use --experimental-mode to enable.")
 
+
+def _register_coreml_torch_ops():
+    """Register coremltools converters for torch ops that coremltools 9.0 lacks or mishandles.
+
+    - ``tensordot``: mel filterbank in the preprocessing (no built-in converter).
+    - ``aminmax``: per-sample min/max normalisation in the preprocessing (no built-in converter).
+    - ``int``: Conv2dSame padding sizes; the built-in converter calls ``int()`` on a
+      one-element array, which NumPy 2.4 rejects.
+    """
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.frontend.torch import ops as ct_ops
+    from coremltools.converters.mil.frontend.torch.torch_op_registry import register_torch_op
+
+    @register_torch_op(override=True)
+    def tensordot(context, node):
+        x, y, dims_x, dims_y = ct_ops._get_inputs(context, node, expected=4)
+        dims_x = [int(d) % x.rank for d in np.atleast_1d(dims_x.val)]
+        dims_y = [int(d) % y.rank for d in np.atleast_1d(dims_y.val)]
+        if len(dims_x) != 1 or y.rank != 2:
+            raise NotImplementedError('tensordot: only one contracted axis and a 2-D right operand')
+        # Move the contracted axis of x last and of y first, then matmul
+        x = mb.transpose(x=x, perm=[d for d in range(x.rank) if d != dims_x[0]] + dims_x)
+        if dims_y[0] == 1:
+            y = mb.transpose(x=y, perm=[1, 0])
+        context.add(mb.matmul(x=x, y=y, name=node.name))
+
+    @register_torch_op(override=True)
+    def aminmax(context, node):
+        x, dim, keepdim = ct_ops._get_inputs(context, node, expected=3)
+        axes = None if dim is None or dim.val is None else [int(dim.val)]
+        keep = bool(keepdim.val)
+        context.add(mb.reduce_min(x=x, axes=axes, keep_dims=keep, name=node.outputs[0]))
+        context.add(mb.reduce_max(x=x, axes=axes, keep_dims=keep, name=node.outputs[1]))
+
+    @register_torch_op(torch_alias=['int'], override=True)
+    def _int(context, node):
+        x = ct_ops._get_inputs(context, node, expected=1)[0]
+        if x.can_be_folded_to_const() and np.ndim(x.val) > 0 and np.size(x.val) == 1:
+            context.add(mb.const(val=np.int32(np.asarray(x.val).item()), name=node.name))
+        else:
+            ct_ops._cast(context, node, int, 'int32')
+
+
+def createCoreMLModel():
+    """Export the full model (with preprocessing) to Core ML ML Programs (.mlpackage).
+
+    Traces the model with ``torch.jit.trace`` at a fixed input shape of
+    ``(batchSize, segmentDuration * sampleRate)`` and converts it with coremltools.
+    The shape is fixed because the preprocessing computes the spectrogram width with
+    Python ints, which the trace bakes in; a fixed shape also lets Core ML schedule
+    the model on the Neural Engine.
+
+    Output: ``{outputDir}/coreml/model[_fp16|_int8].mlpackage``
+    """
+    import coremltools as ct
+    _register_coreml_torch_ops()
+
+    model = loadPytorchModelAndWeights(includePreprocessing=True)
+    n_samples = int(segmentDuration * model_module.sampleRate)
+    example = torch.rand(batchSize, n_samples)
+    with torch.no_grad():
+        traced = torch.jit.trace(model, example, check_trace=False)
+
+    dstDir = outputDir + 'coreml/'
+    os.makedirs(dstDir, exist_ok=True)
+
+    def _convert(compute_precision):
+        mlmodel = ct.convert(
+            traced,
+            inputs=[ct.TensorType(name='input', shape=(batchSize, n_samples), dtype=np.float32)],
+            outputs=[ct.TensorType(name='predictions'), ct.TensorType(name='embeddings')],
+            convert_to='mlprogram',
+            compute_precision=compute_precision,
+            minimum_deployment_target=getattr(ct.target, COREML_DEPLOYMENT_TARGET),
+        )
+        mlmodel.short_description = (
+            f'BirdNET+ audio classifier: {segmentDuration:g} s of mono {model_module.sampleRate} Hz '
+            'audio in, per-class sigmoid scores and embeddings out.')
+        mlmodel.license = 'Apache-2.0 (see MODEL_LICENSE.txt)'
+        mlmodel.input_description['input'] = (
+            f'Audio samples, float32 [{batchSize}, {n_samples}]')
+        mlmodel.output_description['predictions'] = 'Per-class sigmoid scores (see labels file)'
+        mlmodel.output_description['embeddings'] = 'Embedding vector'
+        mlmodel.user_defined_metadata.update({
+            'sample_rate': str(model_module.sampleRate),
+            'segment_duration': f'{segmentDuration:g}',
+            'head_weights': ','.join(f'{w:g}' for w in headWeights),
+        })
+        return mlmodel
+
+    from coremltools.converters.mil.mil.scope import ScopeSource
+
+    def _in_modules(op, prefixes):
+        """True if the MIL op came from a torch module whose dotted name starts with a prefix."""
+        names = op.scopes.get(ScopeSource.TORCHSCRIPT_MODULE_NAME) or []
+        dotted = '.'.join(names)
+        return any(dotted == p or dotted.startswith(p + '.') for p in prefixes)
+
+    if 'fp32' in precisions or ('int8' in precisions and _is_experimental()):
+        fp32_model = _convert(ct.precision.FLOAT32)
+        if 'fp32' in precisions:
+            path = dstDir + 'model.mlpackage'
+            fp32_model.save(path)
+            print('Core ML model saved to', path)
+
+    if 'fp16' in precisions:
+        # Everything runs in fp16 except the modules in COREML_FP32_MODULES
+        fp16_model = _convert(ct.transform.FP16ComputePrecision(
+            op_selector=lambda op: not _in_modules(op, COREML_FP32_MODULES)))
+        path = dstDir + 'model_fp16.mlpackage'
+        fp16_model.save(path)
+        print('Core ML FP16 model saved to', path)
+
+    if 'int8' in precisions and not _is_experimental():
+        print("  ⚠️  Skipping Core ML INT8 — this is only supported in experimental mode. Use --experimental-mode to enable.")
+    elif 'int8' in precisions:
+        # Weight-only int8 (per-channel, symmetric); compute stays fp32. Preprocessing
+        # weights (DFT kernels, mel filterbank) are left unquantized.
+        import coremltools.optimize.coreml as cto
+        skip = {op.name: None for op in fp32_model._mil_program.functions['main'].operations
+                if _in_modules(op, ['preprocess'])}
+        config = cto.OptimizationConfig(
+            global_config=cto.OpLinearQuantizerConfig(
+                mode='linear_symmetric', dtype='int8', granularity='per_channel'),
+            op_name_configs=skip,
+        )
+        int8_model = cto.linear_quantize_weights(fp32_model, config=config)
+        path = dstDir + 'model_int8.mlpackage'
+        int8_model.save(path)
+        print('Core ML INT8 (weight-only) model saved to', path)
+
 ###########################################################################################
 ###########################################################################################
 ###########################################################################################
@@ -1372,6 +1511,7 @@ def _build_parser():
             '  %(prog)s -f onnx torchscript           # ONNX + TorchScript only\n'
             '  %(prog)s -p fp32                        # FP32 only (skip FP16/INT8)\n'
             '  %(prog)s -f onnx -p fp16               # ONNX FP16 only\n'
+            '  %(prog)s -f coreml                     # Core ML only\n'
             '  %(prog)s -m my_model                     # use a different model\n'
             '  %(prog)s -o output/                     # custom output directory\n'
             '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
@@ -1380,7 +1520,7 @@ def _build_parser():
             '  %(prog)s --class-pruning labels.xlsx    # keep only rows with selected=1\n'
             '  %(prog)s --no-class-pruning             # export every class, ignoring labels_pruning.xlsx\n'
             '  %(prog)s --taxonomy taxonomy.csv        # BirdNET taxonomy for labels.csv\n'
-            '  %(prog)s --experimental-mode            # enable full INT8 export for ONNX and TFLite\n'
+            '  %(prog)s --experimental-mode            # enable full INT8 export for ONNX, TFLite and Core ML\n'
         ),
     )
     parser.add_argument(
@@ -1411,7 +1551,7 @@ def _build_parser():
         '--batch-size',
         type=int,
         default=1,
-        help='Batch size baked into TFLite models (default: %(default)s)',
+        help='Batch size baked into TFLite and Core ML models (default: %(default)s)',
     )
     parser.add_argument(
         '-p', '--precisions',
@@ -1429,8 +1569,8 @@ def _build_parser():
         type=float,
         default=3.0,
         help=(
-            'Minimum audio segment duration in seconds used during tracing '
-            '(default: %(default)s)'
+            'Audio segment duration in seconds used during tracing; also the fixed '
+            'input length of Core ML models (default: %(default)s)'
         ),
     )
     parser.add_argument(
@@ -1480,8 +1620,8 @@ def _build_parser():
         action='store_true',
         default=False,
         help=(
-            'Enable experimental features such as full INT8 quantization for ONNX '
-            'and TFLite. Without this flag, full INT8 variants are skipped. '
+            'Enable experimental features such as full INT8 quantization for ONNX, '
+            'TFLite and Core ML. Without this flag, full INT8 variants are skipped. '
             '(default: disabled)'
         ),
     )
@@ -1556,6 +1696,9 @@ def main():
 
     if 'onnx' in formats:
         createOnnxModel()
+
+    if 'coreml' in formats:
+        createCoreMLModel()
 
     print('\nDone.')
 

@@ -6,6 +6,7 @@ All models take raw audio [batch, samples].
 - TorchScript  → (embeddings, predictions)
 - ONNX         → (embeddings, predictions)
 - LiteRT       → predictions   (combined preprocessing + main)
+- Core ML      → predictions, embeddings (macOS only; fixed input shape)
 """
 
 import argparse
@@ -157,6 +158,23 @@ def run_tflite_partial(pre_path: str, main_path: str, audio_np: np.ndarray):
     # Fallback
     return main.get_tensor(main_out[0]['index']), dt
 
+def run_coreml(model, audio_np: np.ndarray):
+    """Run inference with a Core ML model (macOS only).
+
+    Returns:
+        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
+    """
+    t0 = time.perf_counter()
+    out = model.predict({'input': audio_np})
+    dt = time.perf_counter() - t0
+    return np.asarray(out['predictions']), dt
+
+
+def coreml_input_shape(model) -> tuple:
+    """Return the fixed (batch, samples) input shape of a Core ML model."""
+    return tuple(model.get_spec().description.input[0].type.multiArrayType.shape)
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def fmt_topk(out, k=TOP_K):
@@ -215,7 +233,7 @@ def _build_parser():
     parser.add_argument(
         '--gpu',
         action='store_true',
-        help='Use GPU for TorchScript and ONNX (LiteRT always runs on CPU)',
+        help='Use GPU for TorchScript and ONNX (LiteRT runs on CPU; Core ML picks its own units)',
     )
     return parser
 
@@ -316,6 +334,20 @@ def main():
     else:
         print(f"  LRT int8 partial: NOT FOUND — skipping")
 
+    # Core ML (runs only on macOS; each model has a fixed batch size and segment length)
+    coreml_paths = {name: os.path.join(export_dir, 'coreml', f'{stem}.mlpackage')
+                    for name, stem in (('CoreML', 'model'), ('CML_fp16', 'model_fp16'),
+                                       ('CML_int8', 'model_int8'))}
+    for name, path in coreml_paths.items():
+        if not os.path.exists(path):
+            continue
+        if sys.platform != 'darwin':
+            print(f"  {name + ':':<12} {path}  (needs macOS — skipping)")
+            continue
+        import coremltools as ct
+        print(f"  {name + ':':<12} {path}")
+        models[name] = ct.models.MLModel(path)  # default compute units, as an app gets them
+
     print("done.\n")
 
     results = []
@@ -406,6 +438,23 @@ def main():
                         atol=ATOL_INT8))
                 except RuntimeError as e:
                     print(f"⚠️ ERR   LRT_int8    dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
+                    results.append('ERROR')
+
+            # Core ML
+            for name in ('CoreML', 'CML_fp16', 'CML_int8'):
+                if name not in models:
+                    continue
+                if coreml_input_shape(models[name]) != audio.shape:
+                    print(f"⏭️  SKIP  {name:<10}  dur={duration:.1f}s  batch={batch_size}  "
+                          f"(model input is fixed at {coreml_input_shape(models[name])})")
+                    continue
+                try:
+                    out, dt = run_coreml(models[name], audio)
+                    results.append(compare_and_print(
+                        name, ts_out, out, duration, batch_size, ts_dt, dt,
+                        atol=ATOL_INT8 if name.endswith('int8') else ATOL))
+                except Exception as e:
+                    print(f"⚠️ ERR   {name:<10}  dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
 
             print()

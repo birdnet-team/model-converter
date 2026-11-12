@@ -111,7 +111,7 @@ python convert_model.py --class-pruning my_selection.xlsx   # use another sheet
 python convert_model.py --no-class-pruning                  # export every class
 ```
 
-For `02_BirdNET+_V3.0_Global_12K`, `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id, drops classes with fewer than 10 training samples (`nParts`), and keeps 23 non-animal sound classes such as gun, chainsaw, engine and siren. That leaves 11,732 of 16,852 classes, 11,709 of them animal species. The sheet's `pruning_note` column says why each other class was dropped.
+For `02_BirdNET+_V3.0_Global_12K`, `labels_pruning.xlsx` keeps one class per BirdNET taxonomy id, drops animal classes with fewer than 10 training samples (`nParts`), and keeps 16 non-animal sound classes: gun, chainsaw, siren, fireworks, hammer, power tool, sawing, engine, aircraft, vehicle horn, boat, motor vehicle, rail transport, boom, music and fire. That leaves 11,725 of 16,852 classes, 11,709 of them animal species. The sheet's `pruning_note` column says why each other class was dropped.
 
 The export directory gets one label file, with one row per model output:
 

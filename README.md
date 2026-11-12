@@ -116,9 +116,10 @@ For `02_BirdNET+_V3.0_Global_12K`, `labels_pruning.xlsx` keeps one class per Bir
 The export directory gets one label file, with one row per model output:
 
 - **`labels.csv`** when the sheet has a `birdnet_id` column: `ix`, `birdnet_id`, `scientific_name`, `common_name`, `taxon_group`, `inat_id`, `ebird_code` and every `common_name_<lang>` translation, taken from the BirdNET taxonomy (`BirdNET_Taxonomy_v0.5-Nov2026.csv`; override with `--taxonomy`). The conversion stops before writing anything if a kept class has no `birdnet_id`, shares one with another kept class, or has one the taxonomy doesn't list.
-- **`labels_pruned.xlsx`** otherwise: the selected rows, with `ix` renumbered to `0..n-1`.
+- **`labels_pruned.xlsx`** for a pruning sheet without a `birdnet_id` column: the selected rows, with `ix` renumbered to `0..n-1`.
+- **`labels.xlsx`** when classes are not pruned (`--no-class-pruning`, or no `labels_pruning.xlsx` in the model directory): the model directory's own `labels.xlsx`, copied unchanged. Its `ix` column is the output index. The conversion stops if its row count differs from the model's class count.
 
-Label files that a run doesn't write are removed from the export directory, so `--no-class-pruning` leaves none behind.
+Label files that a run doesn't write are removed from the export directory, so it never holds labels for a different set of classes.
 
 ### All Options
 
@@ -241,7 +242,9 @@ usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
 
 Core ML models are tested only on macOS, and only for the batch size and duration they were exported with; other combinations are skipped.
 
-> **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations. INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
+> **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations.* INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
+>
+> \* TFLite models match TorchScript almost exactly on 3 s input (the default `--segment-duration`) but drift on other lengths: about 0.04 max difference at 5 s in FP32, and up to 0.12 in FP16 with a single head (`--head-weights 1.0 0.0 0.0`), which fails the check. Use 3 s segments with TFLite FP16.
 
 ### Continuous Integration
 

@@ -30,6 +30,8 @@ COREML_FP32_MODULES = ['preprocess', 'global_pool', 'gem_pool_time', 'gem_pool_f
 
 # Class pruning sheet used by default when present in the model directory
 DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
+# The model's own label sheet, one row per original output; copied when classes are not pruned
+SOURCE_LABELS_FILE = 'labels.xlsx'
 
 # BirdNET taxonomy used to write labels.csv for kept classes that have a birdnet_id
 DEFAULT_TAXONOMY_FILE = os.path.join(
@@ -1439,16 +1441,42 @@ def build_taxonomy_labels(pruned_labels, taxonomy_path):
     return labels
 
 
-def write_label_files(output_dir, pruned_labels, taxonomy_labels):
+def find_source_labels(model_dir, n_classes):
+    """Return the path of the model's labels.xlsx, or None if the model has none.
+
+    Exits if the sheet's row count differs from n_classes, since its rows would then not
+    line up with the unpruned outputs.
+    """
+    path = os.path.join(model_dir, SOURCE_LABELS_FILE)
+    if not os.path.isfile(path):
+        print(f'⚠️  No {SOURCE_LABELS_FILE} in {model_dir}; the unpruned export has no label file')
+        return None
+    import pandas as pd
+    try:
+        n_rows = len(pd.read_excel(path))
+    except ImportError:
+        sys.exit(f'Error: openpyxl is required to read {path}')
+    if n_rows != n_classes:
+        sys.exit(f'Error: {path} has {n_rows} rows but the model has {n_classes} classes')
+    return path
+
+
+def write_label_files(output_dir, pruned_labels, taxonomy_labels, source_labels_path=None):
     """Write this export's label files and delete any that an earlier run left behind.
 
     A table that is None means this run has no such file; an existing copy is removed so
     the export directory never holds labels for a different set of classes.
+    source_labels_path is the model's labels.xlsx, copied unchanged for unpruned exports.
     """
+    import shutil
     os.makedirs(output_dir, exist_ok=True)
-    for name, table in (('labels_pruned.xlsx', pruned_labels), ('labels.csv', taxonomy_labels)):
+    for name, table in (('labels_pruned.xlsx', pruned_labels), ('labels.csv', taxonomy_labels),
+                        (SOURCE_LABELS_FILE, source_labels_path)):
         path = os.path.join(output_dir, name)
-        if table is not None:
+        if name == SOURCE_LABELS_FILE and table is not None:
+            shutil.copyfile(table, path)
+            print(f'Copied {table} to {path}')
+        elif table is not None:
             if name.endswith('.xlsx'):
                 table.to_excel(path, index=False)
             else:
@@ -1667,7 +1695,11 @@ def main():
     pruned_labels = read_pruned_labels(class_pruning) if classIxsSelection else None
     taxonomy_labels = (build_taxonomy_labels(pruned_labels, args.taxonomy)
                        if pruned_labels is not None else None)
-    write_label_files(outputDir, pruned_labels if taxonomy_labels is None else None, taxonomy_labels)
+    # Unpruned exports keep every original output, so the model's own labels.xlsx fits as is
+    source_labels = (find_source_labels(modelDir, model_module.nClasses)
+                     if not classIxsSelection else None)
+    write_label_files(outputDir, pruned_labels if taxonomy_labels is None else None, taxonomy_labels,
+                      source_labels)
     write_terms_files(outputDir)
 
     print(f'Model directory:    {modelDir}')
@@ -1682,7 +1714,8 @@ def main():
     print(f'Taxonomy labels:    '
           + (f'labels.csv from {args.taxonomy}' if taxonomy_labels is not None
              else 'skipped (label sheet has no birdnet_id column)' if classIxsSelection
-             else 'skipped (class pruning disabled)'))
+             else f'skipped (class pruning disabled; {SOURCE_LABELS_FILE} copied from the model)'
+             if source_labels else 'skipped (class pruning disabled)'))
     print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 

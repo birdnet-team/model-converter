@@ -121,6 +121,8 @@ The export directory gets one label file, with one row per model output:
 
 Label files that a run doesn't write are removed from the export directory, so it never holds labels for a different set of classes.
 
+If the model directory has a `label_overrides.csv` (or with `--label-overrides CSV`; `none` disables it), its non-empty cells replace the taxonomy names in `labels.csv`. Rows are keyed by the original output `ix` and its `birdnet_id`. For `02_BirdNET+_V3.0_Global_12K` it names the 16 sound classes in all languages.
+
 ### All Options
 
 ```
@@ -131,6 +133,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
                         [--head-weights W W W]
                         [--class-pruning XLSX | --no-class-pruning]
                         [--taxonomy CSV]
+                        [--label-overrides CSV]
                         [--experimental-mode]
                         [--list-models]
 
@@ -144,6 +147,7 @@ usage: convert_model.py [-h] [-m MODEL_NAME] [-o OUTPUT_DIR] [-f FMT [FMT ...]]
 --class-pruning XLSX     Keep classes whose selected column is 1 (default: labels_pruning.xlsx in the model directory if present, else all classes)
 --no-class-pruning       Export every class, ignoring labels_pruning.xlsx
 --taxonomy CSV           BirdNET taxonomy for labels.csv (default: BirdNET_Taxonomy_v0.5-Nov2026.csv)
+--label-overrides CSV    Names that replace taxonomy names in labels.csv (default: label_overrides.csv in the model directory if present; none to disable)
 --experimental-mode      Enable experimental variants (see Precision Variants)
 --list-models            List available models and exit
 ```

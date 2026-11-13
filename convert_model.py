@@ -15,7 +15,7 @@ from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 
-DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K 03_BirdNET+_V3.0-preview4_Global_12K_EffNetB0
+DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx', 'coreml']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']

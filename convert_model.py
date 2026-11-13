@@ -32,6 +32,9 @@ COREML_FP32_MODULES = ['preprocess', 'global_pool', 'gem_pool_time', 'gem_pool_f
 DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
 # The model's own label sheet, one row per original output; copied when classes are not pruned
 SOURCE_LABELS_FILE = 'labels.xlsx'
+# Optional file in the model directory with names that replace taxonomy names in labels.csv
+LABEL_OVERRIDES_FILE = 'label_overrides.csv'
+LABEL_OVERRIDE_KEYS = ('ix', 'birdnet_id')
 
 # BirdNET taxonomy used to write labels.csv for kept classes that have a birdnet_id
 DEFAULT_TAXONOMY_FILE = os.path.join(
@@ -1441,6 +1444,51 @@ def build_taxonomy_labels(pruned_labels, taxonomy_path):
     return labels
 
 
+def apply_label_overrides(labels, source_ixs, path):
+    """Return labels with names replaced by the non-empty cells of the overrides CSV at path.
+
+    labels has one row per exported output; source_ixs[k] is the original model output of
+    row k. Each override row names that original ix and, as a check, its birdnet_id. Exits
+    if a row's ix is not exported, its birdnet_id differs, or it has a column labels lacks.
+    """
+    import pandas as pd
+    if not os.path.isfile(path):
+        sys.exit(f'Error: label overrides not found: {path}')
+    overrides = pd.read_csv(path, dtype=str, keep_default_na=False)
+    missing = [c for c in LABEL_OVERRIDE_KEYS if c not in overrides.columns]
+    if missing:
+        sys.exit(f'Error: {path} is missing column(s): {", ".join(missing)}')
+    unknown = [c for c in overrides.columns if c not in labels.columns]
+    if unknown:
+        sys.exit(f'Error: {path} has column(s) that labels.csv lacks: {", ".join(unknown)}')
+    ixs = pd.to_numeric(overrides['ix'].str.strip(), errors='coerce')
+    if ixs.isna().any() or (ixs % 1 != 0).any():
+        sys.exit(f'Error: {path} has a non-integer ix')
+    ixs = ixs.astype(int)
+    if ixs.duplicated().any():
+        sys.exit(f'Error: {path} lists ix {", ".join(map(str, ixs[ixs.duplicated()].unique()))} twice')
+
+    row_of = {int(ix): k for k, ix in enumerate(source_ixs)}
+    columns = [c for c in overrides.columns if c not in LABEL_OVERRIDE_KEYS]
+    labels = labels.copy()
+    changed = 0
+    for ix, (_, override) in zip(ixs, overrides.iterrows()):
+        if ix not in row_of:
+            sys.exit(f'Error: {path} overrides ix {ix}, which is not an exported class')
+        k = row_of[ix]
+        expected = labels['birdnet_id'].iloc[k]
+        if override['birdnet_id'].strip() != expected:
+            sys.exit(f'Error: {path} gives ix {ix} birdnet_id {override["birdnet_id"]!r}, '
+                     f'but it is exported as {expected}')
+        for column in columns:
+            value = override[column].strip()
+            if value and labels[column].iloc[k] != value:
+                labels.iloc[k, labels.columns.get_loc(column)] = value
+                changed += 1
+    print(f'Applied label overrides from {path}: {len(overrides)} class(es), {changed} name(s) changed')
+    return labels
+
+
 def find_source_labels(model_dir, n_classes):
     """Return the path of the model's labels.xlsx, or None if the model has none.
 
@@ -1644,6 +1692,16 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        '--label-overrides',
+        default=None,
+        metavar='CSV',
+        help=(
+            'CSV whose non-empty cells replace taxonomy names in labels.csv, keyed by original '
+            f'ix and birdnet_id (default: {LABEL_OVERRIDES_FILE} in the model directory if '
+            'present; "none" to disable)'
+        ),
+    )
+    parser.add_argument(
         '--experimental-mode',
         action='store_true',
         default=False,
@@ -1695,6 +1753,17 @@ def main():
     pruned_labels = read_pruned_labels(class_pruning) if classIxsSelection else None
     taxonomy_labels = (build_taxonomy_labels(pruned_labels, args.taxonomy)
                        if pruned_labels is not None else None)
+    label_overrides = args.label_overrides
+    if label_overrides is None:
+        default_overrides = os.path.join(modelDir, LABEL_OVERRIDES_FILE)
+        label_overrides = default_overrides if os.path.isfile(default_overrides) else None
+    elif label_overrides.lower() == 'none':
+        label_overrides = None
+    if label_overrides and taxonomy_labels is None:
+        print(f'⚠️  Ignoring label overrides {label_overrides}: this run writes no labels.csv')
+        label_overrides = None
+    if label_overrides:
+        taxonomy_labels = apply_label_overrides(taxonomy_labels, classIxsSelection, label_overrides)
     # Unpruned exports keep every original output, so the model's own labels.xlsx fits as is
     source_labels = (find_source_labels(modelDir, model_module.nClasses)
                      if not classIxsSelection else None)
@@ -1716,6 +1785,7 @@ def main():
              else 'skipped (label sheet has no birdnet_id column)' if classIxsSelection
              else f'skipped (class pruning disabled; {SOURCE_LABELS_FILE} copied from the model)'
              if source_labels else 'skipped (class pruning disabled)'))
+    print(f'Label overrides:    {label_overrides or "none"}')
     print(f'Experimental mode:  {"enabled" if experimentalMode else "disabled"}')
     print()
 

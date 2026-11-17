@@ -71,7 +71,7 @@ OUTPUT_NAME = 'probabilities'
 # INT8 reaches 0.13 on the reference inputs and 0.2 on other random locations.
 TOLERANCE = {'fp32': 1e-4, 'fp16': 0.01, 'int8': 0.3,
              # Core ML: other hardware, and the FP16 model really computes in float16
-             'coreml_fp32': 1e-3, 'coreml_fp16': 0.03}
+             'coreml_fp32': 1e-4, 'coreml_fp16': 0.03}
 # ONNX FP16 stores a weight as float16 only if it has at least this many elements;
 # biases, normalisation parameters and scalar constants stay float32
 FP16_MIN_ELEMENTS = 4096
@@ -113,14 +113,18 @@ def load_model_module(model_dir):
 def reference_inputs(n=256):
     """Return a fixed ``(n, 3)`` float32 array of latitude, longitude and week.
 
-    The first rows are real places, the poles, the date line and the first and last week;
-    the rest are uniformly random.
+    The first rows are real places, the poles, the date line, every week of the year and
+    coordinates at round fractions of 180 degrees; the rest are uniformly random. Weeks and
+    round coordinates put the encoded angles on exact fractions of pi, where a runtime's
+    sin or cos can be wrong (see ``_register_coreml_ops``).
     """
     fixed = np.array([
         [50.83, 12.92, 20], [42.45, -76.47, 22], [-33.87, 151.21, 44], [0.0, 0.0, 1],
         [-1.29, 36.82, 10], [64.13, -21.90, 26], [90.0, 0.0, 48], [-90.0, 0.0, 1],
         [35.68, 180.0, 12], [35.68, -180.0, 12], [-54.80, -68.30, 48], [1.35, 103.82, 30],
-    ], dtype=np.float32)
+    ] + [[50.83, 12.92, week] for week in range(1, 49)]
+      + [[lat, lon, 20] for lat in (45.0, 22.5, -45.0, 30.0, 7.5)
+         for lon in (45.0, -135.0, 22.5, 90.0, 7.5)], dtype=np.float32)
     rng = np.random.RandomState(42)
     random = np.stack([rng.uniform(-90, 90, n), rng.uniform(-180, 180, n),
                        rng.randint(1, 49, n)], axis=1).astype(np.float32)
@@ -675,6 +679,26 @@ def _coreml_keeps_fp32(op):
     return False
 
 
+def _register_coreml_ops():
+    """Make coremltools convert ``sin(x)`` as ``cos(x - pi/2)``.
+
+    Core ML's sin returns the wrong sign for some exact arguments: on macOS 15 (arm64),
+    sin(pi/4) came out as -0.7071 and sin(5*pi/4) as +0.7071 in this model, on the CPU and
+    the GPU. Weeks 2, 3, 4 and 7 and coordinates at multiples of 7.5 degrees produce such
+    angles, and the output probabilities were then off by up to 0.99. Core ML's cos is
+    correct at these arguments; with sin replaced, the model matches PyTorch to 0.00001.
+    """
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.frontend.torch import ops as ct_ops
+    from coremltools.converters.mil.frontend.torch.torch_op_registry import register_torch_op
+
+    @register_torch_op(override=True)
+    def sin(context, node):
+        x = ct_ops._get_inputs(context, node, expected=1)[0]
+        shifted = mb.sub(x=x, y=np.float32(np.pi / 2))
+        context.add(mb.cos(x=shifted, name=node.name))
+
+
 def run_coreml(path, inputs):
     """Run a fixed-batch Core ML model on ``inputs`` (macOS only)."""
     import coremltools as ct
@@ -703,6 +727,7 @@ def export_coreml(module, model, inputs, results, output_dir, precisions, batch_
     """
     import coremltools as ct
 
+    _register_coreml_ops()
     coreml_dir = os.path.join(output_dir, 'coreml')
     os.makedirs(coreml_dir, exist_ok=True)
     wrapper = module.ExportWrapper(model).eval()

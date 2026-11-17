@@ -44,8 +44,7 @@ DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # 3000 random inputs: FP32 below 0.00004, FP16 0.005, INT8 0.2.
 ATOL = {'fp32': 1e-4, 'fp16': 0.01, 'int8': 0.3,
         # Core ML runs on other hardware, and its FP16 model really computes in float16
-        # (expected about 0.01 from a float16 simulation; not yet measured on a Mac)
-        'coreml_fp32': 1e-3, 'coreml_fp16': 0.03}
+        'coreml_fp32': 1e-4, 'coreml_fp16': 0.03}
 # Smallest allowed share of inputs whose top class matches the reference. Near ties flip
 # with any rounding difference; measured 100% (FP32), 99.6% (FP16), 90% (INT8).
 MIN_TOP1 = {'fp32': 0.99, 'fp16': 0.98, 'int8': 0.8, 'coreml_fp32': 0.99, 'coreml_fp16': 0.97}
@@ -63,12 +62,19 @@ ANCHORS = [
 
 
 def test_inputs(n=256):
-    """Return ``(n, 3)`` float32 inputs: real places, poles, date line, then random ones."""
+    """Return ``(n, 3)`` float32 inputs.
+
+    Real places, the poles, the date line, every week of the year and coordinates at round
+    fractions of 180 degrees, then random ones. Weeks and round coordinates give angles at
+    exact fractions of pi, where Core ML's sin was found to return the wrong sign.
+    """
     fixed = np.array([
         [50.83, 12.92, 20], [42.45, -76.47, 22], [-33.87, 151.21, 44], [0.0, 0.0, 1],
         [-1.29, 36.82, 10], [64.13, -21.90, 26], [90.0, 0.0, 48], [-90.0, 0.0, 1],
         [35.68, 180.0, 12], [35.68, -180.0, 12], [-54.80, -68.30, 48], [1.35, 103.82, 30],
-    ], dtype=np.float32)
+    ] + [[50.83, 12.92, week] for week in range(1, 49)]
+      + [[lat, lon, 20] for lat in (45.0, 22.5, -45.0, 30.0, 7.5)
+         for lon in (45.0, -135.0, 22.5, 90.0, 7.5)], dtype=np.float32)
     rng = np.random.RandomState(7)  # not the seed convert_geomodel.py validates with
     random = np.stack([rng.uniform(-90, 90, n), rng.uniform(-180, 180, n),
                        rng.randint(1, 49, n)], axis=1).astype(np.float32)

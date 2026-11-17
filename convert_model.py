@@ -1369,7 +1369,6 @@ def createOnnxModel():
         dstDir+'temp.onnx', 
         verbose=True, 
         input_names=['input'],
-        #output_names=['embeddings', 'predictions'],
         output_names=['predictions', 'embeddings'],
         opset_version=18,
         dynamo=True,
@@ -1600,7 +1599,7 @@ def createCoreMLModel():
     ``(batchSize, segmentDuration * sampleRate)`` and converts it with coremltools.
     The shape is fixed because the preprocessing computes the spectrogram width with
     Python ints, which the trace bakes in; a fixed shape also lets Core ML schedule
-    the model on the Neural Engine.
+    most of the FP16 model on the Neural Engine (which does not run float32).
 
     Output: ``{outputDir}/coreml/model[_fp16|_int8].mlpackage``
     """
@@ -1624,6 +1623,10 @@ def createCoreMLModel():
             convert_to='mlprogram',
             compute_precision=compute_precision,
             minimum_deployment_target=getattr(ct.target, COREML_DEPLOYMENT_TARGET),
+            # Do not compile and load the model (macOS only): the export never runs it,
+            # and compiling writes another copy of the weights to the temp directory.
+            # test_models.py is what checks that Core ML can load and run the model.
+            skip_model_load=True,
         )
         mlmodel.short_description = (
             f'BirdNET+ audio classifier: {segmentDuration:g} s of mono {model_module.sampleRate} Hz '

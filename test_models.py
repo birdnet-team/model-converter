@@ -3,8 +3,8 @@ Compare TorchScript (reference) against ONNX, LiteRT, and quantized/reduced-prec
 model outputs across different batch sizes and segment durations.
 
 All models take raw audio [batch, samples].
-- TorchScript  → (embeddings, predictions)
-- ONNX         → (embeddings, predictions)
+- TorchScript  → (predictions, embeddings)
+- ONNX         → (predictions, embeddings)
 - LiteRT       → predictions   (combined preprocessing + main)
 - Core ML      → predictions, embeddings (macOS only; fixed input shape)
 """
@@ -72,7 +72,6 @@ def run_torchscript(model, audio_np: np.ndarray, device: str, input_dtype=torch.
     with torch.no_grad():
         audio_t = torch.from_numpy(audio_np).to(device=device, dtype=input_dtype)
         t0 = time.perf_counter()
-        #embeddings, predictions = model(audio_t)
         predictions, embeddings = model(audio_t)
         if device != 'cpu':
             torch.cuda.synchronize()

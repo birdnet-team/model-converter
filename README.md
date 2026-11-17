@@ -198,7 +198,7 @@ Variants that are unstable or lose significant accuracy are only exported with `
 | TFLite INT8, combined model | Score differences up to 0.8; changes the top predicted species |
 | TFLite INT8, main model | Weights-only quantization; score differences up to 0.1 |
 | TorchScript FP16 | Needs BN folding and a stage-5 FP32 fallback; may produce NaN on untested models |
-| Core ML INT8 | Treated like the other INT8 variants; weight-only, ~0.02 max prediction difference in conversion checks |
+| Core ML INT8 | Treated like the other INT8 variants; weight-only, ~0.02 max prediction difference on the first 3 s of the example recording, up to ~0.06 over all 40 windows |
 
 No INT8 variant is exported by default. An accurate INT8 model would need quantization-aware training, which this converter does not do.
 
@@ -246,9 +246,11 @@ The separate preprocessing and main TFLite models let you plug in your own spect
 
 `-f coreml` writes Core ML ML Programs (`.mlpackage`) for iOS 16 / macOS 13 and later. Like the TorchScript and ONNX models, they take raw audio and run the preprocessing themselves:
 
-- **Input** `input`: float32 `[batch, samples]`, mono 32 kHz audio. The shape is fixed at `--batch-size` × `--segment-duration` × 32000 (default `[1, 96000]`, 3 s), because the preprocessing computes the spectrogram width with Python integers that the trace bakes in. A fixed shape also lets Core ML run the model on the Neural Engine. Export again with other values for another shape.
+- **Input** `input`: float32 `[batch, samples]`, mono 32 kHz audio. The shape is fixed at `--batch-size` × `--segment-duration` × 32000 (default `[1, 96000]`, 3 s), because the preprocessing computes the spectrogram width with Python integers that the trace bakes in. A fixed shape also lets Core ML use the Neural Engine for the FP16 model. Export again with other values for another shape.
 - **Outputs** `predictions` (per-class sigmoid scores, in `labels.csv` order) and `embeddings`.
 - **Precisions:** `model.mlpackage` computes in float32. `model_fp16.mlpackage` computes in float16, except the preprocessing (the power spectrum exceeds the float16 range) and the GeM pooling layers (the `x**p` and p-th root lose too much precision); both stay float32 and have no large weights. `model_int8.mlpackage` (`--experimental-mode` only) stores weights as per-channel int8 and computes in float32; the preprocessing weights stay float32.
+- **Compute units:** only `model_fp16.mlpackage` can use the Neural Engine, which computes in float16: Core ML places most of its operations there and the float32 parts on the CPU or GPU. The FP32 and INT8 models run on the GPU or CPU only. How close the FP16 model's scores are to the PyTorch model's depends on where it runs: over the 40 windows of the example recording, within about 0.01 on the GPU, 0.02 on the CPU and 0.04 on the Neural Engine, where the top species changed in 1 of 40 windows (a near tie).
+- **Silence:** for all-zero input the FP16 model's embeddings drift from the PyTorch model's on the CPU and Neural Engine (cosine similarity about 0.97; for real audio it is about 0.998, and 0.98 in the worst of the 40 windows on the Neural Engine). With the default head weights and class pruning the scores stay within 0.01. With `--head-weights 1 0 0 --no-class-pruning` one class's score differs by about 0.25, and `test_models.py` reports a failure for the FP16 model on silence. Use the FP32 model if you need exact scores or embeddings for silent segments.
 - The model metadata records the sample rate, segment duration and head weights.
 
 `coremltools` converts on any OS, but Core ML models only run on macOS (or iOS). For example, in Python on a Mac:

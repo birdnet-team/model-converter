@@ -515,7 +515,10 @@ def createTfMainModel(saveKerasModel=False):
         _convert_and_fix_tflite(dstDir, dstDir + 'model_fp16.tflite',
                                 optimize=True, supported_types=[tf.float16])
     if 'int8' in precisions:
-        _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
+        if _is_experimental():
+            _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
+        else:
+            print("  ⚠️  Skipping TFLite INT8 (main) — this is only supported in experimental mode. Use --experimental-mode to enable.")
 
 
     ## Cleanup
@@ -533,6 +536,47 @@ def createTfMainModel(saveKerasModel=False):
         print('Exported keras model to', dstPath)
 
 
+
+
+def _resave_saved_model_static(saved_model_dir, input_shape):
+    """Re-save a SavedModel so that ``serving_default`` advertises a fixed input shape.
+
+    The classifier converted by litert_torch is a fixed-shape StableHLO module. The
+    SavedModels wrap it in a signature with a dynamic length, which the TFLite converter
+    needs (the TFLite files are patched afterwards to be dynamic), but calling the
+    SavedModel itself with any other batch size or length fails at run time. Once the
+    TFLite files are written, the signature is narrowed to the shape that works.
+    TFLite files in the directory are kept.
+    """
+    import shutil
+
+    loaded = tf.saved_model.load(saved_model_dir)
+    fn = loaded.signatures['serving_default']
+    key = list(fn.structured_input_signature[1].keys())[0]
+
+    class StaticModel(tf.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = loaded
+
+        @tf.function(input_signature=[tf.TensorSpec(shape=input_shape, dtype=tf.float32, name=key)])
+        def serve(self, x):
+            return fn(**{key: x})
+
+    static_model = StaticModel()
+    tmpDir = saved_model_dir.rstrip('/') + '_static_tmp/'
+    tf.saved_model.save(static_model, tmpDir, signatures={'serving_default': static_model.serve})
+
+    for name in ('saved_model.pb', 'fingerprint.pb', 'variables', 'assets'):
+        path = os.path.join(saved_model_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
+    for name in os.listdir(tmpDir):
+        shutil.move(os.path.join(tmpDir, name), os.path.join(saved_model_dir, name))
+    shutil.rmtree(tmpDir)
+    print(f'  SavedModel {saved_model_dir}: serving_default input narrowed to {tuple(input_shape)}')
 
 
 def combineTfModels():
@@ -625,6 +669,11 @@ def combineTfModels():
             _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
         else:
             print("  ⚠️  Skipping TFLite INT8 (combined) — this is only supported in experimental mode. Use --experimental-mode to enable.")
+
+    # The SavedModels only run at the export shape; advertise it now that TFLite is done.
+    audio_length = int(segmentDuration * model_module.sampleRate)
+    _resave_saved_model_static(dstDir, [batchSize, audio_length])
+    _resave_saved_model_static(path_main, [batchSize, 3, model_module.imageHeight, imageWidth])
 
 
 
@@ -748,6 +797,104 @@ def _find_preprocessing_node_names(fp32_model) -> list:
                     queue.append(inp)
 
     return preproc_names
+
+
+def _make_mixed_precision_onnx(fp32_model):
+    """Rewrite an fp32 ONNX graph so that only the backbone convolutions run in fp16.
+
+    Every 2D ``Conv`` outside the preprocessing gets fp16 weights and bias, a
+    ``Cast(fp16)`` on its input and a ``Cast(fp32)`` on its output. Activations, SE
+    pooling, residual adds, the pooling heads and the classifier stay in fp32.
+
+    Why: ONNX Runtime on CPU has fast fp16 convolution kernels (arm64) but no vectorized
+    fp16 elementwise kernels, so in a fully fp16 graph the SiLU ``Mul``/``Sigmoid`` cost
+    more than the convolutions. With fp32 activations ORT also fuses ``x * sigmoid(x)``.
+    The large classifier weights are stored as fp16 and cast to fp32 at load, so the file
+    is about as small as the fp16 model.
+
+    BatchNorm is already folded into the Conv weights by the exporter, so conv outputs
+    are post-normalization values, far inside the fp16 range. A Conv whose weights do
+    not fit fp16 is left in fp32.
+
+    Returns:
+        (model, number of fp16 Conv nodes, number of Conv nodes left in fp32)
+    """
+    FP16_MAX = 65504.0
+    graph = fp32_model.graph
+    preproc = set(_find_preprocessing_node_names(fp32_model))
+    inits = {init.name: init for init in graph.initializer}
+
+    new_nodes = []
+    new_inits = {}
+    n_mixed = n_skipped = 0
+    for node in graph.node:
+        weights = [inits.get(name) for name in node.input[1:]]
+        is_backbone_conv = (
+            node.op_type == 'Conv' and node.name not in preproc
+            and weights and all(w is not None for w in weights)
+            and len(weights[0].dims) == 4)
+        if not is_backbone_conv:
+            new_nodes.append(node)
+            continue
+
+        arrays = [numpy_helper.to_array(w) for w in weights]
+        if any(a.dtype != np.float32 or not np.isfinite(a).all() or np.abs(a).max() > FP16_MAX
+               for a in arrays):
+            new_nodes.append(node)
+            n_skipped += 1
+            continue
+
+        # fp16 copies of weight/bias (copies: an initializer may be shared with fp32 nodes)
+        for i, (w, a) in enumerate(zip(weights, arrays), start=1):
+            name16 = w.name + '_fp16'
+            if name16 not in new_inits:
+                new_inits[name16] = numpy_helper.from_array(a.astype(np.float16), name16)
+            node.input[i] = name16
+
+        src, dst = node.input[0], node.output[0]
+        node.input[0] = src + '__' + node.name + '_fp16'
+        node.output[0] = dst + '_fp16'
+        new_nodes.append(helper.make_node('Cast', [src], [node.input[0]],
+                                          to=onnx.TensorProto.FLOAT16, name=node.name + '_to_fp16'))
+        new_nodes.append(node)
+        new_nodes.append(helper.make_node('Cast', [node.output[0]], [dst],
+                                          to=onnx.TensorProto.FLOAT, name=node.name + '_to_fp32'))
+        n_mixed += 1
+
+    # The classifier heads (Gemm, Conv1d attention) hold most of the parameters. They
+    # compute in fp32, but their weights are stored as fp16 and cast back when the model
+    # is loaded (the runtime constant-folds the Cast), which halves the file size.
+    cast_nodes = []
+    for node in new_nodes:
+        if node.name in preproc or node.op_type not in ('Conv', 'Gemm', 'MatMul'):
+            continue
+        for i, name in enumerate(node.input):
+            w = inits.get(name)
+            if w is None or w.data_type != onnx.TensorProto.FLOAT or int(np.prod(w.dims)) < 4096:
+                continue
+            name16 = name + '_stored_fp16'
+            if name16 not in new_inits:
+                a = numpy_helper.to_array(w)
+                if not np.isfinite(a).all() or np.abs(a).max() > FP16_MAX:
+                    continue
+                new_inits[name16] = numpy_helper.from_array(a.astype(np.float16), name16)
+                cast_nodes.append(helper.make_node('Cast', [name16], [name16 + '_fp32'],
+                                                   to=onnx.TensorProto.FLOAT, name=name16 + '_to_fp32'))
+            node.input[i] = name16 + '_fp32'
+
+    del graph.node[:]
+    graph.node.extend(cast_nodes + new_nodes)
+    graph.initializer.extend(new_inits.values())
+
+    # Drop fp32 initializers that are no longer referenced, and stale type annotations
+    used = {name for node in graph.node for name in node.input}
+    kept = [init for init in graph.initializer if init.name in used]
+    del graph.initializer[:]
+    graph.initializer.extend(kept)
+    del graph.value_info[:]
+
+    onnx.checker.check_model(fp32_model)
+    return fp32_model, n_mixed, n_skipped
 
 
 def createTorchScriptModel():
@@ -1191,6 +1338,15 @@ def createOnnxModel():
         fp16_path = dstDir + 'model_fp16.onnx'
         onnx.save(fp16_model, fp16_path, save_as_external_data=False)
         print(f'ONNX FP16 model exported to {fp16_path}')
+
+
+        # Mixed precision variant for CPUs (arm64 in particular): fp16 only inside the
+        # backbone convolutions, everything else fp32.
+        mixed_model, n_mixed, n_skipped = _make_mixed_precision_onnx(onnx.load(onnx_path))
+        mixed_path = dstDir + 'model_fp16_mixed.onnx'
+        onnx.save(mixed_model, mixed_path, save_as_external_data=False)
+        print(f'ONNX mixed-precision model exported to {mixed_path} '
+              f'({n_mixed} fp16 Conv nodes, {n_skipped} kept in fp32)')
 
 
     # INT8 variant (dynamic quantization)

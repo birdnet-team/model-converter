@@ -15,7 +15,19 @@
 
 <p align="center">
   Convert BirdNET+ V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, ONNX, and Core ML formats.<br>
-  ONNX and TorchScript models take any batch size and audio length; the other formats use the export shape.
+  ONNX and TorchScript models take any batch size and audio length; the other formats use the export shape.<br>
+  The <a href="#birdnet-geomodel">BirdNET+ Geomodel</a>, which predicts where and when species occur, is converted here too.
+</p>
+
+<p align="center">
+  <a href="#overview">Overview</a> ·
+  <a href="#setup">Setup</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#precision-variants">Precision</a> ·
+  <a href="#core-ml">Core ML</a> ·
+  <a href="#testing-converted-models">Testing</a> ·
+  <a href="#birdnet-geomodel">Geomodel</a> ·
+  <a href="#license">License</a>
 </p>
 
 ## Overview
@@ -56,6 +68,7 @@ Additional utilities:
 - **`fix_conv2dsame.py`** — Replaces baked-in static Conv2dSame padding in ONNX exports with dynamic padding subgraphs.
 - **`fix_tflite_dynamic_input.py`** — Patches TFLite flatbuffers to fix static batch/temporal dimensions after `litert_torch` conversion.
 - **`test_models.py`** — Compares each converted format against the exported TorchScript model across batch sizes and segment durations.
+- **`convert_geomodel.py`**, **`test_geomodel.py`** — Convert and test the [BirdNET+ Geomodel](#birdnet-geomodel).
 
 ## Setup
 
@@ -311,11 +324,93 @@ Measured on one machine that was also running other jobs (x86 CPU, NVIDIA TITAN 
 
 ### Continuous Integration
 
-[`.github/workflows/conversion-tests.yml`](.github/workflows/conversion-tests.yml) converts the default model to every format and runs `test_models.py` on the result: conversion and the TorchScript, ONNX and LiteRT tests on Linux with CPU-only PyTorch, and Core ML models, when the converter produces them, on a macOS runner.
+[`.github/workflows/conversion-tests.yml`](.github/workflows/conversion-tests.yml) converts the default model to every format and runs `test_models.py` on the result: conversion and the TorchScript, ONNX and LiteRT tests on Linux with CPU-only PyTorch, and Core ML models, when the converter produces them, on a macOS runner. The same jobs convert the geomodel with `convert_geomodel.py` and run `test_geomodel.py`, including its Core ML models on macOS.
 
-- **When it runs:** on every pull request and push to `main`, but it only converts when the change touches the converter (`convert_model.py`, the fix scripts, `test_models.py`, `requirements.txt`, the taxonomy or the default model's directory; see `CONVERTER_FILES`). It can also be started by hand from the Actions tab.
+- **When it runs:** on every pull request and push to `main`, but it only converts when the change touches the converter (`convert_model.py`, `convert_geomodel.py`, the fix scripts, the test scripts, `requirements.txt`, the taxonomy or the directories of the default model and the geomodel; see `CONVERTER_FILES`). It can also be started by hand from the Actions tab.
 - **Required check:** the `Conversion tests` job always reports a result, passing when the tests passed or had nothing to test, so it can be a required status check for `main` (*Settings → Rules* or *Branches*). Require that job, not the individual ones, which are skipped for unrelated changes.
-- **Git LFS bandwidth:** the checkpoint (~470 MB with the taxonomy) is downloaded once into the Actions cache and restored from there. Pull requests read the cache saved on `main`, and a weekly run keeps it from expiring, so LFS bandwidth is only used when the checkpoint or taxonomy changes.
+- **Git LFS bandwidth:** the checkpoints (~490 MB with the taxonomy) are downloaded once into the Actions cache and restored from there. Pull requests read the cache saved on `main`, and a weekly run keeps it from expiring, so LFS bandwidth is only used when the checkpoint or taxonomy changes.
+
+## BirdNET+ Geomodel
+
+The [BirdNET+ Geomodel](https://github.com/birdnet-team/geomodel) predicts which species occur at a place in a given week of the year, typically to filter the audio model's detections by location and season. `convert_geomodel.py` converts a geomodel checkpoint; the default is `models/03_BirdNET+_Geomodel_V3.0.5_Global_14K`. V3.0.5 is a patch of the geomodel V3.0.4 release: the same trained weights, with the classes reduced to those in the BirdNET taxonomy and labelled with BirdNET IDs (see [Geomodel labels](#geomodel-labels)), and converted files that are closer to the PyTorch model.
+
+```bash
+python convert_geomodel.py                     # default geomodel, all formats, FP32 and FP16
+python convert_geomodel.py -f onnx -p fp16     # ONNX FP16 only
+python convert_geomodel.py -f coreml           # Core ML only
+python convert_geomodel.py --batch-size 32     # batch size of the LiteRT, SavedModel and Core ML models
+python test_geomodel.py                        # compare every converted file with TorchScript
+```
+
+Every model takes one float32 tensor `[batch, 3]` with the columns latitude (degrees, -90 to 90), longitude (degrees, -180 to 180) and week (1 to 48, four weeks per month), and returns one value per class, in label order:
+
+| Format | Output in `export/<model name>/` | Returns | Batch size |
+|---|---|---|---|
+| PyTorch checkpoint | `checkpoint/model.pt`, `model_labels.txt` | — | — |
+| TorchScript | `torchscript/model.pt` | raw logits ¹ | any |
+| ONNX | `onnx/model.onnx`, `model_fp16.onnx` | probabilities | any |
+| LiteRT (TFLite) | `tf/model.tflite`, `model_fp16.tflite`, `model_int8.tflite` ² | probabilities | fixed (`--batch-size`) ³ |
+| TF SavedModel | `tf/` | probabilities | fixed (`--batch-size`) ³ |
+| Core ML | `coreml/model.mlpackage`, `model_fp16.mlpackage` | probabilities | fixed (`--batch-size`) ⁴ |
+
+¹ As in the geomodel releases, so that existing loaders keep working; apply a sigmoid, or export with `--torchscript-sigmoid` to get probabilities.  
+² Experimental: exported with `--experimental-mode` only, and not part of the released files. It changes the top class for about one input in ten.  
+³ `litert_torch` converts a fixed input shape. The SavedModel fails with an error on another batch size; a LiteRT model resized to another batch size returns output for the export batch size only. Use ONNX or TorchScript for other batch sizes.  
+⁴ ML Programs for iOS 16 / macOS 13 and later, input `input`, output `probabilities`. See [Geomodel Core ML](#geomodel-core-ml); these models have not been run yet.
+
+The checkpoint in `checkpoint/` holds the exported classes and nothing but weights, the model configuration and the species vocabulary (no optimizer state). It loads with `load_checkpoint` in the model directory's `model.py` and with the geomodel repository's `convert.py` and `predict.py`, which read the labels from `model_labels.txt` next to it.
+
+Each run first deletes the model files an earlier run left in the export directory, so the models always match the label files written by that run.
+
+Differences between these files and the files of the geomodel V3.0.4 release:
+
+- **FP16 is more accurate.** The FP16 models store their weights as float16 and compute in float32. The model definition here also converts degrees and weeks to radians with constants that float16 represents without loss; rounding `pi / 180` to float16 was the main source of error in FP16 files.
+- **LiteRT models need no Flex delegate.** They contain built-in operators only, so they run under plain LiteRT; the release's TFLite files need the TensorFlow Select ops (`FlexErf`).
+- **Fixed batch size** for LiteRT and the SavedModel, as described above.
+- **Core ML** is new.
+- **No INT8 file** by default.
+
+Largest difference in output probability to the original PyTorch model of the geomodel repository, over 3000 random locations and weeks:
+
+| Model | Max difference | Top class agrees | Size |
+|---|---|---|---|
+| TorchScript, ONNX, LiteRT FP32, TF SavedModel | below 0.00004 | 100% | 15 MB |
+| ONNX FP16 | 0.005 (V3.0.4 release file: 0.09) | 99.9% | 7 MB |
+| LiteRT FP16 | 0.004 (V3.0.4 release file: 0.06) | 99.8% | 7 MB |
+| LiteRT INT8 ² | 0.19 | 89% | 4 MB |
+
+`convert_geomodel.py` compares every file it writes with the PyTorch model on 256 fixed locations and weeks and fails if one exceeds its tolerance (0.0001 for FP32, 0.01 for FP16, 0.3 for INT8). The FP32 models differ from the V3.0.4 release files by less than 0.0001 on the classes both have; that difference comes from the changed degree-to-radian conversion. The INT8 model changes the top class for about one input in ten, which is why it is experimental. Measured on an x86 CPU; LiteRT FP16 on a device that computes in float16 was not measured.
+
+### Geomodel Core ML
+
+`-f coreml` writes two ML Programs with a fixed input shape of `[--batch-size, 3]`:
+
+- `model.mlpackage` computes in float32.
+- `model_fp16.mlpackage` computes in float16, which the Neural Engine requires, except for the coordinate encoding: splitting the input, converting degrees and weeks to radians, and sin and cos stay float32. Latitude and longitude need more digits than float16 has. Input and output are float32.
+
+`coremltools` converts on any OS, but Core ML models only run on macOS and iOS. **They have been converted and their graphs inspected on Linux, but not run.** A float16 simulation of the same split in PyTorch gives a largest difference of 0.01 to the FP32 model (0.17 with the encoding in float16 too); the real figure depends on the compute unit. On a Mac, `convert_geomodel.py` compares them with the PyTorch model like the other formats, and `test_geomodel.py` tests them (tolerance 0.001 for FP32, 0.03 for FP16); the macOS CI job runs that test.
+
+### Geomodel labels
+
+The export directory gets `labels.csv`, with the same columns as the audio model's `labels.csv` (BirdNET ID, names, translations), and `labels.txt` in the geomodel's own format (`id<TAB>scientific name<TAB>common name`) with the BirdNET ID as the id. Both have one row per model output. The audio model and the geomodel cover different sets of classes; rows are matched by `birdnet_id`.
+
+Which outputs are exported, and their BirdNET IDs, come from a class pruning sheet as for the audio model (`labels_pruning.xlsx` in the model directory, or `--class-pruning`): rows with `selected = 1` are kept, `ix` is the output of the checkpoint, and `birdnet_id` links the row to the taxonomy. The sheet belongs to one checkpoint: the converter compares the sheet's `source_code` or `birdnet_id` with the checkpoint's species vocabulary and stops if they name different classes.
+
+The default model's checkpoint is already reduced to its 14,057 selected classes.
+`labels_pruning_source.xlsx` in the model directory lists all 14,082 classes of the release with their match and what was dropped; with it and the release checkpoint, `--checkpoint` and `--class-pruning` reproduce `checkpoint.pt`.
+
+### Converting your own geomodel
+
+A checkpoint trained with the [geomodel repository](https://github.com/birdnet-team/geomodel) comes with a `labels.txt` of eBird codes and iNaturalist ids. Match it to the taxonomy, review the sheet, then convert:
+
+```bash
+python convert_geomodel.py --map-labels my_run/checkpoint_best_labels.txt --sheet-out my_run/pruning.xlsx
+python convert_geomodel.py --checkpoint my_run/checkpoint_best.pt --class-pruning my_run/pruning.xlsx -o export/my_run
+```
+
+`--map-labels` matches each label by scientific name, then by code, then by a scientific name alias, and selects one class per BirdNET ID; it prints what was not selected and why. It also lists rows to review by hand (column `review`): codes that belong to another taxon than the name, and alias matches with a different common name, which may be a form the taxonomy lumps into a wider species. Set `selected` to 0 for classes you do not want.
+
+With `--checkpoint` and no `--class-pruning`, or with `--no-class-pruning`, every class of the checkpoint is exported. `labels.txt` is then copied from the labels file next to the checkpoint (`<name>_labels.txt` or `labels.txt`); without one, the names come from the checkpoint's vocabulary, and `labels.csv` is written if those are BirdNET IDs. The checkpoint is read with `torch.load(..., weights_only=True)`, and the model must match the architecture in `model.py` of the model directory given with `-m`.
 
 ## License
 
@@ -325,7 +420,7 @@ Trained model weights are licensed under the [Apache License, Version 2.0](MODEL
 
 ## Acceptable Use
 
-BirdNET is built to support biodiversity research and conservation. See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) for how we expect the BirdNET+ V3.0 models to be used, including uses we consider unacceptable and guidance on branding derivative work.
+BirdNET is built to support biodiversity research and conservation. See [ACCEPTABLE_USE.md](ACCEPTABLE_USE.md) for how we expect the BirdNET+ V3.0 models and the BirdNET+ Geomodel to be used, including uses we consider unacceptable and guidance on branding derivative work.
 
 ## Funding
 

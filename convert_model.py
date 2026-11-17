@@ -103,6 +103,8 @@ def _init_config(model_name, output_dir, batch_size, segment_duration, precision
     model_module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = model_module
     spec.loader.exec_module(model_module)
+    if getattr(model_module, 'MODEL_TYPE', 'audio') == 'geomodel':
+        sys.exit(f'Error: {model_arg} is a geomodel; convert it with convert_geomodel.py')
 
 
     # Set headWeights after model_module is loaded so we can fall back to its default

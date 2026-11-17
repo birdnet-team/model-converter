@@ -3,8 +3,8 @@ Compare TorchScript (reference) against ONNX, LiteRT, and quantized/reduced-prec
 model outputs across different batch sizes and segment durations.
 
 All models take raw audio [batch, samples].
-- TorchScript  → (embeddings, predictions)
-- ONNX         → (embeddings, predictions)
+- TorchScript  → (predictions, embeddings)
+- ONNX         → (predictions, embeddings)
 - LiteRT       → predictions   (combined preprocessing + main)
 - Core ML      → predictions, embeddings (macOS only; fixed input shape)
 """
@@ -72,7 +72,6 @@ def run_torchscript(model, audio_np: np.ndarray, device: str, input_dtype=torch.
     with torch.no_grad():
         audio_t = torch.from_numpy(audio_np).to(device=device, dtype=input_dtype)
         t0 = time.perf_counter()
-        #embeddings, predictions = model(audio_t)
         predictions, embeddings = model(audio_t)
         if device != 'cpu':
             torch.cuda.synchronize()
@@ -200,6 +199,123 @@ def compare_and_print(name: str, ref_out, other_out, duration, batch_size, ref_d
     return 'PASS' if passed else 'FAIL'
 
 
+def run_any(name: str, model, audio_np: np.ndarray, device: str):
+    """Run any loaded model by its name in the ``models`` dict; returns (predictions, seconds)."""
+    if name.startswith('TS'):
+        return run_torchscript(model, audio_np, device)
+    if name.startswith('ONNX'):
+        return run_onnx(model, audio_np)
+    if name == 'LRT_int8_partial':
+        return run_tflite_partial(model[0], model[1], audio_np)
+    if name.startswith('L'):
+        return run_tflite(model, audio_np)
+    return run_coreml(model, audio_np)
+
+
+# ── Speed test ───────────────────────────────────────────────────────────────
+
+def _tflite_runner(model_path: str, input_np: np.ndarray):
+    """Build an interpreter once and return a function that runs it on ``input_np``.
+
+    Uses all CPU cores, like TorchScript and ONNX Runtime do by default.
+    """
+    interpreter = Interpreter(model_path=model_path, num_threads=os.cpu_count())
+    index = interpreter.get_input_details()[0]['index']
+    interpreter.resize_tensor_input(index, list(input_np.shape))
+    interpreter.allocate_tensors()
+
+    def run():
+        interpreter.set_tensor(index, input_np)
+        interpreter.invoke()
+    return run, interpreter
+
+
+def build_speed_runners(models: dict, audio: np.ndarray, device: str) -> dict:
+    """Return ``{model name: zero-argument function}`` that runs each model once on ``audio``.
+
+    Sessions and interpreters are set up here, outside the timed part. A model that
+    cannot take the input shape (fixed-shape TFLite or Core ML) maps to an error string.
+    """
+    runners = {}
+    for name, model in models.items():
+        try:
+            if name.startswith('TS'):
+                audio_t = torch.from_numpy(audio).to(device)
+
+                def run(model=model, audio_t=audio_t):
+                    with torch.no_grad():
+                        model(audio_t)
+                        if device != 'cpu':
+                            torch.cuda.synchronize()
+            elif name.startswith('ONNX'):
+                input_name = model.get_inputs()[0].name
+
+                def run(model=model, input_name=input_name):
+                    model.run(None, {input_name: audio})
+            elif name == 'LRT_int8_partial':
+                run_pre, pre = _tflite_runner(model[0], audio)
+                run_pre()
+                pre_out = pre.get_output_details()[0]['index']
+                spec = np.transpose(pre.get_tensor(pre_out), (0, 3, 1, 2))
+                main_index_run, _ = _tflite_runner(model[1], spec)
+
+                def run(run_pre=run_pre, run_main=main_index_run):
+                    run_pre()
+                    run_main()
+            elif name.startswith('L'):
+                run, _ = _tflite_runner(model, audio)
+            else:  # Core ML
+                if coreml_input_shape(model) != audio.shape:
+                    raise RuntimeError(f'model input is fixed at {coreml_input_shape(model)}')
+
+                def run(model=model):
+                    model.predict({'input': audio})
+            run()  # first call: fails here if the shape is not supported
+            runners[name] = run
+        except Exception as e:
+            runners[name] = str(e).split(chr(10))[0][:70]
+    return runners
+
+
+def speed_test(models: dict, audio: np.ndarray, device: str, n_runs: int, providers: dict):
+    """Time every model on the same input and print a table.
+
+    Each model gets two warm-up runs and ``n_runs`` timed runs; the median is reported,
+    with the audio throughput (seconds of audio per second) and the speed relative to
+    the TorchScript FP32 reference.
+    """
+    batch_size, samples = audio.shape
+    audio_seconds = batch_size * samples / SAMPLE_RATE
+    print(f"Speed test: batch={batch_size}, {samples / SAMPLE_RATE:.1f} s segments, "
+          f"median of {n_runs} runs after 2 warm-up runs")
+    print(f"  {'model':<18}{'runs on':<10}{'ms/batch':>10}{'x real-time':>13}{'vs TS':>8}")
+
+    runners = build_speed_runners(models, audio, device)
+    ts_ms = None
+    for name, run in runners.items():
+        if isinstance(run, str):
+            print(f"  {name:<18}skipped: {run}")
+            continue
+        try:
+            for _ in range(2):
+                run()
+            times = []
+            for _ in range(n_runs):
+                t0 = time.perf_counter()
+                run()
+                times.append(time.perf_counter() - t0)
+        except Exception as e:
+            print(f"  {name:<18}failed: {str(e).split(chr(10))[0][:70]}")
+            continue
+        ms = float(np.median(times)) * 1000.0
+        if name == 'TS':
+            ts_ms = ms
+        rel = f"{ts_ms / ms:.2f}x" if ts_ms else ''
+        print(f"  {name:<18}{providers.get(name, 'CPU'):<10}{ms:>10.1f}"
+              f"{audio_seconds / (ms / 1000.0):>13.0f}{rel:>8}")
+    print()
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _build_parser():
@@ -235,6 +351,12 @@ def _build_parser():
         action='store_true',
         help='Use GPU for TorchScript and ONNX (LiteRT runs on CPU; Core ML picks its own units)',
     )
+    parser.add_argument(
+        '--speed-runs',
+        type=int,
+        default=10,
+        help='Timed runs per model in the speed test, at the first duration (default: 10; 0 skips it)',
+    )
     return parser
 
 
@@ -260,6 +382,7 @@ def main():
     # FP16 / INT8 variants
     torchscript_fp16_path = os.path.join(export_dir, 'torchscript', 'model_fp16.pt')
     onnx_fp16_path = os.path.join(export_dir, 'onnx', 'model_fp16.onnx')
+    onnx_fp16_gpu_path = os.path.join(export_dir, 'onnx', 'model_fp16_gpu.onnx')
     onnx_int8_path = os.path.join(export_dir, 'onnx', 'model_int8.onnx')
     tflite_fp16_path = os.path.join(export_dir, 'tf', 'combined', 'model_fp16.tflite')
     tflite_int8_path = os.path.join(export_dir, 'tf', 'combined', 'model_int8.tflite')
@@ -273,6 +396,11 @@ def main():
     print(f"Device: {device}" + (f"  ({torch.cuda.get_device_name()})" if use_gpu else ""))
     print(f"Audio: {audio_label}")
     print(f"Export dir: {export_dir}\n")
+
+    if use_gpu and hasattr(ort, 'preload_dlls'):
+        # Load the CUDA/cuDNN libraries that ship with PyTorch; without them ONNX Runtime
+        # falls back to the CPU without failing.
+        ort.preload_dlls()
 
     # Check which models exist
     models = {}
@@ -308,6 +436,12 @@ def main():
         models['ONNX_fp16'] = ort.InferenceSession(
             onnx_fp16_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
                                        if use_gpu else ['CPUExecutionProvider']))
+
+    if os.path.exists(onnx_fp16_gpu_path):
+        print(f"  ONNX fp16 GPU: {onnx_fp16_gpu_path}")
+        models['ONNX_fp16_gpu'] = ort.InferenceSession(
+            onnx_fp16_gpu_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
+                                        if use_gpu else ['CPUExecutionProvider']))
 
     if os.path.exists(onnx_int8_path):
         print(f"  ONNX int8:   {onnx_int8_path}")
@@ -350,6 +484,18 @@ def main():
 
     print("done.\n")
 
+    # Where each model really runs (ONNX Runtime falls back to the CPU if CUDA cannot load)
+    providers = {}
+    for name, model in models.items():
+        if name.startswith('TS'):
+            providers[name] = 'CUDA' if use_gpu else 'CPU'
+        elif name.startswith('ONNX'):
+            providers[name] = model.get_providers()[0].replace('ExecutionProvider', '')
+            if use_gpu and name != 'ONNX_int8' and providers[name] != 'CUDA':
+                print(f"⚠️  {name}: CUDA execution provider not available, running on {providers[name]}")
+        elif name.startswith('C'):
+            providers[name] = 'Core ML'
+
     results = []
 
     for duration in durations:
@@ -377,7 +523,7 @@ def main():
                     print(f"⚠️ ERR   ONNX        dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
 
-            # ONNX FP16
+            # ONNX FP16 (mixed precision: fp16 convolutions, fp32 elsewhere)
             if 'ONNX_fp16' in models:
                 try:
                     out, dt = run_onnx(models['ONNX_fp16'], audio)
@@ -385,6 +531,16 @@ def main():
                         'ONNX_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
                 except Exception as e:
                     print(f"⚠️ ERR   ONNX_fp16   dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
+                    results.append('ERROR')
+
+            # ONNX FP16 for GPUs (whole backbone in fp16)
+            if 'ONNX_fp16_gpu' in models:
+                try:
+                    out, dt = run_onnx(models['ONNX_fp16_gpu'], audio)
+                    results.append(compare_and_print(
+                        'ONNX_fp16_gpu', ts_out, out, duration, batch_size, ts_dt, dt))
+                except Exception as e:
+                    print(f"⚠️ ERR   ONNX_fp16_gpu  dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
 
             # ONNX INT8
@@ -458,6 +614,31 @@ def main():
                     results.append('ERROR')
 
             print()
+
+    # Silence: a constant spectrogram is the degenerate case of the per-sample
+    # normalization (0/0); every model must return finite scores that match the reference.
+    duration, batch_size = durations[0], batch_sizes[0]
+    silence = np.zeros((batch_size, int(duration * SAMPLE_RATE)), dtype=np.float32)
+    ts_out, ts_dt = run_torchscript(ts_model, silence, device)
+    print("Silence (all-zero input):")
+    for name, model in models.items():
+        if name == 'TS':
+            continue
+        if name.startswith('C') and coreml_input_shape(model) != silence.shape:
+            continue
+        try:
+            out, dt = run_any(name, model, silence, device)
+            results.append(compare_and_print(
+                name, ts_out, out, duration, batch_size, ts_dt, dt,
+                atol=ATOL_INT8 if 'int8' in name else ATOL))
+        except Exception as e:
+            print(f"⚠️ ERR   {name:<10}  silence  {str(e).split(chr(10))[0][:80]}")
+            results.append('ERROR')
+    print()
+
+    if args.speed_runs > 0:
+        speed_test(models, load_audio(audio_path, durations[0], batch_sizes[0]),
+                   device, args.speed_runs, providers)
 
     n_pass  = results.count('PASS')
     n_fail  = results.count('FAIL')

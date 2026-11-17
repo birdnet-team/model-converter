@@ -10,7 +10,7 @@ from tensorflow import keras
 from tensorflow.python.keras.engine.base_layer import Layer
 
 import torchaudio
-from typing import Optional
+from typing import List, Optional
 
 backbone = 'tf_efficientnetv2_s_in21k' # tf_efficientnet_b0_ns tf_efficientnetv2_s_in21k
 nClasses = 16852 #12295 # 11560 # 1225
@@ -126,7 +126,30 @@ class AttBlock(nn.Module):
         
 
 
+def _gem_fp16_safe(x: torch.Tensor, p: torch.Tensor, dims: List[int]) -> torch.Tensor:
+    """Generalized mean ``mean(x**p)**(1/p)`` over ``dims`` (kept as size 1), inside the fp16 range.
+
+    The direct form underflows in fp16 (x**6.6 for x < 0.1) and can overflow for large
+    x and p. Normalizing by the maximum, ``m * mean((x/m)**p)**(1/p)``, is mathematically
+    identical but keeps the ratio in [2**-14, 1], the normal fp16 range, so the result is
+    carried by the largest terms instead of underflowing as a whole. ``exp(log(.) * p)``
+    is used instead of ``pow`` because accelerators support it better. Clamping the ratio
+    at 2**-14 changes the result by at most 2**-14 of the maximum: nothing measurable for
+    the global pool (p ~ 6.6), about 2e-4 relative for the 1D pools (p ~ 1), which moves
+    the final scores by less than 5e-5.
+    """
+    tiny = 2.0 ** -14  # smallest normal fp16 value
+    m = x
+    for d in dims:  # one axis at a time: amax over several axes has no LiteRT lowering
+        m = torch.max(m, dim=d, keepdim=True)[0]
+    m = m.clamp(min=tiny)
+    r = (x / m).clamp(min=tiny, max=1.0)
+    pooled = torch.exp(torch.log(r) * p).mean(dim=dims, keepdim=True)
+    return m * torch.exp(torch.log(pooled) / p)
+
+
 class GeM(torch.nn.Module):
+    """Global GeM pooling over height and width (fp16-safe formulation)."""
     def __init__(self, p=3.0, input_min=1e-6, input_max=3.5, p_min=1.0, p_max=7.4):
         super(GeM, self).__init__()
         self.p = torch.nn.Parameter(torch.ones(1) * p)
@@ -136,11 +159,9 @@ class GeM(torch.nn.Module):
         self.p_max = p_max
     def forward(self, x):
         p_clamped = torch.clamp(self.p, min=self.p_min, max=self.p_max)
-        x_clamped = x.clamp(min=self.input_min, max=self.input_max)
-        x_pooled = torch.nn.functional.adaptive_avg_pool2d(x_clamped.pow(p_clamped), (1, 1)).pow(1.0 / p_clamped)
-        x_pooled = x_pooled.flatten(start_dim=1)
-        return x_pooled
-        
+        x = x.clamp(min=self.input_min, max=self.input_max)
+        return _gem_fp16_safe(x, p_clamped, [2, 3]).flatten(start_dim=1)
+
 
 class GeM1D_Time(torch.nn.Module):
     """GeM pooling over time dimension (dim=3, width)"""
@@ -156,11 +177,8 @@ class GeM1D_Time(torch.nn.Module):
         # x: [batch, channels, height, width]
         p_clamped = torch.clamp(self.p, min=self.p_min, max=self.p_max)
         x = x.clamp(min=self.input_min, max=self.input_max)
-        
-        # Power mean over width (time axis, dim=3)
-        x_pooled = torch.mean(x.pow(p_clamped), dim=3, keepdim=False).pow(1.0 / p_clamped)
-        
-        return x_pooled  # [batch, channels, height]
+        return _gem_fp16_safe(x, p_clamped, [3]).squeeze(3)  # [batch, channels, height]
+
 
 class GeM1D_Freq(torch.nn.Module):
     """GeM pooling over frequency dimension (dim=2, height)"""
@@ -176,11 +194,7 @@ class GeM1D_Freq(torch.nn.Module):
         # x: [batch, channels, height, width]
         p_clamped = torch.clamp(self.p, min=self.p_min, max=self.p_max)
         x = x.clamp(min=self.input_min, max=self.input_max)
-        
-        # Power mean over height (frequency axis, dim=2)
-        x_pooled = torch.mean(x.pow(p_clamped), dim=2, keepdim=False).pow(1.0 / p_clamped)
-        
-        return x_pooled  # [batch, channels, width]
+        return _gem_fp16_safe(x, p_clamped, [2]).squeeze(2)  # [batch, channels, width]
 
 
 # Approximates tf preprocessing
@@ -200,17 +214,35 @@ class PreprocessingLayerTorch(nn.Module):
 
         super().__init__()
 
-        self.torchSpecTransform = torchaudio.transforms.Spectrogram(
-            n_fft=fftSizeInSamples, 
-            hop_length=fftHopSizeInSamples, 
-            power=2.0
-        )
-        
+        # Power spectrogram without torch.stft / the ONNX STFT op (no CUDA kernel in
+        # ONNX Runtime, scalar on CPU): framing via gather + a two-stage Cooley-Tukey DFT
+        # (N = 32 * 64) built from matmuls with constant matrices. Matches
+        # torchaudio.transforms.Spectrogram(n_fft, hop, power=2, center=True, reflect).
+        self.fftSize = int(fftSizeInSamples)
+        self.fftHop = int(fftHopSizeInSamples)
+        self.nBins = self.fftSize // 2 + 1
+        n1, n2 = 32, 64
+        assert n1 * n2 == self.fftSize
+        self.dftN1 = n1
+        self.dftN2 = n2
+        f1 = np.exp(-2j * np.pi * np.outer(np.arange(n1), np.arange(n1)) / n1)              # [k1, n1]
+        tw = np.exp(-2j * np.pi * np.outer(np.arange(n1), np.arange(n2)) / self.fftSize)    # [k1, n2]
+        f2 = np.exp(-2j * np.pi * np.outer(np.arange(n2), np.arange(n2)) / n2)              # [n2, k2]
+        def _buf(name, a):
+            self.register_buffer(name, torch.from_numpy(a.astype(np.float32)), persistent=False)
+        _buf('window', torch.hann_window(self.fftSize, periodic=True, dtype=torch.float64).numpy())
+        _buf('dft1Re', f1.real); _buf('dft1Im', f1.imag)
+        _buf('twRe', tw.real); _buf('twIm', tw.imag)
+        _buf('dft2Re', f2.real); _buf('dft2Im', f2.imag)
+
+        # Constants are buffers (not plain attributes) so that module.to(device) moves them,
+        # also after TorchScript export.
         melBasisPath = os.path.join(os.path.dirname(os.path.abspath(__file__)), melBasisPath) # Hack
-        self.melBasis = torch.from_numpy(np.load(melBasisPath).T).to(device) # Could be problematic for torchscript export
+        self.register_buffer('melBasis', torch.from_numpy(np.load(melBasisPath).T).to(device), persistent=False)
         self.amin = amin
-        self.ref_value = torch.abs(torch.tensor(ref, device=device)) # Ensure ref_value is on the same device
-        self.ref_value_log10 = torch.log10(torch.clamp(self.ref_value, min=self.amin))
+        ref_value = torch.abs(torch.tensor(ref, device=device))
+        self.register_buffer('ref_value', ref_value, persistent=False)
+        self.register_buffer('ref_value_log10', torch.log10(torch.clamp(ref_value, min=self.amin)), persistent=False)
         self.top_db = top_db
 
         self.nLowFreqsInPixelToCut = int(nLowFreqsInPixelToCutMax/2.0)
@@ -221,17 +253,44 @@ class PreprocessingLayerTorch(nn.Module):
         self.fftHopSizeInSamples = fftHopSizeInSamples
         
         self.epsilon = 1e-10
-        self.ten = torch.tensor(10.0, device=device)
+        self.register_buffer('ten', torch.tensor(10.0, device=device), persistent=False)
         
         # Replace torchvision.transforms.Normalize with manual normalization parameters for onnx export
         self.register_buffer('mean', torch.tensor(specImageMean, dtype=torch.float32).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(specImageStd, dtype=torch.float32).view(1, 3, 1, 1))
 
 
+    def powerSpectrogram(self, sampleVec):
+        """sampleVec [B, L] -> power spectrogram [B, nBins, 1 + L // hop]"""
+        pad = self.fftSize // 2
+        x = torch.nn.functional.pad(sampleVec.unsqueeze(1), [pad, pad], mode='reflect').squeeze(1)
+        nFrames = sampleVec.shape[1] // self.fftHop + 1
+
+        # Framing via gather: frames[b, t, j] = x[b, t * hop + j]
+        idx = (torch.arange(nFrames, device=x.device).unsqueeze(1) * self.fftHop
+               + torch.arange(self.fftSize, device=x.device).unsqueeze(0)).to(torch.int64)
+        frames = x.index_select(1, idx.reshape(-1))                            # plain Gather in ONNX
+        frames = frames.reshape(x.shape[0], nFrames, self.fftSize) * self.window   # [B, T, N]
+        frames = frames.reshape(x.shape[0], nFrames, self.dftN1, self.dftN2)   # n = 64 * n1 + n2
+
+        # Stage 1: DFT over n1 (real input)
+        aRe = torch.matmul(self.dft1Re, frames)                                # [B, T, k1, n2]
+        aIm = torch.matmul(self.dft1Im, frames)
+        # Twiddle factors
+        bRe = aRe * self.twRe - aIm * self.twIm
+        bIm = aRe * self.twIm + aIm * self.twRe
+        # Stage 2: DFT over n2
+        xRe = torch.matmul(bRe, self.dft2Re) - torch.matmul(bIm, self.dft2Im)  # [B, T, k1, k2]
+        xIm = torch.matmul(bRe, self.dft2Im) + torch.matmul(bIm, self.dft2Re)
+        # Bin index k = k1 + 32 * k2
+        power = xRe * xRe + xIm * xIm
+        power = power.transpose(2, 3).reshape(power.shape[0], nFrames, self.fftSize)
+        return power[:, :, :self.nBins].transpose(1, 2)
+
     def forward(self, sampleVec):
         
         ## FFT
-        spec = self.torchSpecTransform(sampleVec)
+        spec = self.powerSpectrogram(sampleVec)
         
         ## Mel spectrogram
         melSpec = torch.tensordot(spec, self.melBasis, dims=([1], [0])).transpose(1, 2)
@@ -252,7 +311,9 @@ class PreprocessingLayerTorch(nn.Module):
         min_vals, max_vals = torch.aminmax(flattened, dim=1, keepdim=True)
         min_vals = min_vals.view(batch_size, 1, 1)
         max_vals = max_vals.view(batch_size, 1, 1)
-        melSpec = (max_vals - melSpec).div_(max_vals - min_vals + self.epsilon)
+        # clamp, not "+ epsilon": the ONNX exporter folds the tiny addend away, and a constant
+        # spectrogram (silence, DC) then gives 0/0 = NaN
+        melSpec = (max_vals - melSpec).div_((max_vals - min_vals).clamp(min=self.epsilon))
         
 
         ## Resize
@@ -577,7 +638,10 @@ class Preprocessing(Layer):
         ref=1.0
         amin=1e-10
 
-        melSpecTf = 10.0 * (tf.math.log(tf.math.maximum(melSpecTf, amin)) / tf.math.log(10.0))
+        # log(max(x, amin)) written as max(log(x), log(amin)): the float16 TFLite model
+        # stores constants as float16, where amin = 1e-10 becomes 0 and silence gives -inf.
+        # log(amin) = -23.03 survives the conversion.
+        melSpecTf = 10.0 * (tf.math.maximum(tf.math.log(melSpecTf), float(np.log(amin))) / tf.math.log(10.0))
         ref_value = tf.math.abs(ref)
         melSpecTf -= 10.0 * tf.math.log(tf.math.maximum(ref_value, amin)) / tf.math.log(10.0)
         
@@ -604,10 +668,13 @@ class Preprocessing(Layer):
         epsilon = 1e-10  # Small value to prevent division by zero
         min_val = tf.reduce_min(melSpecTf, axis=[1, 2], keepdims=True)  # Shape: [batch, 1, 1]
         max_val = tf.reduce_max(melSpecTf, axis=[1, 2], keepdims=True)  # Shape: [batch, 1, 1]
-        melSpecTf = (melSpecTf - min_val) / (max_val - min_val + epsilon)
-
-        # Invert colors
-        melSpecTf = 1.0 - melSpecTf
+        # Normalized and inverted in one step, as in PreprocessingLayerTorch. A constant
+        # spectrogram (silence, DC) has range 0 and must give 0 like the PyTorch model, not
+        # 0/0. The range is replaced by 1 there instead of being clamped to epsilon,
+        # because 1e-10 becomes 0 in the float16 TFLite model.
+        value_range = max_val - min_val
+        value_range = tf.where(value_range > 0.0, value_range, tf.ones_like(value_range))
+        melSpecTf = (max_val - melSpecTf) / value_range
 
         ## Resize
 

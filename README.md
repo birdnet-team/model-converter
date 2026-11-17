@@ -15,7 +15,7 @@
 
 <p align="center">
   Convert BirdNET+ V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, ONNX, and Core ML formats.<br>
-  Supports variable-length audio input, with post-conversion fixes for ONNX and TFLite.
+  ONNX and TorchScript models take any batch size and audio length; the other formats use the export shape.
 </p>
 
 ## Overview
@@ -25,9 +25,9 @@
 | Format | Output (FP32) | FP16 | INT8 |
 |---|---|---|---|
 | TorchScript | `export/<model name>/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
-| ONNX | `export/<model name>/onnx/model.onnx` | `model_fp16.onnx` | `model_int8.onnx` ¹ |
+| ONNX | `export/<model name>/onnx/model.onnx` | `model_fp16.onnx`, `model_fp16_gpu.onnx` ⁴ | `model_int8.onnx` ¹ |
 | TFLite — preprocessing | `export/<model name>/tf/preprocessing/model.tflite` | — | — |
-| TFLite — main (spectrogram in) | `export/<model name>/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` |
+| TFLite — main (spectrogram in) | `export/<model name>/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
 | TFLite — combined (audio in) | `export/<model name>/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
 | TF SavedModel — preprocessing | `export/<model name>/tf/preprocessing/` | — | — |
 | TF SavedModel — main (spectrogram in) | `export/<model name>/tf/main/` ² | — | — |
@@ -35,10 +35,21 @@
 | Core ML (audio in) | `export/<model name>/coreml/model.mlpackage` ³ | `model_fp16.mlpackage` | `model_int8.mlpackage` ¹ |
 
 ¹ Requires `--experimental-mode` (see [Precision Variants](#precision-variants)).  
-² Intermediate model; does not support dynamic inputs.  
-³ Fixed input shape; see [Core ML](#core-ml).
+² Fixed input shape: the model takes the batch size set with `--batch-size` and the length set with `--segment-duration` only, and fails with an error on any other shape. Use the ONNX or TorchScript models for other batch sizes or lengths.  
+³ Fixed input shape; see [Core ML](#core-ml).  
+⁴ `model_fp16.onnx` is the default FP16 model (mixed precision); `model_fp16_gpu.onnx` is faster on GPUs. See [Precision Variants](#precision-variants).
 
-TorchScript and ONNX models accept any batch size; TFLite and Core ML models use the batch size set with `--batch-size`, and Core ML models also take a fixed audio length set with `--segment-duration`. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and plain-text copies of the model license and acceptable use policy (`MODEL_LICENSE.txt`, `ACCEPTABLE_USE.txt`).
+Input shapes each format supports:
+
+| Format | Batch size | Audio length |
+|---|---|---|
+| TorchScript, ONNX | 1 or more | 1025 samples or more (the spectrogram's reflect padding needs more than half an FFT window); outputs match the PyTorch model at every length tested, 2 s to 10 s |
+| TFLite | fixed (`--batch-size`) | accurate at `--segment-duration` only ⁵ |
+| TF SavedModel (main, combined), Core ML | fixed (`--batch-size`) | fixed (`--segment-duration`) |
+
+⁵ The TFLite files are patched to accept other lengths, but this is experimental: at lengths other than the export length the scores deviate from the PyTorch model (max difference 0.05–0.1 at 2 s and 5 s for a 3 s export, against below 0.002 at 3 s). For another length, export again with that `--segment-duration`.
+
+The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and plain-text copies of the model license and acceptable use policy (`MODEL_LICENSE.txt`, `ACCEPTABLE_USE.txt`).
 
 Additional utilities:
 
@@ -176,19 +187,47 @@ All non-experimental precisions are exported by default. Use `-p` to pick specif
 | Precision | Method | Notes |
 |---|---|---|
 | `fp32` | Standard export | Full precision, used as the reference |
-| `fp16` | Weights converted to float16 (Core ML: float16 compute, see [Core ML](#core-ml)) | ~2× smaller, minimal accuracy loss |
+| `fp16` | Weights converted to float16 (Core ML: float16 compute, see [Core ML](#core-ml)) | ~2× smaller; small score differences (table below) |
 | `int8` | Dynamic quantization (ONNX) / dynamic range quantization (TFLite) / weight-only quantization (Core ML) | ~4× smaller, significant accuracy loss |
 
 Variants that are unstable or lose significant accuracy are only exported with `--experimental-mode`; otherwise they are skipped with a message:
 
 | Variant | Why experimental |
 |---|---|
-| ONNX INT8 | Severe numerical differences; changes the top predicted species |
-| TFLite INT8, combined model | Same quantization instability; not recommended for production |
+| ONNX INT8 | Score differences above 0.1; changes the predicted species |
+| TFLite INT8, combined model | Score differences up to 0.8; changes the top predicted species |
+| TFLite INT8, main model | Weights-only quantization; score differences up to 0.1 |
 | TorchScript FP16 | Needs BN folding and a stage-5 FP32 fallback; may produce NaN on untested models |
-| Core ML INT8 | Treated like the other INT8 variants; weight-only, ~0.02 max prediction difference in conversion checks |
+| Core ML INT8 | Treated like the other INT8 variants; weight-only, ~0.02 max prediction difference on the first 3 s of the example recording, up to ~0.06 over all 40 windows |
 
-The INT8 version of the main TFLite model (weights-only quantization) is exported by default.
+No INT8 variant is exported by default. An accurate INT8 model would need quantization-aware training, which this converter does not do.
+
+Largest score difference to the FP32 PyTorch model for the default model with all three heads at the export length of 3 s. "Real audio" is the 40 consecutive 3 s windows of `example/soundscape.wav`; "synthetic" is 18 edge-case inputs (silence, DC, a 1e-7 sine, the soundscape scaled by 1e-4 to 10, white noise from 1e-5 to 30 000, clipped noise, sines, a sweep, soundscape plus a loud tone). The ONNX files return finite scores on all of them.
+
+| Variant | Real audio | Synthetic | Top-1 on real audio |
+|---|---|---|---|
+| ONNX FP32 | below 0.00001 | below 0.00001 | 40/40 |
+| TFLite FP32 ⁶ | below 0.00001 | — | same |
+| ONNX FP16 (`model_fp16.onnx`), CPU / CUDA | 0.003 / 0.006 | 0.016 / 0.010 | 40/40 |
+| ONNX FP16 for GPUs (`model_fp16_gpu.onnx`), CPU / CUDA | 0.003 / 0.008 | 0.016 / 0.015 | 40/40 |
+| TFLite FP16 ⁶ | 0.001 | — | same |
+| TorchScript FP16 ¹ ⁶ | 0.003 | — | same |
+| TFLite INT8, main model ¹ ⁶ | 0.10 | — | same order, shifted scores |
+| ONNX INT8 ¹ ⁶ | 0.11 | — | changed |
+| TFLite INT8, combined model ¹ ⁶ | 0.83 | — | changed |
+
+⁶ Measured with `test_models.py` on the first 3 s of the soundscape and on silence only.
+
+What these numbers do and do not cover:
+
+- With a single head (`--head-weights 1 0 0`) and pruned classes, the two ONNX FP16 files differ from FP32 by up to 0.007 (`model_fp16.onnx`) and 0.010 (`model_fp16_gpu.onnx`) on the real audio, with the same top-1 on all 40 windows. On white noise, where every score is below 0.03, single scores move by up to 0.04.
+- The remaining FP16 error comes from rounding the backbone weights to float16. Inputs the model was not trained on (noise, clipping) are the most sensitive to it.
+- ONNX Runtime on x86 CPUs computes float16 graphs in float32, so a CPU test on x86 only measures the weight rounding. The CUDA columns are real float16 arithmetic. The models were not run on arm64 or on a phone.
+- Core ML models cannot be run on Linux and are not in this table; see [Core ML](#core-ml).
+
+ONNX has two FP16 files of the same size. `model_fp16.onnx` is the default: it runs the backbone convolutions in float16 and everything else in float32 (mixed precision), with the classifier weight matrices stored as float16 and cast to float32 when the model loads. The squeeze-excite gate convolutions stay in float32, because their output can exceed the float16 range on noise-like input. This layout targets CPUs, arm64 in particular, where ONNX Runtime has fast float16 convolutions but slow float16 elementwise ops. `model_fp16_gpu.onnx` runs the whole backbone in float16 and is faster on GPUs (about 28% on an NVIDIA TITAN RTX at batch 32). Both keep the preprocessing in float32 with float32 constants and have the same input and output names as the FP32 model.
+
+The ONNX and TorchScript models compute the spectrogram with matrix products instead of an STFT operator, so its heavy operations run on GPU execution providers (a few index and shape operations stay on the CPU), and the GeM pooling layers use a formulation that stays inside the float16 range.
 
 ### Conversion Pipeline
 
@@ -207,9 +246,11 @@ The separate preprocessing and main TFLite models let you plug in your own spect
 
 `-f coreml` writes Core ML ML Programs (`.mlpackage`) for iOS 16 / macOS 13 and later. Like the TorchScript and ONNX models, they take raw audio and run the preprocessing themselves:
 
-- **Input** `input`: float32 `[batch, samples]`, mono 32 kHz audio. The shape is fixed at `--batch-size` × `--segment-duration` × 32000 (default `[1, 96000]`, 3 s), because the preprocessing computes the spectrogram width with Python integers that the trace bakes in. A fixed shape also lets Core ML run the model on the Neural Engine. Export again with other values for another shape.
+- **Input** `input`: float32 `[batch, samples]`, mono 32 kHz audio. The shape is fixed at `--batch-size` × `--segment-duration` × 32000 (default `[1, 96000]`, 3 s), because the preprocessing computes the spectrogram width with Python integers that the trace bakes in. A fixed shape also lets Core ML use the Neural Engine for the FP16 model. Export again with other values for another shape.
 - **Outputs** `predictions` (per-class sigmoid scores, in `labels.csv` order) and `embeddings`.
 - **Precisions:** `model.mlpackage` computes in float32. `model_fp16.mlpackage` computes in float16, except the preprocessing (the power spectrum exceeds the float16 range) and the GeM pooling layers (the `x**p` and p-th root lose too much precision); both stay float32 and have no large weights. `model_int8.mlpackage` (`--experimental-mode` only) stores weights as per-channel int8 and computes in float32; the preprocessing weights stay float32.
+- **Compute units:** only `model_fp16.mlpackage` can use the Neural Engine, which computes in float16: Core ML places most of its operations there and the float32 parts on the CPU or GPU. The FP32 and INT8 models run on the GPU or CPU only. How close the FP16 model's scores are to the PyTorch model's depends on where it runs: over the 40 windows of the example recording, within about 0.01 on the GPU, 0.02 on the CPU and 0.04 on the Neural Engine, where the top species changed in 1 of 40 windows (a near tie).
+- **Silence:** for all-zero input the FP16 model's embeddings drift from the PyTorch model's on the CPU and Neural Engine (cosine similarity about 0.97; for real audio it is about 0.998, and 0.98 in the worst of the 40 windows on the Neural Engine). With the default head weights and class pruning the scores stay within 0.01. With `--head-weights 1 0 0 --no-class-pruning` one class's score differs by about 0.25, and `test_models.py` reports a failure for the FP16 model on silence. Use the FP32 model if you need exact scores or embeddings for silent segments.
 - The model metadata records the sample rate, segment duration and head weights.
 
 `coremltools` converts on any OS, but Core ML models only run on macOS (or iOS). For example, in Python on a Mac:
@@ -235,18 +276,36 @@ python test_models.py --durations 3.0 5.0 --batch-size 2
 
 ```
 usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
-                      [--durations S [S ...]] [--gpu]
+                      [--durations S [S ...]] [--gpu] [--speed-runs N]
 
 -e, --export-dir    Path to a model's export directory (default: export/<model name>/)
 -a, --audio         Audio file for test input (default: example/soundscape.wav)
 --batch-size        Batch size for test inputs (default: 1)
 --durations         Segment durations in seconds (default: 3.0 5.0)
 --gpu               Use GPU for TorchScript and ONNX inference
+--speed-runs        Timed runs per model in the speed test (default: 10; 0 skips it)
 ```
 
 Core ML models are tested only on macOS, and only for the batch size and duration they were exported with; other combinations are skipped.
 
-> **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations.* INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
+After the comparison, a speed test times every model on the same input (the first duration and the batch size given): two warm-up runs, then the median of `--speed-runs` runs, reported as milliseconds per batch, seconds of audio per second, and speed relative to TorchScript FP32. The table also shows where each model ran; with `--gpu`, an ONNX model that falls back to the CPU because the CUDA libraries cannot be loaded is flagged. The speed test does not affect the pass/fail result, and the numbers only describe the machine it runs on: a desktop CPU says little about a phone.
+
+Measured on one machine that was also running other jobs (x86 CPU, NVIDIA TITAN RTX; default model, all three heads, 3 s segments), in seconds of audio per second; treat the CPU column as approximate:
+
+| Variant | CPU, batch 1 | GPU, batch 32 |
+|---|---|---|
+| TorchScript FP32 | 21 | 734 |
+| TorchScript FP16 ¹ | 1 | 1069 |
+| ONNX FP32 | 25 | 662 |
+| ONNX FP16 (`model_fp16.onnx`) | 24 | 749 |
+| ONNX FP16 for GPUs (`model_fp16_gpu.onnx`) | 24 | 959 |
+| ONNX INT8 ¹ | 6 | — |
+| TFLite FP32 | 48 | — |
+| TFLite FP16 | 45 | — |
+
+¹ `--experimental-mode` only. TorchScript FP16 is a GPU format: on a CPU it is far slower than FP32. ONNX INT8 is much slower than FP32 on an x86 CPU. All models use every CPU core. The ONNX GPU timings include copying the input to the GPU and the output back; the TorchScript timings do not.
+
+> **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations* and on an all-zero input, which is tested as well. INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
 >
 > \* TFLite models match TorchScript almost exactly on 3 s input (the default `--segment-duration`) but drift on other lengths: about 0.04 max difference at 5 s in FP32, and up to 0.12 in FP16 with a single head (`--head-weights 1.0 0.0 0.0`), which fails the check. Use 3 s segments with TFLite FP16.
 

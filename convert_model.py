@@ -1,6 +1,10 @@
 import argparse
+import hashlib
+import json
+import math
 import os
 import re
+import shutil
 import sys
 import numpy as np
 import importlib.util
@@ -27,6 +31,10 @@ COREML_DEPLOYMENT_TARGET = 'iOS16'
 # root, loses too much precision in fp16; max error 0.1 instead of 0.002). Neither has
 # large weights, so the model stays half the fp32 size.
 COREML_FP32_MODULES = ['preprocess', 'global_pool', 'gem_pool_time', 'gem_pool_freq']
+
+# Folders of an export directory that hold models, and the record of their configuration
+MODEL_SUBDIRS = ('torchscript', 'onnx', 'tf', 'coreml')
+EXPORT_CONFIG_FILE = 'export_config.json'
 
 # Class pruning sheet used by default when present in the model directory
 DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
@@ -113,8 +121,8 @@ def _init_config(model_name, output_dir, batch_size, segment_duration, precision
     # Validate and normalize head weights
     if len(headWeights) != 3:
         sys.exit(f'Error: --head-weights must have exactly 3 values, got {len(headWeights)}')
-    if any(w < 0.0 for w in headWeights):
-        sys.exit(f'Error: --head-weights must be non-negative, got {headWeights}')
+    if not all(math.isfinite(w) and w >= 0.0 for w in headWeights):
+        sys.exit(f'Error: --head-weights must be finite and non-negative, got {headWeights}')
     if all(w == 0.0 for w in headWeights):
         sys.exit(f'Error: --head-weights must not all be zero')
 
@@ -124,6 +132,41 @@ def _init_config(model_name, output_dir, batch_size, segment_duration, precision
         print(f'⚠️  Head weights sum to {weight_sum:.4f}, normalizing: '
               f'{headWeights} → {[round(w, 6) for w in normalized]}')
         headWeights = normalized
+
+
+def clear_models_of_other_config(output_dir):
+    """Delete the models of an earlier run that was made with another configuration.
+
+    One export directory holds one model: all formats share the label file, so they must
+    have the same classes, head weights and input shape. ``export_config.json`` records
+    what the models in the directory were exported with. If this run differs, or the
+    directory has models but no record, the model folders are removed before anything is
+    written; with the same configuration, formats exported earlier are kept.
+    """
+    class_ixs = ','.join(str(i) for i in classIxsSelection) if classIxsSelection else 'all'
+    config = {
+        'model': os.path.basename(modelDir.rstrip('/')),
+        'classes': len(classIxsSelection) if classIxsSelection else model_module.nClasses,
+        'class_selection_sha1': hashlib.sha1(class_ixs.encode()).hexdigest(),
+        'head_weights': [round(float(w), 6) for w in headWeights],
+        'segment_duration': float(segmentDuration),
+        'batch_size': int(batchSize),
+    }
+    config_path = os.path.join(output_dir, EXPORT_CONFIG_FILE)
+    previous = None
+    if os.path.isfile(config_path):
+        with open(config_path, encoding='utf-8') as f:
+            previous = json.load(f)
+    if previous != config:
+        for name in MODEL_SUBDIRS:
+            path = os.path.join(output_dir, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+                print(f'Removed {path}: exported with another configuration')
+    os.makedirs(output_dir, exist_ok=True)
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+        f.write('\n')
 
 
 def _is_experimental():
@@ -286,11 +329,20 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
     checkpointFiles = [f for f in os.listdir(modelDir) if f.endswith('.pth.tar')]
     if not checkpointFiles:
         sys.exit(f'Error: No checkpoint files found in {modelDir}')
-    checkpointFiles.sort()  # Sort to get the latest checkpoint (assuming naming convention includes epoch or timestamp)
+    # The latest checkpoint: numbers in the name sort as numbers (Checkpoint35 after Checkpoint9)
+    checkpointFiles.sort(key=lambda name: [int(part) if part.isdigit() else part
+                                           for part in re.split(r'(\d+)', name)])
     checkpointPath = os.path.join(modelDir, checkpointFiles[-1])
-    
+
     checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint['state_dict'], strict=False)
+    # Only preprocessing buffers, which the model definition computes itself, may be absent
+    # from the checkpoint; anything else would export randomly initialised weights
+    loaded = model.load_state_dict(checkpoint['state_dict'], strict=False)
+    missing = [key for key in loaded.missing_keys if not key.startswith('preprocess.')]
+    if missing or loaded.unexpected_keys:
+        sys.exit(f'Error: {checkpointPath} does not fit the model definition: '
+                 f'{len(missing)} missing key(s) {missing[:3]}, '
+                 f'{len(loaded.unexpected_keys)} unexpected key(s) {list(loaded.unexpected_keys)[:3]}')
 
     model.prune_unused_weights()
 
@@ -506,8 +558,7 @@ def createTfMainModel(saveKerasModel=False):
         print(f"  Fixing static ops for dynamic batch...")
         audio_length = int(segmentDuration * model_module.sampleRate)
         n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
-        if n_fixed > 0:
-            verify_fix(tflite_path, model_module.imageHeight, imageWidth)
+        verify_fix(tflite_path, model_module.imageHeight, imageWidth, audio_length)
 
     print("Step 3: Converting and fixing TFLite models...")
 
@@ -524,7 +575,6 @@ def createTfMainModel(saveKerasModel=False):
 
 
     ## Cleanup
-    import shutil
     if os.path.exists(staticDir):
         shutil.rmtree(staticDir)
         print(f"Cleaned up {staticDir}")
@@ -550,7 +600,6 @@ def _resave_saved_model_static(saved_model_dir, input_shape):
     TFLite files are written, the signature is narrowed to the shape that works.
     TFLite files in the directory are kept.
     """
-    import shutil
 
     loaded = tf.saved_model.load(saved_model_dir)
     fn = loaded.signatures['serving_default']
@@ -674,8 +723,7 @@ def combineTfModels():
         print(f'  Fixing static ops for dynamic batch...')
         audio_length = int(segmentDuration * model_module.sampleRate)
         n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
-        if n_fixed > 0:
-            verify_fix(tflite_path, model_module.imageHeight, imageWidth)
+        verify_fix(tflite_path, model_module.imageHeight, imageWidth, audio_length)
 
 
     if 'fp32' in precisions:
@@ -1232,9 +1280,9 @@ def patch_onnx_resize_to_dynamic(model_path, output_path,
             break
     
     if target_resize_node is None:
-        print("WARNING: Could not find Resize node with baked-in sizes. Model may already be dynamic.")
-        onnx.save(model, output_path, save_as_external_data=False)
-        return
+        # Without the patch the model would stretch every input to the export width
+        raise RuntimeError('ONNX export: could not find the Resize node with baked-in sizes; '
+                           'the model cannot be made to accept other input lengths')
     
     # ========================================================================
     # Build the dynamic imageWidth computation subgraph
@@ -1328,11 +1376,8 @@ def patch_onnx_resize_to_dynamic(model_path, output_path,
     
     # Validate
     print("\nValidating patched model...")
-    try:
-        onnx.checker.check_model(model)
-        print("  ✅ Model is valid")
-    except Exception as e:
-        print(f"  ⚠️  Validation warning: {e}")
+    onnx.checker.check_model(model)
+    print("  ✅ Model is valid")
     
     # Save
     onnx.save(model, output_path, save_as_external_data=False)
@@ -1460,10 +1505,7 @@ def createOnnxModel():
         # ── Step 2: shape inference so the converter has full type context ─
         # Do NOT clear value_info before this: the converter needs it to
         # identify fp32/fp16 boundaries and insert Cast nodes correctly.
-        try:
-            fp32_model = onnx.shape_inference.infer_shapes(fp32_model)
-        except Exception as e:
-            print(f'  Warning: shape inference failed ({e}), proceeding without it')
+        fp32_model = onnx.shape_inference.infer_shapes(fp32_model)
 
         # ── Step 3: convert backbone to fp16, keep ALL preprocessing in fp32 ──
         #
@@ -1474,10 +1516,10 @@ def createOnnxModel():
         # lists are additive.  Using only op_block_list is insufficient because
         # it acts on op types globally and misses the mel filterbank MatMul.
         preproc_nodes = _find_preprocessing_node_names(fp32_model)
-        if preproc_nodes:
-            print(f'  ONNX FP16: blocking {len(preproc_nodes)} preprocessing nodes in fp32')
-        else:
-            print('  ONNX FP16: stem Conv not found; using op_block_list only')
+        if not preproc_nodes:
+            raise RuntimeError('ONNX FP16: backbone stem Conv not found, so the preprocessing '
+                               'nodes that must stay float32 cannot be identified')
+        print(f'  ONNX FP16: blocking {len(preproc_nodes)} preprocessing nodes in fp32')
         preproc_set = set(preproc_nodes)
         preproc_arrays = {
             init.name: numpy_helper.to_array(init) for init in fp32_model.graph.initializer
@@ -1526,10 +1568,7 @@ def createOnnxModel():
             # type/shape context for every intermediate tensor.  Without this,
             # missing value_info causes quantize_dynamic to misclassify tensor types.
             del model_for_quant.graph.value_info[:]
-            try:
-                model_for_quant = onnx.shape_inference.infer_shapes(model_for_quant)
-            except Exception as e:
-                print(f'  Warning: shape inference failed ({e}), proceeding without it')
+            model_for_quant = onnx.shape_inference.infer_shapes(model_for_quant)
             # Exclude preprocessing nodes from quantization — same reason as FP16:
             # the mel filterbank is a MatMul whose weights must not be quantized to
             # INT8 (it corrupts the spectrogram and collapses predictions).
@@ -1550,6 +1589,9 @@ def createOnnxModel():
             print(f'ONNX INT8 (dynamic quantization) model exported to {int8_path}')
         else:
             print("  ⚠️  Skipping ONNX INT8 — this is only supported in experimental mode. Use --experimental-mode to enable.")
+
+    if 'fp32' not in precisions:
+        os.remove(onnx_path)  # only needed to derive the other precisions
 
 
 def _register_coreml_torch_ops():
@@ -1709,11 +1751,14 @@ def load_class_ixs_from_excel(path):
 
     selected = pd.to_numeric(df['selected'], errors='coerce')
     ixs = pd.to_numeric(df.loc[selected == 1, 'ix'], errors='coerce')
-    if ixs.isna().any():
-        sys.exit(f'Error: {path} has a non-numeric ix in a selected row')
+    if ixs.isna().any() or (ixs != ixs.round()).any() or (ixs < 0).any():
+        sys.exit(f'Error: {path} has an ix in a selected row that is not a whole number of 0 or more')
     class_ixs = [int(i) for i in ixs.tolist()]
     if not class_ixs:
         sys.exit(f'Error: {path} has no rows with selected == 1')
+    if len(set(class_ixs)) != len(class_ixs):
+        duplicate = next(i for i in class_ixs if class_ixs.count(i) > 1)
+        sys.exit(f'Error: {path} selects ix {duplicate} more than once')
     return class_ixs
 
 
@@ -1843,7 +1888,6 @@ def write_label_files(output_dir, pruned_labels, taxonomy_labels, source_labels_
     the export directory never holds labels for a different set of classes.
     source_labels_path is the model's labels.xlsx, copied unchanged for unpruned exports.
     """
-    import shutil
     os.makedirs(output_dir, exist_ok=True)
     for name, table in (('labels_pruned.xlsx', pruned_labels), ('labels.csv', taxonomy_labels),
                         (SOURCE_LABELS_FILE, source_labels_path)):
@@ -1917,7 +1961,7 @@ def _build_parser():
             '  %(prog)s -f coreml                     # Core ML only\n'
             '  %(prog)s -m my_model                     # use a different model\n'
             '  %(prog)s -o output/                     # custom output directory\n'
-            '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
+            '  %(prog)s --batch-size 4                 # batch size of the fixed-shape models\n'
             '  %(prog)s --list-models                  # show available models\n'
             '  %(prog)s --head-weights 1.0 0.0 0.0     # use only Head 1 for predictions and reduce model size\n'
             '  %(prog)s --class-pruning labels.xlsx    # keep only rows with selected=1\n'
@@ -1954,7 +1998,7 @@ def _build_parser():
         '--batch-size',
         type=int,
         default=1,
-        help='Batch size baked into TFLite and Core ML models (default: %(default)s)',
+        help='Batch size of the fixed-shape models: TFLite, TF SavedModel and Core ML (default: %(default)s)',
     )
     parser.add_argument(
         '-p', '--precisions',
@@ -1972,8 +2016,8 @@ def _build_parser():
         type=float,
         default=3.0,
         help=(
-            'Audio segment duration in seconds used during tracing; also the fixed '
-            'input length of Core ML models (default: %(default)s)'
+            'Audio segment duration in seconds used during tracing; the input length of '
+            'the TFLite, TF SavedModel and Core ML models (default: %(default)s)'
         ),
     )
     parser.add_argument(
@@ -2033,9 +2077,8 @@ def _build_parser():
         action='store_true',
         default=False,
         help=(
-            'Enable experimental features such as full INT8 quantization for ONNX, '
-            'TFLite and Core ML. Without this flag, full INT8 variants are skipped. '
-            '(default: disabled)'
+            'Enable the experimental variants: INT8 for ONNX, TFLite and Core ML, and '
+            'TorchScript FP16. Without this flag they are skipped. (default: disabled)'
         ),
     )
     return parser
@@ -2069,12 +2112,18 @@ def main():
         head_weights=args.head_weights,
     )
 
+    if args.batch_size < 1 or args.segment_duration <= 0:
+        sys.exit('Error: --batch-size must be at least 1 and --segment-duration positive')
+
     formats = set(args.formats)
     class_pruning = args.class_pruning
     default_pruning = os.path.join(modelDir, DEFAULT_CLASS_PRUNING_FILE)
     if class_pruning is None and not args.no_class_pruning and os.path.isfile(default_pruning):
         class_pruning = default_pruning
     classIxsSelection = load_class_ixs_from_excel(class_pruning) if class_pruning else None
+    if classIxsSelection and max(classIxsSelection) >= model_module.nClasses:
+        sys.exit(f'Error: {class_pruning} selects ix {max(classIxsSelection)}, but the model has '
+                 f'outputs 0..{model_module.nClasses - 1}')
     # Build and check every label table before writing, so a failed check writes nothing.
     # labels.csv replaces labels_pruned.xlsx; the latter ships only for sheets without birdnet_id.
     pruned_labels = read_pruned_labels(class_pruning) if classIxsSelection else None
@@ -2094,6 +2143,7 @@ def main():
     # Unpruned exports keep every original output, so the model's own labels.xlsx fits as is
     source_labels = (find_source_labels(modelDir, model_module.nClasses)
                      if not classIxsSelection else None)
+    clear_models_of_other_config(outputDir)
     write_label_files(outputDir, pruned_labels if taxonomy_labels is None else None, taxonomy_labels,
                       source_labels)
     write_terms_files(outputDir)

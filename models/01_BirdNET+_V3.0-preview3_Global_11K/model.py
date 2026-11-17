@@ -473,21 +473,25 @@ class Preprocessing(Layer):
 
         # Get image width based on input length dynamically
         # Use tf.shape for dynamic dimensions
+        # Integer arithmetic, as in PreprocessingLayerTorch: in float32 the width comes out
+        # one too small at some lengths
         num_samples = tf.shape(inputs)[1]
-        duration = tf.cast(num_samples, tf.float32) / self.sampleRate
-        imageWidth = tf.cast(self.imageWidthResizeFactor * duration * self.sampleRate / self.fftHopSizeInSamples, tf.int32)
+        widthNum, widthDen = float(self.imageWidthResizeFactor).as_integer_ratio()
+        imageWidth = (widthNum * num_samples) // (widthDen * self.fftHopSizeInSamples)
 
         sampleVecTf = inputs
 
         # Original number of spectrogram frames (used to reconstruct spec after padding and centering)
         # Use tf.shape for dynamic dimensions, but keep static shape access for fixed dimensions
         num_samples_static = inputs.shape[1]
+        # 1 + L // hop frames, as in PreprocessingLayerTorch (ceil(L / hop) is one frame
+        # short when L is a multiple of the hop size)
         if num_samples_static is not None:
             # Static shape known at graph construction time
-            nFramesOrg = -(-num_samples_static // self.fftHopSizeInSamples)
+            nFramesOrg = num_samples_static // self.fftHopSizeInSamples + 1
         else:
             # Dynamic shape - compute at runtime
-            nFramesOrg = tf.cast(tf.math.ceil(tf.cast(num_samples, tf.float32) / self.fftHopSizeInSamples), tf.int32)
+            nFramesOrg = num_samples // self.fftHopSizeInSamples + 1
         
         pad_amount = 2 * (self.fftSizeInSamples - self.fftHopSizeInSamples)
         # Pad along the sample dimension (axis=1)

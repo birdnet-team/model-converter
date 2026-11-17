@@ -43,11 +43,12 @@ DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Largest allowed difference in probability to the TorchScript reference. Measured on
 # 3000 random inputs: FP32 below 0.00004, FP16 0.005, INT8 0.2.
 ATOL = {'fp32': 1e-4, 'fp16': 0.01, 'int8': 0.3,
-        # Core ML runs on other hardware, and its FP16 model really computes in float16
-        'coreml_fp32': 1e-4, 'coreml_fp16': 0.03}
+        # Core ML FP16 stores float16 weights and computes in float32, like ONNX FP16
+        # (measured on macOS: 0.0025, top class agrees for 99.4%)
+        'coreml_fp32': 1e-4, 'coreml_fp16': 0.01}
 # Smallest allowed share of inputs whose top class matches the reference. Near ties flip
 # with any rounding difference; measured 100% (FP32), 99.6% (FP16), 90% (INT8).
-MIN_TOP1 = {'fp32': 0.99, 'fp16': 0.98, 'int8': 0.8, 'coreml_fp32': 0.99, 'coreml_fp16': 0.97}
+MIN_TOP1 = {'fp32': 0.99, 'fp16': 0.98, 'int8': 0.8, 'coreml_fp32': 0.99, 'coreml_fp16': 0.98}
 
 # (scientific name, latitude, longitude, week, expected to occur) — checked when the labels
 # contain the species. Occurring means a probability above 0.5, not occurring below 0.1.
@@ -269,6 +270,49 @@ def check_labels(export_dir, n_classes):
     return errors
 
 
+def check_checkpoint_labels(export_dir, checkpoint_path):
+    """Check the label files against the exported checkpoint's vocabulary; return errors."""
+    errors = []
+    vocab = (torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+             .get('species_vocab') or {}).get('idx_to_species')
+    if not vocab:
+        return errors
+    names = [str(vocab[i]) for i in range(len(vocab))]
+
+    def first_column(path):
+        with open(path, encoding='utf-8') as f:
+            return [line.rstrip('\n').split('\t')[0] for line in f if line.strip()]
+
+    for path in (os.path.join(export_dir, 'labels.txt'),
+                 os.path.join(os.path.dirname(checkpoint_path), 'model_labels.txt')):
+        if os.path.isfile(path) and first_column(path) != names:
+            errors.append(f'{os.path.relpath(path, export_dir)} does not list the classes of the '
+                          f'checkpoint vocabulary in the same order')
+    return errors
+
+
+def coreml_structure_problem(path):
+    """Return what is wrong with the operations of a Core ML model, or None.
+
+    Core ML's sin returns the wrong sign at some exact angles, so the converter writes
+    sin(x) as cos(x - pi/2); a model that still contains a sin operation would be wrong
+    for several weeks of the year. This check runs on any OS.
+    """
+    try:
+        import coremltools as ct
+    except ImportError:
+        return None
+    program = ct.utils.load_spec(path).mlProgram
+    for function in program.functions.values():
+        for block in function.block_specializations.values():
+            if any(operation.type == 'sin' for operation in block.operations):
+                return 'contains a sin operation, which Core ML evaluates wrongly at some angles'
+            if (path.endswith('model_fp16.mlpackage')
+                    and not any(operation.type == 'constexpr_cast' for operation in block.operations)):
+                return 'has no weights stored as float16'
+    return None
+
+
 def speed(name, run, inputs, runs):
     """Print the median time of ``run`` on one model batch."""
     batch = getattr(run, 'batch', 1)
@@ -292,6 +336,9 @@ def main():
                         help='Model directory whose model.py loads checkpoint/model.pt')
     parser.add_argument('--speed-runs', type=int, default=10,
                         help='Timed runs per model in the speed test (0 to skip it)')
+    parser.add_argument('--expect', nargs='+', default=[], metavar='MODEL',
+                        help='Models that must be found and compared, e.g. ONNX LRT_fp16 CoreML; '
+                             'the test fails if one is missing or skipped')
     args = parser.parse_args()
     export_dir = os.path.abspath(args.export_dir)
 
@@ -308,11 +355,14 @@ def main():
         sys.exit('Error: the TorchScript reference returns NaN or infinite values')
 
     passed = failed = models = 0
+    compared = set()
 
-    def record(ok):
+    def record(ok, model=None):
         nonlocal passed, failed
         passed += bool(ok)
         failed += not ok
+        if model:
+            compared.add(model)
 
     # LiteRT first: TensorFlow is not imported yet, so a model that needs the Flex
     # delegate fails here instead of passing because TensorFlow happened to be loaded.
@@ -325,7 +375,7 @@ def main():
         models += 1
         try:
             runners[name] = load_tflite(path)
-            record(compare(name, runners[name](inputs), reference, precision))
+            record(compare(name, runners[name](inputs), reference, precision), name)
         except Exception as error:
             runners.pop(name, None)
             print(f'❌ FAIL  {name:14s} does not run under LiteRT: {str(error)[:160]}')
@@ -340,7 +390,7 @@ def main():
         try:
             runners[name] = load_onnx(path)
             whole = runners[name](inputs)
-            record(compare(name, whole, reference, precision))
+            record(compare(name, whole, reference, precision), name)
             for batch in (1, 7):
                 part = runners[name](inputs[:batch])
                 same = part.shape == (batch, reference.shape[1]) and np.allclose(part, whole[:batch], atol=1e-5)
@@ -357,10 +407,11 @@ def main():
         try:
             runner = load_saved_model(saved_model_dir)
             if runner is None:
-                print('⚠️  SKIP  SavedModel     TensorFlow is not installed')
+                print('❌ FAIL  SavedModel     TensorFlow is not installed, so the model was not tested')
+                record(False)
             else:
                 runners['SavedModel'] = runner
-                record(compare('SavedModel', runner(inputs), reference, 'fp32'))
+                record(compare('SavedModel', runner(inputs), reference, 'fp32'), 'SavedModel')
         except Exception as error:
             runners.pop('SavedModel', None)
             print(f'❌ FAIL  SavedModel     {str(error)[:160]}')
@@ -371,13 +422,17 @@ def main():
         path = os.path.join(export_dir, 'coreml', file_name)
         if not os.path.isdir(path):
             continue
+        problem = coreml_structure_problem(path)
+        if problem:
+            print(f'❌ FAIL  {name:14s} {problem}')
+            record(False)
         if sys.platform != 'darwin':
             print(f'⚠️  SKIP  {name:14s} Core ML models only run on macOS')
             continue
         models += 1
         try:
             runners[name] = load_coreml(path)
-            record(compare(name, runners[name](inputs), reference, precision))
+            record(compare(name, runners[name](inputs), reference, precision), name)
         except Exception as error:
             runners.pop(name, None)
             print(f'❌ FAIL  {name:14s} {str(error)[:160]}')
@@ -390,7 +445,10 @@ def main():
         models += 1
         try:
             runners['Checkpoint'] = load_checkpoint_runner(checkpoint_path, args.model_dir)
-            record(compare('Checkpoint', runners['Checkpoint'](inputs), reference, 'fp32'))
+            record(compare('Checkpoint', runners['Checkpoint'](inputs), reference, 'fp32'), 'Checkpoint')
+            for error in check_checkpoint_labels(export_dir, checkpoint_path):
+                print(f'❌ FAIL  labels         {error}')
+                record(False)
         except Exception as error:
             runners.pop('Checkpoint', None)
             print(f'❌ FAIL  Checkpoint     {str(error)[:160]}')
@@ -423,6 +481,10 @@ def main():
             except Exception as error:
                 print(f'  {name:14s} failed: {str(error)[:120]}')
 
+    missing = [name for name in args.expect if name not in compared]
+    if missing:
+        print(f'❌ FAIL  expected model(s) not compared: {", ".join(missing)}')
+        failed += 1
     print(f'\n{passed} passed, {failed} failed')
     sys.exit(1 if failed else 0)
 

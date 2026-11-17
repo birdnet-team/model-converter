@@ -266,16 +266,35 @@ python test_models.py --durations 3.0 5.0 --batch-size 2
 
 ```
 usage: test_models.py [-h] [-e EXPORT_DIR] [-a AUDIO] [--batch-size N]
-                      [--durations S [S ...]] [--gpu]
+                      [--durations S [S ...]] [--gpu] [--speed-runs N]
 
 -e, --export-dir    Path to a model's export directory (default: export/<model name>/)
 -a, --audio         Audio file for test input (default: example/soundscape.wav)
 --batch-size        Batch size for test inputs (default: 1)
 --durations         Segment durations in seconds (default: 3.0 5.0)
 --gpu               Use GPU for TorchScript and ONNX inference
+--speed-runs        Timed runs per model in the speed test (default: 10; 0 skips it)
 ```
 
 Core ML models are tested only on macOS, and only for the batch size and duration they were exported with; other combinations are skipped.
+
+After the comparison, a speed test times every model on the same input (the first duration and the batch size given): two warm-up runs, then the median of `--speed-runs` runs, reported as milliseconds per batch, seconds of audio per second, and speed relative to TorchScript FP32. The table also shows where each model ran; with `--gpu`, an ONNX model that falls back to the CPU because the CUDA libraries cannot be loaded is flagged. The speed test does not affect the pass/fail result, and the numbers only describe the machine it runs on: a desktop CPU says little about a phone.
+
+Measured on one machine (x86 CPU, NVIDIA TITAN RTX; default model, all three heads, 3 s segments), in seconds of audio per second:
+
+| Variant | CPU, batch 1 | GPU, batch 32 |
+|---|---|---|
+| TorchScript FP32 | 21 | 739 |
+| TorchScript FP16 ¹ | 1 | 1063 |
+| ONNX FP32 | 14 | 657 |
+| ONNX FP16 (`model_fp16.onnx`) | 15 | 917 |
+| ONNX FP16 mixed (`model_fp16_mixed.onnx`) | 16 | 778 |
+| ONNX INT8 ¹ | 6 | — |
+| TFLite FP32 | 27 | — |
+| TFLite FP16 | 26 | — |
+| TFLite INT8, combined / main ¹ | 25 | — |
+
+¹ `--experimental-mode` only. TorchScript FP16 is a GPU format: on a CPU it is far slower than FP32. On an x86 CPU the INT8 models are not faster than FP32, and ONNX INT8 is much slower.
 
 > **Interpreting results:** Each format must match TorchScript within `atol=0.09` (`0.1` for INT8). ONNX, LiteRT and the FP16 variants should pass at the default durations.* INT8 variants are unstable and not recommended for production. TFLite models only accept the batch size they were exported with.
 >

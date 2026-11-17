@@ -363,7 +363,7 @@ def main():
     # FP16 / INT8 variants
     torchscript_fp16_path = os.path.join(export_dir, 'torchscript', 'model_fp16.pt')
     onnx_fp16_path = os.path.join(export_dir, 'onnx', 'model_fp16.onnx')
-    onnx_mixed_path = os.path.join(export_dir, 'onnx', 'model_fp16_mixed.onnx')
+    onnx_fp16_gpu_path = os.path.join(export_dir, 'onnx', 'model_fp16_gpu.onnx')
     onnx_int8_path = os.path.join(export_dir, 'onnx', 'model_int8.onnx')
     tflite_fp16_path = os.path.join(export_dir, 'tf', 'combined', 'model_fp16.tflite')
     tflite_int8_path = os.path.join(export_dir, 'tf', 'combined', 'model_int8.tflite')
@@ -418,10 +418,10 @@ def main():
             onnx_fp16_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
                                        if use_gpu else ['CPUExecutionProvider']))
 
-    if os.path.exists(onnx_mixed_path):
-        print(f"  ONNX mixed:  {onnx_mixed_path}")
-        models['ONNX_mixed'] = ort.InferenceSession(
-            onnx_mixed_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
+    if os.path.exists(onnx_fp16_gpu_path):
+        print(f"  ONNX fp16 GPU: {onnx_fp16_gpu_path}")
+        models['ONNX_fp16_gpu'] = ort.InferenceSession(
+            onnx_fp16_gpu_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
                                         if use_gpu else ['CPUExecutionProvider']))
 
     if os.path.exists(onnx_int8_path):
@@ -504,7 +504,7 @@ def main():
                     print(f"⚠️ ERR   ONNX        dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
 
-            # ONNX FP16
+            # ONNX FP16 (mixed precision: fp16 convolutions, fp32 elsewhere)
             if 'ONNX_fp16' in models:
                 try:
                     out, dt = run_onnx(models['ONNX_fp16'], audio)
@@ -514,14 +514,14 @@ def main():
                     print(f"⚠️ ERR   ONNX_fp16   dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
 
-            # ONNX mixed precision (fp16 convolutions, fp32 elsewhere)
-            if 'ONNX_mixed' in models:
+            # ONNX FP16 for GPUs (whole backbone in fp16)
+            if 'ONNX_fp16_gpu' in models:
                 try:
-                    out, dt = run_onnx(models['ONNX_mixed'], audio)
+                    out, dt = run_onnx(models['ONNX_fp16_gpu'], audio)
                     results.append(compare_and_print(
-                        'ONNX_mixed', ts_out, out, duration, batch_size, ts_dt, dt))
+                        'ONNX_fp16_gpu', ts_out, out, duration, batch_size, ts_dt, dt))
                 except Exception as e:
-                    print(f"⚠️ ERR   ONNX_mixed  dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
+                    print(f"⚠️ ERR   ONNX_fp16_gpu  dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
                     results.append('ERROR')
 
             # ONNX INT8

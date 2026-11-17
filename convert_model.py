@@ -1335,17 +1335,19 @@ def createOnnxModel():
             node_block_list=preproc_nodes or None,
         )
 
-        fp16_path = dstDir + 'model_fp16.onnx'
+        fp16_path = dstDir + 'model_fp16_gpu.onnx'
         onnx.save(fp16_model, fp16_path, save_as_external_data=False)
-        print(f'ONNX FP16 model exported to {fp16_path}')
+        print(f'ONNX FP16 (GPU, full fp16 backbone) model exported to {fp16_path}')
 
 
-        # Mixed precision variant for CPUs (arm64 in particular): fp16 only inside the
-        # backbone convolutions, everything else fp32.
+        # Default FP16 model (model_fp16.onnx): mixed precision, fp16 only inside the
+        # backbone convolutions, everything else fp32. It is closer to fp32 than the
+        # full-fp16 graph above and faster on CPUs; the full-fp16 graph is only faster
+        # on GPUs.
         mixed_model, n_mixed, n_skipped = _make_mixed_precision_onnx(onnx.load(onnx_path))
-        mixed_path = dstDir + 'model_fp16_mixed.onnx'
+        mixed_path = dstDir + 'model_fp16.onnx'
         onnx.save(mixed_model, mixed_path, save_as_external_data=False)
-        print(f'ONNX mixed-precision model exported to {mixed_path} '
+        print(f'ONNX FP16 (mixed precision) model exported to {mixed_path} '
               f'({n_mixed} fp16 Conv nodes, {n_skipped} kept in fp32)')
 
 

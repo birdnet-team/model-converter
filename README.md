@@ -25,7 +25,7 @@
 | Format | Output (FP32) | FP16 | INT8 |
 |---|---|---|---|
 | TorchScript | `export/<model name>/torchscript/model.pt` | `model_fp16.pt` ¹ | — |
-| ONNX | `export/<model name>/onnx/model.onnx` | `model_fp16.onnx`, `model_fp16_mixed.onnx` ⁴ | `model_int8.onnx` ¹ |
+| ONNX | `export/<model name>/onnx/model.onnx` | `model_fp16.onnx`, `model_fp16_gpu.onnx` ⁴ | `model_int8.onnx` ¹ |
 | TFLite — preprocessing | `export/<model name>/tf/preprocessing/model.tflite` | — | — |
 | TFLite — main (spectrogram in) | `export/<model name>/tf/main/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
 | TFLite — combined (audio in) | `export/<model name>/tf/combined/model.tflite` | `model_fp16.tflite` | `model_int8.tflite` ¹ |
@@ -37,7 +37,7 @@
 ¹ Requires `--experimental-mode` (see [Precision Variants](#precision-variants)).  
 ² Fixed input shape: the signature takes the batch size set with `--batch-size` and the length set with `--segment-duration` only. Use the ONNX or TorchScript models for other batch sizes or lengths.  
 ³ Fixed input shape; see [Core ML](#core-ml).  
-⁴ float16 only inside the convolutions, for CPU inference; see [Precision Variants](#precision-variants).
+⁴ `model_fp16.onnx` is the default FP16 model (mixed precision); `model_fp16_gpu.onnx` trades some accuracy for GPU throughput. See [Precision Variants](#precision-variants).
 
 Input shapes each format supports:
 
@@ -207,17 +207,17 @@ Largest score difference to the FP32 PyTorch model, measured with `test_models.p
 | Variant | Max score difference | Top predictions |
 |---|---|---|
 | ONNX FP32, TFLite FP32 | below 0.00001 | identical |
-| ONNX FP16 mixed (`model_fp16_mixed.onnx`) | 0.001 | identical |
+| ONNX FP16 (`model_fp16.onnx`) | 0.001 | identical |
 | TFLite FP16 | 0.001 | identical |
 | TorchScript FP16 ¹ | 0.003 | identical |
-| ONNX FP16 (`model_fp16.onnx`) | 0.016 | identical |
+| ONNX FP16 for GPUs (`model_fp16_gpu.onnx`) | 0.016 | identical |
 | TFLite INT8, main model ¹ | 0.10 | same order, shifted scores |
 | ONNX INT8 ¹ | 0.11 | changed |
 | TFLite INT8, combined model ¹ | 0.83 | changed |
 
 Core ML models cannot be run on Linux and are not in this table; see [Core ML](#core-ml).
 
-ONNX has two FP16 files. `model_fp16.onnx` runs the whole backbone in float16 and suits GPUs. `model_fp16_mixed.onnx` runs only the backbone convolutions in float16 and everything else in float32; it is meant for CPUs (arm64 in particular), where ONNX Runtime has fast float16 convolutions but slow float16 elementwise ops, and it is the more accurate of the two. Its classifier weights are stored as float16 and cast to float32 when the model loads, so both files have the same size.
+ONNX has two FP16 files of the same size. `model_fp16.onnx` is the default: it runs only the backbone convolutions in float16 and everything else in float32 (mixed precision), with the classifier weights stored as float16 and cast to float32 when the model loads. It is the more accurate of the two and the faster one on CPUs, arm64 in particular, where ONNX Runtime has fast float16 convolutions but slow float16 elementwise ops. `model_fp16_gpu.onnx` runs the whole backbone in float16; it is faster on GPUs (about 18% on an NVIDIA TITAN RTX) at the cost of larger score differences.
 
 The ONNX and TorchScript models compute the spectrogram with plain matrix products instead of an STFT operator, so the preprocessing also runs on GPU execution providers, and the GeM pooling layers use a formulation that stays inside the float16 range.
 
@@ -287,8 +287,8 @@ Measured on one machine (x86 CPU, NVIDIA TITAN RTX; default model, all three hea
 | TorchScript FP32 | 21 | 739 |
 | TorchScript FP16 ¹ | 1 | 1063 |
 | ONNX FP32 | 14 | 657 |
-| ONNX FP16 (`model_fp16.onnx`) | 15 | 917 |
-| ONNX FP16 mixed (`model_fp16_mixed.onnx`) | 16 | 778 |
+| ONNX FP16 (`model_fp16.onnx`) | 16 | 778 |
+| ONNX FP16 for GPUs (`model_fp16_gpu.onnx`) | 15 | 917 |
 | ONNX INT8 ¹ | 6 | — |
 | TFLite FP32 | 27 | — |
 | TFLite FP16 | 26 | — |

@@ -131,9 +131,12 @@ def _gem_fp16_safe(x: torch.Tensor, p: torch.Tensor, dims: List[int]) -> torch.T
 
     The direct form underflows in fp16 (x**6.6 for x < 0.1) and can overflow for large
     x and p. Normalizing by the maximum, ``m * mean((x/m)**p)**(1/p)``, is mathematically
-    identical but keeps every intermediate in [2**-14, 1]. ``exp(log(.) * p)`` is used
-    instead of ``pow`` because accelerators support it better. Terms clamped at 2**-14
-    are below ~1e-28 of the largest term and do not change the result.
+    identical but keeps the ratio in [2**-14, 1], the normal fp16 range, so the result is
+    carried by the largest terms instead of underflowing as a whole. ``exp(log(.) * p)``
+    is used instead of ``pow`` because accelerators support it better. Clamping the ratio
+    at 2**-14 changes the result by at most 2**-14 of the maximum: nothing measurable for
+    the global pool (p ~ 6.6), about 2e-4 relative for the 1D pools (p ~ 1), which moves
+    the final scores by less than 5e-5.
     """
     tiny = 2.0 ** -14  # smallest normal fp16 value
     m = x
@@ -308,7 +311,9 @@ class PreprocessingLayerTorch(nn.Module):
         min_vals, max_vals = torch.aminmax(flattened, dim=1, keepdim=True)
         min_vals = min_vals.view(batch_size, 1, 1)
         max_vals = max_vals.view(batch_size, 1, 1)
-        melSpec = (max_vals - melSpec).div_(max_vals - min_vals + self.epsilon)
+        # clamp, not "+ epsilon": the ONNX exporter folds the tiny addend away, and a constant
+        # spectrogram (silence, DC) then gives 0/0 = NaN
+        melSpec = (max_vals - melSpec).div_((max_vals - min_vals).clamp(min=self.epsilon))
         
 
         ## Resize
@@ -633,7 +638,10 @@ class Preprocessing(Layer):
         ref=1.0
         amin=1e-10
 
-        melSpecTf = 10.0 * (tf.math.log(tf.math.maximum(melSpecTf, amin)) / tf.math.log(10.0))
+        # log(max(x, amin)) written as max(log(x), log(amin)): the float16 TFLite model
+        # stores constants as float16, where amin = 1e-10 becomes 0 and silence gives -inf.
+        # log(amin) = -23.03 survives the conversion.
+        melSpecTf = 10.0 * (tf.math.maximum(tf.math.log(melSpecTf), float(np.log(amin))) / tf.math.log(10.0))
         ref_value = tf.math.abs(ref)
         melSpecTf -= 10.0 * tf.math.log(tf.math.maximum(ref_value, amin)) / tf.math.log(10.0)
         
@@ -660,10 +668,13 @@ class Preprocessing(Layer):
         epsilon = 1e-10  # Small value to prevent division by zero
         min_val = tf.reduce_min(melSpecTf, axis=[1, 2], keepdims=True)  # Shape: [batch, 1, 1]
         max_val = tf.reduce_max(melSpecTf, axis=[1, 2], keepdims=True)  # Shape: [batch, 1, 1]
-        melSpecTf = (melSpecTf - min_val) / (max_val - min_val + epsilon)
-
-        # Invert colors
-        melSpecTf = 1.0 - melSpecTf
+        # Normalized and inverted in one step, as in PreprocessingLayerTorch. A constant
+        # spectrogram (silence, DC) has range 0 and must give 0 like the PyTorch model, not
+        # 0/0. The range is replaced by 1 there instead of being clamped to epsilon,
+        # because 1e-10 becomes 0 in the float16 TFLite model.
+        value_range = max_val - min_val
+        value_range = tf.where(value_range > 0.0, value_range, tf.ones_like(value_range))
+        melSpecTf = (max_val - melSpecTf) / value_range
 
         ## Resize
 

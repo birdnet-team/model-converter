@@ -561,7 +561,25 @@ def _resave_saved_model_static(saved_model_dir, input_shape):
 
         @tf.function(input_signature=[tf.TensorSpec(shape=input_shape, dtype=tf.float32, name=key)])
         def serve(self, x):
-            return fn(**{key: x})
+            # The signature shape is not enforced when the SavedModel is called through
+            # signatures['serving_default']; without this check another batch size or
+            # length returns wrong output instead of failing.
+            # The run-time shape is counted from the data: tf.shape(x) would be folded into
+            # a constant taken from the signature and the check would never fail.
+            rank = len(input_shape)
+            dims = []
+            for axis in range(rank):
+                size = [1] * rank
+                size[axis] = -1
+                line = tf.slice(x, [0] * rank, size)  # all of this axis, index 0 elsewhere
+                finite = tf.math.is_finite(line)
+                dims.append(tf.reduce_sum(tf.cast(finite, tf.int32))
+                            + tf.reduce_sum(tf.cast(tf.logical_not(finite), tf.int32)))
+            check = tf.debugging.assert_equal(
+                tf.stack(dims), tf.constant(input_shape, dtype=tf.int32),
+                message=f'This SavedModel only accepts input shape {tuple(input_shape)}')
+            with tf.control_dependencies([check]):
+                return fn(**{key: tf.identity(x)})
 
     static_model = StaticModel()
     tmpDir = saved_model_dir.rstrip('/') + '_static_tmp/'
@@ -753,6 +771,16 @@ def _find_preprocessing_node_names(fp32_model) -> list:
     """
     graph = fp32_model.graph
 
+    # Nodes added by the Resize and Conv2dSame patches have no name. Name them, so that
+    # the returned list covers the whole preprocessing sub-graph.
+    taken = {node.name for node in graph.node if node.name}
+    for i, node in enumerate(graph.node):
+        if not node.name:
+            node.name = f'_unnamed_{i}'
+            while node.name in taken:
+                node.name += '_'
+            taken.add(node.name)
+
     # output_name → node that produces it
     producer = {}
     for node in graph.node:
@@ -790,8 +818,7 @@ def _find_preprocessing_node_names(fp32_model) -> list:
         visited.add(name)
         if name in producer:
             node = producer[name]
-            if node.name:          # skip unnamed nodes (they stay fp32 by default)
-                preproc_names.append(node.name)
+            preproc_names.append(node.name)
             for inp in node.input:
                 if inp:
                     queue.append(inp)
@@ -799,12 +826,104 @@ def _find_preprocessing_node_names(fp32_model) -> list:
     return preproc_names
 
 
+def _strip_fp16_roundtrips(model) -> int:
+    """Remove ``Cast(fp16)`` → ``Cast(fp32)`` pairs applied to an fp32 tensor.
+
+    Consumers of the pair's output read the original fp32 tensor instead. Returns the
+    number of round trips removed.
+    """
+    graph = model.graph
+    FLOAT, FLOAT16 = onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16
+
+    def _cast_to(node):
+        return next((a.i for a in node.attribute if a.name == 'to'), None)
+
+    producer = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {out.name for out in graph.output}
+
+    replace = {}
+    drop = set()  # node indices (protobuf wrappers are temporary, so not id())
+    for index, node in enumerate(graph.node):
+        if node.op_type != 'Cast' or _cast_to(node) != FLOAT or node.output[0] in graph_outputs:
+            continue
+        down = producer.get(node.input[0])
+        if down is None or down.op_type != 'Cast' or _cast_to(down) != FLOAT16:
+            continue
+        # the source must itself be fp32: produced by a node that is not a cast to fp16
+        src = producer.get(down.input[0])
+        if src is None or (src.op_type == 'Cast' and _cast_to(src) != FLOAT):
+            continue
+        replace[node.output[0]] = down.input[0]
+        drop.add(index)
+
+    for node in graph.node:
+        for i, name in enumerate(node.input):
+            while name in replace:
+                name = replace[name]
+            node.input[i] = name
+
+    used = {name for index, node in enumerate(graph.node) if index not in drop
+            for name in node.input}
+    kept = [node for index, node in enumerate(graph.node)
+            if index not in drop
+            and not (node.op_type == 'Cast' and _cast_to(node) == FLOAT16
+                     and node.output[0] not in used and node.output[0] not in graph_outputs)]
+    del graph.node[:]
+    graph.node.extend(kept)
+    del graph.value_info[:]
+    return len(drop)
+
+
+def _restore_fp32_initializers(model, fp32_arrays) -> int:
+    """Give the preprocessing its original fp32 constants back after an fp16 conversion.
+
+    The fp16 converter stores every initializer as fp16, also those of nodes it keeps in
+    fp32, and feeds them through a ``Cast(fp32)``. For the DFT matrices, the window and
+    the mel filterbank that rounding degrades the spectrogram. ``fp32_arrays`` maps
+    initializer names to their original fp32 values; each fp16 → ``Cast(fp32)`` use of
+    one of them is replaced with the original constant. Returns the number restored.
+    """
+    graph = model.graph
+    FLOAT, FLOAT16 = onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16
+    fp16_inits = {init.name for init in graph.initializer if init.data_type == FLOAT16}
+
+    replace = {}
+    drop = set()
+    restored = {}
+    for index, node in enumerate(graph.node):
+        if node.op_type != 'Cast' or node.input[0] not in fp16_inits or node.input[0] not in fp32_arrays:
+            continue
+        if next((a.i for a in node.attribute if a.name == 'to'), None) != FLOAT:
+            continue
+        name32 = node.input[0] + '__fp32'
+        restored[name32] = numpy_helper.from_array(fp32_arrays[node.input[0]], name32)
+        replace[node.output[0]] = name32
+        drop.add(index)
+
+    kept = [node for index, node in enumerate(graph.node) if index not in drop]
+    for node in kept:
+        for i, name in enumerate(node.input):
+            if name in replace:
+                node.input[i] = replace[name]
+    del graph.node[:]
+    graph.node.extend(kept)
+    graph.initializer.extend(restored.values())
+
+    used = {name for node in graph.node for name in node.input}
+    inits = [init for init in graph.initializer if init.name in used]
+    del graph.initializer[:]
+    graph.initializer.extend(inits)
+    return len(restored)
+
+
 def _make_mixed_precision_onnx(fp32_model):
     """Rewrite an fp32 ONNX graph so that only the backbone convolutions run in fp16.
 
     Every 2D ``Conv`` outside the preprocessing gets fp16 weights and bias, a
     ``Cast(fp16)`` on its input and a ``Cast(fp32)`` on its output. Activations, SE
-    pooling, residual adds, the pooling heads and the classifier stay in fp32.
+    pooling, residual adds, the pooling heads and the classifier stay in fp32. The
+    squeeze-excite gate convs (those feeding only a ``Sigmoid``) also stay in fp32: on
+    noise-like input their output can exceed the fp16 range.
 
     Why: ONNX Runtime on CPU has fast fp16 convolution kernels (arm64) but no vectorized
     fp16 elementwise kernels, so in a fully fp16 graph the SiLU ``Mul``/``Sigmoid`` cost
@@ -812,9 +931,10 @@ def _make_mixed_precision_onnx(fp32_model):
     The large classifier weights are stored as fp16 and cast to fp32 at load, so the file
     is about as small as the fp16 model.
 
-    BatchNorm is already folded into the Conv weights by the exporter, so conv outputs
-    are post-normalization values, far inside the fp16 range. A Conv whose weights do
-    not fit fp16 is left in fp32.
+    BatchNorm is already folded into the Conv weights by the exporter, so the outputs of
+    the fp16 convs are post-normalization values: below about 550 on real audio and
+    below about 16 000 on synthetic noise and clipping, against an fp16 maximum of
+    65 504. A Conv whose weights do not fit fp16 is left in fp32.
 
     Returns:
         (model, number of fp16 Conv nodes, number of Conv nodes left in fp32)
@@ -822,7 +942,21 @@ def _make_mixed_precision_onnx(fp32_model):
     FP16_MAX = 65504.0
     graph = fp32_model.graph
     preproc = set(_find_preprocessing_node_names(fp32_model))
+    if not preproc:
+        raise RuntimeError('mixed-precision ONNX: preprocessing nodes not found; '
+                           'refusing to convert, the spectrogram constants must stay fp32')
     inits = {init.name: init for init in graph.initializer}
+
+    # Tensors consumed only by Sigmoid: outputs of the squeeze-excite gate convs
+    consumers = {}
+    for node in graph.node:
+        for name in node.input:
+            consumers.setdefault(name, []).append(node.op_type)
+    graph_outputs = {out.name for out in graph.output}
+
+    def _is_se_gate(node):
+        ops = consumers.get(node.output[0], [])
+        return bool(ops) and all(op == 'Sigmoid' for op in ops) and node.output[0] not in graph_outputs
 
     new_nodes = []
     new_inits = {}
@@ -838,8 +972,9 @@ def _make_mixed_precision_onnx(fp32_model):
             continue
 
         arrays = [numpy_helper.to_array(w) for w in weights]
-        if any(a.dtype != np.float32 or not np.isfinite(a).all() or np.abs(a).max() > FP16_MAX
-               for a in arrays):
+        if _is_se_gate(node) or any(
+                a.dtype != np.float32 or not np.isfinite(a).all() or np.abs(a).max() > FP16_MAX
+                for a in arrays):
             new_nodes.append(node)
             n_skipped += 1
             continue
@@ -852,13 +987,14 @@ def _make_mixed_precision_onnx(fp32_model):
             node.input[i] = name16
 
         src, dst = node.input[0], node.output[0]
-        node.input[0] = src + '__' + node.name + '_fp16'
-        node.output[0] = dst + '_fp16'
+        tag = f'mixed_fp16_{n_mixed}'  # unique without relying on node names
+        node.input[0] = f'{src}__{tag}'
+        node.output[0] = f'{dst}__{tag}'
         new_nodes.append(helper.make_node('Cast', [src], [node.input[0]],
-                                          to=onnx.TensorProto.FLOAT16, name=node.name + '_to_fp16'))
+                                          to=onnx.TensorProto.FLOAT16, name=tag + '_in'))
         new_nodes.append(node)
         new_nodes.append(helper.make_node('Cast', [node.output[0]], [dst],
-                                          to=onnx.TensorProto.FLOAT, name=node.name + '_to_fp32'))
+                                          to=onnx.TensorProto.FLOAT, name=tag + '_out'))
         n_mixed += 1
 
     # The classifier heads (Gemm, Conv1d attention) hold most of the parameters. They
@@ -870,7 +1006,9 @@ def _make_mixed_precision_onnx(fp32_model):
             continue
         for i, name in enumerate(node.input):
             w = inits.get(name)
-            if w is None or w.data_type != onnx.TensorProto.FLOAT or int(np.prod(w.dims)) < 4096:
+            # weight matrices only: biases are tiny and lose accuracy for nothing
+            if (w is None or w.data_type != onnx.TensorProto.FLOAT or len(w.dims) < 2
+                    or int(np.prod(w.dims)) < 4096):
                 continue
             name16 = name + '_stored_fp16'
             if name16 not in new_inits:
@@ -1298,14 +1436,25 @@ def createOnnxModel():
                 if inp:
                     internal_inputs.add(inp)
 
+        # The graph output keeps its name (same output names as the fp32 model); the
+        # tensor the other nodes consume is renamed instead.
         for out in list(fp32_model.graph.output):
             if out.name in internal_inputs:
-                new_name = out.name + '_out'
-                identity = helper.make_node('Identity', [out.name], [new_name],
+                internal_name = out.name + '_internal'
+                for node in fp32_model.graph.node:
+                    for i, name in enumerate(node.output):
+                        if name == out.name:
+                            node.output[i] = internal_name
+                    for i, name in enumerate(node.input):
+                        if name == out.name:
+                            node.input[i] = internal_name
+                for vi in fp32_model.graph.value_info:
+                    if vi.name == out.name:
+                        vi.name = internal_name
+                identity = helper.make_node('Identity', [internal_name], [out.name],
                                             name=f'_fp16_decoupler_{out.name}')
                 fp32_model.graph.node.append(identity)
-                out.name = new_name
-                print(f'  FP16 prep: decoupled graph output → {new_name}')
+                print(f'  FP16 prep: decoupled graph output {out.name}')
 
         # ── Step 2: shape inference so the converter has full type context ─
         # Do NOT clear value_info before this: the converter needs it to
@@ -1328,12 +1477,27 @@ def createOnnxModel():
             print(f'  ONNX FP16: blocking {len(preproc_nodes)} preprocessing nodes in fp32')
         else:
             print('  ONNX FP16: stem Conv not found; using op_block_list only')
+        preproc_set = set(preproc_nodes)
+        preproc_arrays = {
+            init.name: numpy_helper.to_array(init) for init in fp32_model.graph.initializer
+            if init.data_type == onnx.TensorProto.FLOAT and any(
+                init.name in node.input for node in fp32_model.graph.node
+                if node.name in preproc_set)}
         fp16_model = float16.convert_float_to_float16(
             fp32_model,
             keep_io_types=True,
             op_block_list=['STFT', 'Log', 'Pow', 'Exp', 'GlobalAveragePool', 'ReduceMean', 'AveragePool', 'ConstantOfShape'],
             node_block_list=preproc_nodes or None,
         )
+
+        # The converter separates blocked nodes with fp32 → fp16 → fp32 Cast pairs, which
+        # pushes the spectrogram through fp16 (Inf for loud input, lost precision for
+        # quiet input). Remove them so the preprocessing really runs in fp32.
+        n_stripped = _strip_fp16_roundtrips(fp16_model)
+        n_restored = _restore_fp32_initializers(fp16_model, preproc_arrays)
+        print(f'  ONNX FP16: removed {n_stripped} fp32 → fp16 → fp32 Cast round trips, '
+              f'restored {n_restored} fp32 preprocessing constants')
+        onnx.checker.check_model(fp16_model)
 
         fp16_path = dstDir + 'model_fp16_gpu.onnx'
         onnx.save(fp16_model, fp16_path, save_as_external_data=False)

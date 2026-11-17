@@ -200,11 +200,27 @@ def compare_and_print(name: str, ref_out, other_out, duration, batch_size, ref_d
     return 'PASS' if passed else 'FAIL'
 
 
+def run_any(name: str, model, audio_np: np.ndarray, device: str):
+    """Run any loaded model by its name in the ``models`` dict; returns (predictions, seconds)."""
+    if name.startswith('TS'):
+        return run_torchscript(model, audio_np, device)
+    if name.startswith('ONNX'):
+        return run_onnx(model, audio_np)
+    if name == 'LRT_int8_partial':
+        return run_tflite_partial(model[0], model[1], audio_np)
+    if name.startswith('L'):
+        return run_tflite(model, audio_np)
+    return run_coreml(model, audio_np)
+
+
 # ── Speed test ───────────────────────────────────────────────────────────────
 
 def _tflite_runner(model_path: str, input_np: np.ndarray):
-    """Build an interpreter once and return a function that runs it on ``input_np``."""
-    interpreter = Interpreter(model_path=model_path)
+    """Build an interpreter once and return a function that runs it on ``input_np``.
+
+    Uses all CPU cores, like TorchScript and ONNX Runtime do by default.
+    """
+    interpreter = Interpreter(model_path=model_path, num_threads=os.cpu_count())
     index = interpreter.get_input_details()[0]['index']
     interpreter.resize_tensor_input(index, list(input_np.shape))
     interpreter.allocate_tensors()
@@ -281,13 +297,17 @@ def speed_test(models: dict, audio: np.ndarray, device: str, n_runs: int, provid
         if isinstance(run, str):
             print(f"  {name:<18}skipped: {run}")
             continue
-        for _ in range(2):
-            run()
-        times = []
-        for _ in range(n_runs):
-            t0 = time.perf_counter()
-            run()
-            times.append(time.perf_counter() - t0)
+        try:
+            for _ in range(2):
+                run()
+            times = []
+            for _ in range(n_runs):
+                t0 = time.perf_counter()
+                run()
+                times.append(time.perf_counter() - t0)
+        except Exception as e:
+            print(f"  {name:<18}failed: {str(e).split(chr(10))[0][:70]}")
+            continue
         ms = float(np.median(times)) * 1000.0
         if name == 'TS':
             ts_ms = ms
@@ -595,6 +615,27 @@ def main():
                     results.append('ERROR')
 
             print()
+
+    # Silence: a constant spectrogram is the degenerate case of the per-sample
+    # normalization (0/0); every model must return finite scores that match the reference.
+    duration, batch_size = durations[0], batch_sizes[0]
+    silence = np.zeros((batch_size, int(duration * SAMPLE_RATE)), dtype=np.float32)
+    ts_out, ts_dt = run_torchscript(ts_model, silence, device)
+    print("Silence (all-zero input):")
+    for name, model in models.items():
+        if name == 'TS':
+            continue
+        if name.startswith('C') and coreml_input_shape(model) != silence.shape:
+            continue
+        try:
+            out, dt = run_any(name, model, silence, device)
+            results.append(compare_and_print(
+                name, ts_out, out, duration, batch_size, ts_dt, dt,
+                atol=ATOL_INT8 if 'int8' in name else ATOL))
+        except Exception as e:
+            print(f"⚠️ ERR   {name:<10}  silence  {str(e).split(chr(10))[0][:80]}")
+            results.append('ERROR')
+    print()
 
     if args.speed_runs > 0:
         speed_test(models, load_audio(audio_path, durations[0], batch_sizes[0]),

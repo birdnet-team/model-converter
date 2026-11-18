@@ -9,7 +9,7 @@
   <a href="MODEL_LICENSE.md"><img src="https://img.shields.io/badge/model%20license-Apache--2.0-blue.svg" alt="Model license: Apache 2.0"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.9+-ee4c2c.svg" alt="PyTorch 2.9+"></a>
-  <img src="https://img.shields.io/badge/model-V3.x-green.svg" alt="BirdNET+ V3.x">
+  <img src="https://img.shields.io/badge/model-V3.0-green.svg" alt="BirdNET+ V3.0">
   <img src="https://img.shields.io/badge/species-11%2C709-yellow.svg" alt="11,709 animal species">
 </p>
 

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  Convert BirdNET+ V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, ONNX, and Core ML formats.<br>
+  Convert BirdNET+ V3.x PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, ONNX, and Core ML formats.<br>
   ONNX and TorchScript models take any batch size and audio length; the other formats use the export shape.<br>
   The <a href="#birdnet-geomodel">BirdNET+ Geomodel</a>, which predicts where and when species occur, is converted here too.
 </p>
@@ -32,7 +32,7 @@
 
 ## Overview
 
-`convert_model.py` converts a BirdNET+ V3.0 PyTorch model (multi-head classifier on an EfficientNet backbone) into these formats, written to `export/<model name>/`:
+`convert_model.py` converts a BirdNET+ V3.x PyTorch model (multi-head classifier on an EfficientNet backbone) into these formats, written to `export/<model name>/`:
 
 | Format | Files | Input | FP16 | INT8 ¹ |
 |---|---|---|---|---|
@@ -110,7 +110,7 @@ python convert_model.py --list-models          # list the models in models/
 --head-weights W W W     Weights for the three classifier heads (default: from model definition)
 --class-pruning XLSX     Keep classes whose selected column is 1 (default: labels_pruning.xlsx in the model directory if present)
 --no-class-pruning       Export every class
---taxonomy CSV           BirdNET taxonomy for labels.csv (default: BirdNET_Taxonomy_v0.5-Nov2026.csv)
+--taxonomy CSV           BirdNET taxonomy for labels.csv (default: BirdNET+_Taxonomy_v0.5-Nov2026.csv)
 --label-overrides CSV    Names that replace taxonomy names in labels.csv (default: label_overrides.csv in the model directory if present; none to disable)
 --experimental-mode      Enable experimental variants
 --list-models            List available models and exit

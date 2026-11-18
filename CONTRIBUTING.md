@@ -13,7 +13,7 @@ This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDU
 - Use a clear and descriptive title.
 - Describe the exact steps to reproduce the problem.
 - Include the Python version, OS, and GPU/CUDA version if relevant.
-- Specify which conversion target (TFLite, ONNX, TorchScript) is affected.
+- Specify which conversion target (TFLite, TF SavedModel, ONNX, TorchScript, Core ML) and which model (audio model or geomodel) is affected.
 - Attach error tracebacks and log output.
 
 ### Suggesting Features
@@ -26,7 +26,7 @@ This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDU
 
 1. Fork the repo and create a branch from `main`.
 2. If you've added code, add or update docstrings.
-3. Make sure the code runs without errors.
+3. Convert the models and run `test_models.py` and `test_geomodel.py`; both must pass. The same tests run in CI for every change to the converters.
 4. Keep commits small and focused; write clear commit messages.
 5. Open a pull request with a description of what changed and why.
 
@@ -43,6 +43,7 @@ We welcome contributions that use AI coding assistants (Copilot, Cursor, etc.), 
 ```bash
 git clone https://github.com/birdnet-team/model-converter.git
 cd model-converter
+git lfs install && git lfs pull
 conda create --name model-converter python=3.12
 conda activate model-converter
 pip install -r requirements.txt

@@ -15,8 +15,4 @@ coremltools==9.0
 # For inference tests and --class-pruning
 pandas
 openpyxl
-torchmetrics
-ffmpeg-python
-# For TensorRT
-tensorrt-cu12==10.15.1.29
 

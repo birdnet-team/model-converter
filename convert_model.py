@@ -1,12 +1,15 @@
 import argparse
+import hashlib
+import json
+import math
 import os
 import re
+import shutil
 import sys
 import numpy as np
 import importlib.util
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.python.keras.engine.base_layer import Layer
 import torch
 import litert_torch
 import onnx
@@ -15,7 +18,13 @@ from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 
-DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K
+DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K'
+# Models that still convert but are not tested or maintained; converting one prints the note
+LEGACY_MODELS = {
+    '01_BirdNET+_V3.0-preview3_Global_11K':
+        'legacy preview model: not tested, without the FP16 fixes of V3.0, and its ONNX '
+        'exports return NaN on silent input. Do not publish models converted from it.',
+}
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx', 'coreml']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
@@ -27,6 +36,10 @@ COREML_DEPLOYMENT_TARGET = 'iOS16'
 # root, loses too much precision in fp16; max error 0.1 instead of 0.002). Neither has
 # large weights, so the model stays half the fp32 size.
 COREML_FP32_MODULES = ['preprocess', 'global_pool', 'gem_pool_time', 'gem_pool_freq']
+
+# Folders of an export directory that hold models, and the record of their configuration
+MODEL_SUBDIRS = ('torchscript', 'onnx', 'tf', 'coreml')
+EXPORT_CONFIG_FILE = 'export_config.json'
 
 # Class pruning sheet used by default when present in the model directory
 DEFAULT_CLASS_PRUNING_FILE = 'labels_pruning.xlsx'
@@ -113,8 +126,8 @@ def _init_config(model_name, output_dir, batch_size, segment_duration, precision
     # Validate and normalize head weights
     if len(headWeights) != 3:
         sys.exit(f'Error: --head-weights must have exactly 3 values, got {len(headWeights)}')
-    if any(w < 0.0 for w in headWeights):
-        sys.exit(f'Error: --head-weights must be non-negative, got {headWeights}')
+    if not all(math.isfinite(w) and w >= 0.0 for w in headWeights):
+        sys.exit(f'Error: --head-weights must be finite and non-negative, got {headWeights}')
     if all(w == 0.0 for w in headWeights):
         sys.exit(f'Error: --head-weights must not all be zero')
 
@@ -126,6 +139,41 @@ def _init_config(model_name, output_dir, batch_size, segment_duration, precision
         headWeights = normalized
 
 
+def clear_models_of_other_config(output_dir):
+    """Delete the models of an earlier run that was made with another configuration.
+
+    One export directory holds one model: all formats share the label file, so they must
+    have the same classes, head weights and input shape. ``export_config.json`` records
+    what the models in the directory were exported with. If this run differs, or the
+    directory has models but no record, the model folders are removed before anything is
+    written; with the same configuration, formats exported earlier are kept.
+    """
+    class_ixs = ','.join(str(i) for i in classIxsSelection) if classIxsSelection else 'all'
+    config = {
+        'model': os.path.basename(modelDir.rstrip('/')),
+        'classes': len(classIxsSelection) if classIxsSelection else model_module.nClasses,
+        'class_selection_sha1': hashlib.sha1(class_ixs.encode()).hexdigest(),
+        'head_weights': [round(float(w), 6) for w in headWeights],
+        'segment_duration': float(segmentDuration),
+        'batch_size': int(batchSize),
+    }
+    config_path = os.path.join(output_dir, EXPORT_CONFIG_FILE)
+    previous = None
+    if os.path.isfile(config_path):
+        with open(config_path, encoding='utf-8') as f:
+            previous = json.load(f)
+    if previous != config:
+        for name in MODEL_SUBDIRS:
+            path = os.path.join(output_dir, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+                print(f'Removed {path}: exported with another configuration')
+    os.makedirs(output_dir, exist_ok=True)
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+        f.write('\n')
+
+
 def _is_experimental():
     """Check whether INT8 export is allowed (requires experimental mode)."""
     return experimentalMode
@@ -134,29 +182,14 @@ def _is_experimental():
 def createTfPreprocessingModel():
     """Export the mel-spectrogram preprocessing layer as a TF SavedModel and TFLite.
 
-    Builds a Keras model around the model_module.Preprocessing layer, saves it
-    as a TF SavedModel, then converts to TFLite.  Supports dynamic input length
-    when allow_dynamic_input_length is True (default).
+    Builds a Keras model around the model_module.Preprocessing layer with a dynamic
+    input length, saves it as a TF SavedModel, then converts to TFLite. The TFLite model
+    is fp32 and written for every precision: all main models take its spectrogram.
 
     Output: ``{outputDir}/tf/preprocessing/`` (SavedModel + model.tflite)
     """
-    allow_dynamic_input_length = True
-    batch_size = batchSize
-
-
-    
     preprocessing = model_module.Preprocessing()
-
-    
-    if allow_dynamic_input_length:
-        inputs = keras.Input(shape=(None,), batch_size=batch_size, name='inputs') # dynamic input length
-    else:
-        segmentDurationInSamples = int(segmentDuration * model_module.sampleRate)
-        dtype = np.float32
-        sampleVec = np.random.rand(segmentDurationInSamples).astype(dtype)
-        input_shape = sampleVec.shape
-        inputs = keras.Input(shape=input_shape, batch_size=batch_size, name='inputs') # fixed input length
-
+    inputs = keras.Input(shape=(None,), batch_size=batchSize, name='inputs')  # dynamic input length
     x = preprocessing(inputs)
 
     model = keras.Model(inputs, x)
@@ -173,8 +206,6 @@ def createTfPreprocessingModel():
 
     converter.experimental_new_converter = True
     converter.experimental_enable_resource_variables = True
-
-    #converter.allow_custom_ops = True # ?
 
     tflite_model = converter.convert()
 
@@ -266,7 +297,6 @@ def prune_to_selected_classes(model, class_ixs, n_classes):
 
 def loadPytorchModelAndWeights(includePreprocessing=True):
 
-    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     device = 'cpu'
 
     # Load model
@@ -286,11 +316,20 @@ def loadPytorchModelAndWeights(includePreprocessing=True):
     checkpointFiles = [f for f in os.listdir(modelDir) if f.endswith('.pth.tar')]
     if not checkpointFiles:
         sys.exit(f'Error: No checkpoint files found in {modelDir}')
-    checkpointFiles.sort()  # Sort to get the latest checkpoint (assuming naming convention includes epoch or timestamp)
+    # The latest checkpoint: numbers in the name sort as numbers (Checkpoint35 after Checkpoint9)
+    checkpointFiles.sort(key=lambda name: [int(part) if part.isdigit() else part
+                                           for part in re.split(r'(\d+)', name)])
     checkpointPath = os.path.join(modelDir, checkpointFiles[-1])
-    
+
     checkpoint = torch.load(checkpointPath, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint['state_dict'], strict=False)
+    # Only preprocessing buffers, which the model definition computes itself, may be absent
+    # from the checkpoint; anything else would export randomly initialised weights
+    loaded = model.load_state_dict(checkpoint['state_dict'], strict=False)
+    missing = [key for key in loaded.missing_keys if not key.startswith('preprocess.')]
+    if missing or loaded.unexpected_keys:
+        sys.exit(f'Error: {checkpointPath} does not fit the model definition: '
+                 f'{len(missing)} missing key(s) {missing[:3]}, '
+                 f'{len(loaded.unexpected_keys)} unexpected key(s) {list(loaded.unexpected_keys)[:3]}')
 
     model.prune_unused_weights()
 
@@ -352,16 +391,13 @@ def get_expected_t_dims():
     return sorted(list(t_dims))
 
 
-def createTfMainModel(saveKerasModel=False):
+def createTfMainModel():
     """Convert the classifier to a TF SavedModel and TFLite (spectrogram input).
 
     Steps:
         1. Convert the PyTorch classifier to a static TF SavedModel via litert_torch.
         2. Re-wrap the SavedModel with a dynamic temporal dimension.
         3. Export to TFLite (fp32, and optionally fp16/int8) and fix static ops.
-
-    Args:
-        saveKerasModel: If True, also save a ``.keras`` file.
 
     Output: ``{outputDir}/tf/main/`` (SavedModel + TFLite variants)
     """
@@ -390,23 +426,8 @@ def createTfMainModel(saveKerasModel=False):
 
     print("Step 1: Converting PyTorch model to static TF SavedModel...")
 
-    # # Define a simple wrapper to strip out the embeddings so the resulting
-    # # TFLite model keeps the same single-output signature as before.
-    # class _SingleOutputWrapper(torch.nn.Module):
-    #     def __init__(self, core_model):
-    #         super().__init__()
-    #         self.core_model = core_model
-
-    #     def forward(self, x):
-    #         preds, embs = self.core_model(x)
-    #         return preds
-
-    # single_output_model = _SingleOutputWrapper(model)
-    # single_output_model.eval()
-
-    edge_model = litert_torch.convert(
+    litert_torch.convert(
         model,
-        #single_output_model,
         sample_inputs,
         _saved_model_dir=staticDir,
     )
@@ -505,9 +526,8 @@ def createTfMainModel(saveKerasModel=False):
 
         print(f"  Fixing static ops for dynamic batch...")
         audio_length = int(segmentDuration * model_module.sampleRate)
-        n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
-        if n_fixed > 0:
-            verify_fix(tflite_path, model_module.imageHeight, imageWidth)
+        fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
+        verify_fix(tflite_path, model_module.imageHeight, imageWidth, audio_length)
 
     print("Step 3: Converting and fixing TFLite models...")
 
@@ -524,20 +544,22 @@ def createTfMainModel(saveKerasModel=False):
 
 
     ## Cleanup
-    import shutil
     if os.path.exists(staticDir):
         shutil.rmtree(staticDir)
         print(f"Cleaned up {staticDir}")
 
 
-    ## Save as keras model
-    if saveKerasModel:
-        dstPath = dstDir + 'model.keras'
-        saved_model = tf.keras.layers.TFSMLayer(dstDir, call_endpoint='serving_default')
-        tf.keras.models.save_model(saved_model, dstPath, overwrite=True)
-        print('Exported keras model to', dstPath)
+SAVED_MODEL_FILES = ('saved_model.pb', 'fingerprint.pb', 'variables', 'assets')
 
 
+def _remove_saved_model(saved_model_dir):
+    """Delete the SavedModel in a directory; the TFLite models next to it stay."""
+    for name in SAVED_MODEL_FILES:
+        path = os.path.join(saved_model_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
 
 
 def _resave_saved_model_static(saved_model_dir, input_shape):
@@ -550,7 +572,6 @@ def _resave_saved_model_static(saved_model_dir, input_shape):
     TFLite files are written, the signature is narrowed to the shape that works.
     TFLite files in the directory are kept.
     """
-    import shutil
 
     loaded = tf.saved_model.load(saved_model_dir)
     fn = loaded.signatures['serving_default']
@@ -587,12 +608,7 @@ def _resave_saved_model_static(saved_model_dir, input_shape):
     tmpDir = saved_model_dir.rstrip('/') + '_static_tmp/'
     tf.saved_model.save(static_model, tmpDir, signatures={'serving_default': static_model.serve})
 
-    for name in ('saved_model.pb', 'fingerprint.pb', 'variables', 'assets'):
-        path = os.path.join(saved_model_dir, name)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        elif os.path.exists(path):
-            os.remove(path)
+    _remove_saved_model(saved_model_dir)
     for name in os.listdir(tmpDir):
         shutil.move(os.path.join(tmpDir, name), os.path.join(saved_model_dir, name))
     shutil.rmtree(tmpDir)
@@ -624,7 +640,6 @@ def combineTfModels():
             pre_out = self.pre.signatures['serving_default'](x)['output_0']
             # reshape pre_out to match input shape of main model: (B, 224, W, 3) --> (B, 3, 224, W)
             pre_out = tf.transpose(pre_out, perm=[0, 3, 1, 2])
-            #main_out = self.main.signatures['serving_default'](pre_out)['output_0']
             main_out = self.main.signatures['serving_default'](pre_out)
             #return main_out
             return {
@@ -673,9 +688,8 @@ def combineTfModels():
 
         print(f'  Fixing static ops for dynamic batch...')
         audio_length = int(segmentDuration * model_module.sampleRate)
-        n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
-        if n_fixed > 0:
-            verify_fix(tflite_path, model_module.imageHeight, imageWidth)
+        fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
+        verify_fix(tflite_path, model_module.imageHeight, imageWidth, audio_length)
 
 
     if 'fp32' in precisions:
@@ -689,6 +703,13 @@ def combineTfModels():
             _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
         else:
             print("  ⚠️  Skipping TFLite INT8 (combined) — this is only supported in experimental mode. Use --experimental-mode to enable.")
+
+    if 'fp32' not in precisions:
+        # The SavedModels are fp32; without that precision they only served the conversion
+        for directory in (path_pre, path_main, dstDir):
+            _remove_saved_model(directory)
+        print('Removed the fp32 SavedModels (fp32 not requested)')
+        return
 
     # The SavedModels only run at the export shape; advertise it now that TFLite is done.
     audio_length = int(segmentDuration * model_module.sampleRate)
@@ -1133,7 +1154,6 @@ def createTorchScriptModel():
 
                 def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                     spec = self.preprocess(x)          # float32 audio → float32 spec
-                    #emb, pred = self.backbone(spec.half())  # fp16 entry; fp32 exit
                     #return emb, pred
                     pred, emb = self.backbone(spec.half())  # <-- Flipped order
                     return pred, emb # <-- Flipped order
@@ -1232,9 +1252,9 @@ def patch_onnx_resize_to_dynamic(model_path, output_path,
             break
     
     if target_resize_node is None:
-        print("WARNING: Could not find Resize node with baked-in sizes. Model may already be dynamic.")
-        onnx.save(model, output_path, save_as_external_data=False)
-        return
+        # Without the patch the model would stretch every input to the export width
+        raise RuntimeError('ONNX export: could not find the Resize node with baked-in sizes; '
+                           'the model cannot be made to accept other input lengths')
     
     # ========================================================================
     # Build the dynamic imageWidth computation subgraph
@@ -1328,11 +1348,8 @@ def patch_onnx_resize_to_dynamic(model_path, output_path,
     
     # Validate
     print("\nValidating patched model...")
-    try:
-        onnx.checker.check_model(model)
-        print("  ✅ Model is valid")
-    except Exception as e:
-        print(f"  ⚠️  Validation warning: {e}")
+    onnx.checker.check_model(model)
+    print("  ✅ Model is valid")
     
     # Save
     onnx.save(model, output_path, save_as_external_data=False)
@@ -1460,10 +1477,7 @@ def createOnnxModel():
         # ── Step 2: shape inference so the converter has full type context ─
         # Do NOT clear value_info before this: the converter needs it to
         # identify fp32/fp16 boundaries and insert Cast nodes correctly.
-        try:
-            fp32_model = onnx.shape_inference.infer_shapes(fp32_model)
-        except Exception as e:
-            print(f'  Warning: shape inference failed ({e}), proceeding without it')
+        fp32_model = onnx.shape_inference.infer_shapes(fp32_model)
 
         # ── Step 3: convert backbone to fp16, keep ALL preprocessing in fp32 ──
         #
@@ -1474,10 +1488,10 @@ def createOnnxModel():
         # lists are additive.  Using only op_block_list is insufficient because
         # it acts on op types globally and misses the mel filterbank MatMul.
         preproc_nodes = _find_preprocessing_node_names(fp32_model)
-        if preproc_nodes:
-            print(f'  ONNX FP16: blocking {len(preproc_nodes)} preprocessing nodes in fp32')
-        else:
-            print('  ONNX FP16: stem Conv not found; using op_block_list only')
+        if not preproc_nodes:
+            raise RuntimeError('ONNX FP16: backbone stem Conv not found, so the preprocessing '
+                               'nodes that must stay float32 cannot be identified')
+        print(f'  ONNX FP16: blocking {len(preproc_nodes)} preprocessing nodes in fp32')
         preproc_set = set(preproc_nodes)
         preproc_arrays = {
             init.name: numpy_helper.to_array(init) for init in fp32_model.graph.initializer
@@ -1526,10 +1540,7 @@ def createOnnxModel():
             # type/shape context for every intermediate tensor.  Without this,
             # missing value_info causes quantize_dynamic to misclassify tensor types.
             del model_for_quant.graph.value_info[:]
-            try:
-                model_for_quant = onnx.shape_inference.infer_shapes(model_for_quant)
-            except Exception as e:
-                print(f'  Warning: shape inference failed ({e}), proceeding without it')
+            model_for_quant = onnx.shape_inference.infer_shapes(model_for_quant)
             # Exclude preprocessing nodes from quantization — same reason as FP16:
             # the mel filterbank is a MatMul whose weights must not be quantized to
             # INT8 (it corrupts the spectrogram and collapses predictions).
@@ -1550,6 +1561,9 @@ def createOnnxModel():
             print(f'ONNX INT8 (dynamic quantization) model exported to {int8_path}')
         else:
             print("  ⚠️  Skipping ONNX INT8 — this is only supported in experimental mode. Use --experimental-mode to enable.")
+
+    if 'fp32' not in precisions:
+        os.remove(onnx_path)  # only needed to derive the other precisions
 
 
 def _register_coreml_torch_ops():
@@ -1709,11 +1723,14 @@ def load_class_ixs_from_excel(path):
 
     selected = pd.to_numeric(df['selected'], errors='coerce')
     ixs = pd.to_numeric(df.loc[selected == 1, 'ix'], errors='coerce')
-    if ixs.isna().any():
-        sys.exit(f'Error: {path} has a non-numeric ix in a selected row')
+    if ixs.isna().any() or (ixs != ixs.round()).any() or (ixs < 0).any():
+        sys.exit(f'Error: {path} has an ix in a selected row that is not a whole number of 0 or more')
     class_ixs = [int(i) for i in ixs.tolist()]
     if not class_ixs:
         sys.exit(f'Error: {path} has no rows with selected == 1')
+    if len(set(class_ixs)) != len(class_ixs):
+        duplicate = next(i for i in class_ixs if class_ixs.count(i) > 1)
+        sys.exit(f'Error: {path} selects ix {duplicate} more than once')
     return class_ixs
 
 
@@ -1843,7 +1860,6 @@ def write_label_files(output_dir, pruned_labels, taxonomy_labels, source_labels_
     the export directory never holds labels for a different set of classes.
     source_labels_path is the model's labels.xlsx, copied unchanged for unpruned exports.
     """
-    import shutil
     os.makedirs(output_dir, exist_ok=True)
     for name, table in (('labels_pruned.xlsx', pruned_labels), ('labels.csv', taxonomy_labels),
                         (SOURCE_LABELS_FILE, source_labels_path)):
@@ -1917,7 +1933,7 @@ def _build_parser():
             '  %(prog)s -f coreml                     # Core ML only\n'
             '  %(prog)s -m my_model                     # use a different model\n'
             '  %(prog)s -o output/                     # custom output directory\n'
-            '  %(prog)s --batch-size 4                 # set TFLite batch size\n'
+            '  %(prog)s --batch-size 4                 # batch size of the fixed-shape models\n'
             '  %(prog)s --list-models                  # show available models\n'
             '  %(prog)s --head-weights 1.0 0.0 0.0     # use only Head 1 for predictions and reduce model size\n'
             '  %(prog)s --class-pruning labels.xlsx    # keep only rows with selected=1\n'
@@ -1954,7 +1970,7 @@ def _build_parser():
         '--batch-size',
         type=int,
         default=1,
-        help='Batch size baked into TFLite and Core ML models (default: %(default)s)',
+        help='Batch size of the fixed-shape models: TFLite, TF SavedModel and Core ML (default: %(default)s)',
     )
     parser.add_argument(
         '-p', '--precisions',
@@ -1964,7 +1980,9 @@ def _build_parser():
         metavar='PREC',
         help=(
             'Precision variant(s) to produce. '
-            f'Choose from: {", ".join(ALL_PRECISIONS)} (default: all)'
+            f'Choose from: {", ".join(ALL_PRECISIONS)} (default: all). The TF SavedModels '
+            'are fp32 and only kept with fp32; the fp32 preprocessing TFLite model is '
+            'always written, because the main models of every precision need it'
         ),
     )
     parser.add_argument(
@@ -1972,8 +1990,8 @@ def _build_parser():
         type=float,
         default=3.0,
         help=(
-            'Audio segment duration in seconds used during tracing; also the fixed '
-            'input length of Core ML models (default: %(default)s)'
+            'Audio segment duration in seconds used during tracing; the input length of '
+            'the TFLite, TF SavedModel and Core ML models (default: %(default)s)'
         ),
     )
     parser.add_argument(
@@ -2033,9 +2051,8 @@ def _build_parser():
         action='store_true',
         default=False,
         help=(
-            'Enable experimental features such as full INT8 quantization for ONNX, '
-            'TFLite and Core ML. Without this flag, full INT8 variants are skipped. '
-            '(default: disabled)'
+            'Enable the experimental variants: INT8 for ONNX, TFLite and Core ML, and '
+            'TorchScript FP16. Without this flag they are skipped. (default: disabled)'
         ),
     )
     return parser
@@ -2069,12 +2086,18 @@ def main():
         head_weights=args.head_weights,
     )
 
+    if args.batch_size < 1 or args.segment_duration <= 0:
+        sys.exit('Error: --batch-size must be at least 1 and --segment-duration positive')
+
     formats = set(args.formats)
     class_pruning = args.class_pruning
     default_pruning = os.path.join(modelDir, DEFAULT_CLASS_PRUNING_FILE)
     if class_pruning is None and not args.no_class_pruning and os.path.isfile(default_pruning):
         class_pruning = default_pruning
     classIxsSelection = load_class_ixs_from_excel(class_pruning) if class_pruning else None
+    if classIxsSelection and max(classIxsSelection) >= model_module.nClasses:
+        sys.exit(f'Error: {class_pruning} selects ix {max(classIxsSelection)}, but the model has '
+                 f'outputs 0..{model_module.nClasses - 1}')
     # Build and check every label table before writing, so a failed check writes nothing.
     # labels.csv replaces labels_pruned.xlsx; the latter ships only for sheets without birdnet_id.
     pruned_labels = read_pruned_labels(class_pruning) if classIxsSelection else None
@@ -2094,10 +2117,14 @@ def main():
     # Unpruned exports keep every original output, so the model's own labels.xlsx fits as is
     source_labels = (find_source_labels(modelDir, model_module.nClasses)
                      if not classIxsSelection else None)
+    clear_models_of_other_config(outputDir)
     write_label_files(outputDir, pruned_labels if taxonomy_labels is None else None, taxonomy_labels,
                       source_labels)
     write_terms_files(outputDir)
 
+    legacy_note = LEGACY_MODELS.get(os.path.basename(os.path.normpath(modelDir)))
+    if legacy_note:
+        print(f'⚠️  {os.path.basename(os.path.normpath(modelDir))} is a {legacy_note}\n')
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')
     print(f'Output format(s):   {", ".join(sorted(formats))}')
@@ -2118,7 +2145,7 @@ def main():
 
     if 'tf' in formats or 'tflite' in formats:
         createTfPreprocessingModel()
-        createTfMainModel(saveKerasModel=False)
+        createTfMainModel()
         combineTfModels()
 
     if 'torchscript' in formats:

@@ -1,283 +1,336 @@
 """
-Compare TorchScript (reference) against ONNX, LiteRT, and quantized/reduced-precision
-model outputs across different batch sizes and segment durations.
+Compare every converted audio model in an export directory with the TorchScript model.
 
-All models take raw audio [batch, samples].
-- TorchScript  → (predictions, embeddings)
-- ONNX         → (predictions, embeddings)
-- LiteRT       → predictions   (combined preprocessing + main)
-- Core ML      → predictions, embeddings (macOS only; fixed input shape)
+All models take raw audio ``[batch, samples]`` (mono, 32 kHz, float32) and return
+predictions and embeddings; both are compared:
+
+- TorchScript FP32 is the reference (``torchscript/model.pt``)
+- TorchScript FP16, ONNX: any batch size and length
+- TFLite combined, and TFLite preprocessing chained into TFLite main: fixed batch size;
+  other lengths than the export length run, with a looser tolerance
+- TF SavedModel combined, and preprocessing chained into main: fixed shape
+- Core ML: fixed shape, macOS only
+
+INT8 models are experimental: their differences are reported but do not fail the test,
+as long as the output has the right shape and is finite.
 """
 
 import argparse
+import csv
 import os
 import sys
 import time
-import numpy as np
-import torch
+
 import librosa
+import numpy as np
 import onnxruntime as ort
+import torch
 from ai_edge_litert.interpreter import Interpreter
 
-MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K
+MODEL_NAME = '02_BirdNET+_V3.0_Global_12K'
 
 SAMPLE_RATE = 32000
 DEFAULT_EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'export', MODEL_NAME)
 DEFAULT_AUDIO = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'example', 'soundscape.wav')
 
-# Tolerance for "match" (absolute + relative)
-ATOL = 0.09 # 1e-3
-ATOL_INT8 = 0.1 # 0.025   # INT8 dynamic quantization introduces larger per-output error
-RTOL = 1e-5
+# Largest allowed difference in score to the TorchScript reference. Measured on the example
+# recording: FP32 formats 0.000002, ONNX and TFLite FP16 0.002 (ONNX on CUDA 0.008),
+# Core ML FP16 0.01 to 0.04 depending on the compute unit.
+TOLERANCE = {'fp32': 1e-4, 'fp16': 0.02, 'coreml_fp16': 0.05}
+# TFLite at another length than it was exported with: the resize of the spectrogram is
+# baked in for the export length (FP32 0.05, FP16 0.08 at 5 s for a 3 s export)
+OFF_LENGTH_TOLERANCE = 0.15
+# Embeddings are compared relative to the largest reference embedding value
+EMBEDDING_TOLERANCE = {'fp32': 1e-4, 'fp16': 0.05, 'coreml_fp16': 0.1}
 TOP_K = 3
+DYNAMIC_BATCH = 3  # rows of the extra batch test for models with a dynamic batch size
 
 
-# ── Audio loading ────────────────────────────────────────────────────────────
+# ── Audio ────────────────────────────────────────────────────────────────────
 
-def load_audio(audio_path: str, duration: float, batch_size: int) -> np.ndarray:
-    """Load or generate an audio batch.
+def load_audio(audio_path, duration, batch_size):
+    """Return ``(batch_size, samples)`` float32: consecutive windows of the recording.
 
-    Reads ``duration`` seconds from ``audio_path`` at 32 kHz, zero-pads or
-    truncates to the exact sample count, and tiles to ``batch_size`` rows.
-    Falls back to deterministic random noise if the file is missing.
-
-    Returns:
-        np.ndarray: Float32 array of shape ``(batch_size, samples)``.
+    Every row is a different part of the recording, so a model that mixes up or drops
+    rows is caught. Rows beyond the end of the recording are zero-padded.
     """
     samples = int(duration * SAMPLE_RATE)
-    if audio_path and os.path.isfile(audio_path):
-        audio, sr = librosa.load(audio_path, sr=SAMPLE_RATE, duration=duration,
-                                 offset=0.0, dtype=np.float32)
-        assert sr == SAMPLE_RATE
-    else:
-        if audio_path:
-            print(f"Warning: audio file not found: {audio_path} — using random noise")
-        rng = np.random.default_rng(seed=42)
-        audio = rng.standard_normal(samples).astype(np.float32) * 0.1
-    if len(audio) < samples:
-        audio = np.pad(audio, (0, samples - len(audio)))
-    else:
-        audio = audio[:samples]
-    return np.tile(audio[np.newaxis, :], (batch_size, 1))
+    audio, _ = librosa.load(audio_path, sr=SAMPLE_RATE, duration=duration * batch_size,
+                            offset=0.0, dtype=np.float32)
+    audio = np.pad(audio, (0, max(0, samples * batch_size - len(audio))))
+    return np.ascontiguousarray(audio[:samples * batch_size].reshape(batch_size, samples))
 
 
-# ── Model runners ────────────────────────────────────────────────────────────
+# ── Models ───────────────────────────────────────────────────────────────────
 
-def run_torchscript(model, audio_np: np.ndarray, device: str, input_dtype=torch.float32) -> np.ndarray:
-    """Run inference with a TorchScript model.
+class Candidate:
+    """One converted model (or chain of two) with a uniform ``run(audio)``.
 
-    Returns:
-        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
+    ``run`` returns ``(predictions, embeddings)`` as float32 arrays.
     """
-    with torch.no_grad():
-        audio_t = torch.from_numpy(audio_np).to(device=device, dtype=input_dtype)
-        t0 = time.perf_counter()
-        predictions, embeddings = model(audio_t)
-        if device != 'cpu':
-            torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
-    return predictions.float().cpu().numpy(), dt
+
+    dynamic_batch = False   # accepts any batch size
+    fixed_length = False    # runs only at the length it was exported with
+    off_length = False      # runs at other lengths, less accurately
+
+    def __init__(self, name, precision, paths, where='CPU'):
+        self.name, self.precision, self.paths, self.where = name, precision, paths, where
+
+    @property
+    def experimental(self):
+        return self.precision == 'int8'
+
+    def load(self):
+        pass
+
+    def input_shape(self):
+        """Fixed input shape, or None if the model accepts any."""
+        return None
+
+    def run(self, audio):
+        raise NotImplementedError
 
 
-def run_onnx(session, audio_np: np.ndarray) -> np.ndarray:
-    """Run inference with an ONNX Runtime session.
+class TorchScriptModel(Candidate):
+    dynamic_batch = True
 
-    Returns:
-        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
+    def __init__(self, name, precision, path, device):
+        super().__init__(name, precision, [path], 'CUDA' if device != 'cpu' else 'CPU')
+        self.device = device
+
+    def load(self):
+        self.model = torch.jit.load(self.paths[0], map_location=self.device).eval()
+
+    def run(self, audio):
+        with torch.no_grad():
+            predictions, embeddings = self.model(torch.from_numpy(audio).to(self.device))
+            if self.device != 'cpu':
+                torch.cuda.synchronize()
+        return predictions.float().cpu().numpy(), embeddings.float().cpu().numpy()
+
+
+class OnnxModel(Candidate):
+    dynamic_batch = True
+
+    def __init__(self, name, precision, path, use_gpu):
+        super().__init__(name, precision, [path])
+        self.use_gpu = use_gpu
+
+    def load(self):
+        providers = (['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.use_gpu
+                     else ['CPUExecutionProvider'])
+        self.session = ort.InferenceSession(self.paths[0], providers=providers)
+        self.where = self.session.get_providers()[0].replace('ExecutionProvider', '')
+        if self.use_gpu and self.where != 'CUDA':
+            raise RuntimeError('the CUDA execution provider could not be loaded')
+        self.input_name = self.session.get_inputs()[0].name
+        names = [output.name for output in self.session.get_outputs()]
+        self.outputs = ['predictions', 'embeddings']
+        if set(self.outputs) - set(names):
+            raise RuntimeError(f'outputs are {names}, expected predictions and embeddings')
+
+    def run(self, audio):
+        predictions, embeddings = self.session.run(self.outputs, {self.input_name: audio})
+        return predictions, embeddings
+
+
+class _TfliteRunner:
+    """A TFLite model called through its serving signature, resized on demand."""
+
+    def __init__(self, path):
+        self.interpreter = Interpreter(model_path=path, num_threads=os.cpu_count())
+        signature = self.interpreter.get_signature_list()['serving_default']
+        self.input_name = signature['inputs'][0]
+        self.runner = self.interpreter.get_signature_runner('serving_default')
+
+    def __call__(self, array):
+        return self.runner(**{self.input_name: array})
+
+
+class TfliteModel(Candidate):
+    """TFLite combined model, or TFLite preprocessing chained into a TFLite main model."""
+
+    off_length = True
+
+    def load(self):
+        self.runners = [_TfliteRunner(path) for path in self.paths]
+
+    def run(self, audio):
+        x = audio
+        if len(self.runners) == 2:
+            spectrogram = next(iter(self.runners[0](x).values()))   # [B, H, W, C]
+            x = np.transpose(spectrogram, (0, 3, 1, 2))             # [B, C, H, W]
+        outputs = self.runners[-1](x)
+        return outputs['predictions'], outputs['embeddings']
+
+
+class SavedModel(Candidate):
+    """TF SavedModel combined model, or preprocessing chained into the main model."""
+
+    fixed_length = True
+
+    def load(self):
+        import tensorflow as tf
+        self.tf = tf
+        self.functions = [tf.saved_model.load(path).signatures['serving_default']
+                          for path in self.paths]
+
+    def input_shape(self):
+        if len(self.functions) == 2:
+            return None  # the preprocessing model accepts any shape; main checks its own
+        spec = next(iter(self.functions[0].structured_input_signature[1].values()))
+        return tuple(spec.shape.as_list())
+
+    def _call(self, function, array):
+        name = next(iter(function.structured_input_signature[1]))
+        return function(**{name: self.tf.constant(array)})
+
+    def run(self, audio):
+        x = audio
+        if len(self.functions) == 2:
+            spectrogram = next(iter(self._call(self.functions[0], x).values())).numpy()
+            x = np.transpose(spectrogram, (0, 3, 1, 2))
+            expected = tuple(next(iter(
+                self.functions[1].structured_input_signature[1].values())).shape.as_list())
+            if x.shape != expected:
+                raise FixedShape(f'main model input is fixed at {expected}')
+        outputs = self._call(self.functions[-1], x)
+        return outputs['predictions'].numpy(), outputs['embeddings'].numpy()
+
+
+class CoreMLModel(Candidate):
+    fixed_length = True
+
+    def __init__(self, name, precision, path):
+        super().__init__(name, precision, [path], 'Core ML')
+
+    def load(self):
+        import coremltools as ct
+        self.model = ct.models.MLModel(self.paths[0])  # default compute units, as an app gets them
+
+    def input_shape(self):
+        return tuple(self.model.get_spec().description.input[0].type.multiArrayType.shape)
+
+    def run(self, audio):
+        out = self.model.predict({'input': audio})
+        return np.asarray(out['predictions']), np.asarray(out['embeddings'])
+
+
+class FixedShape(Exception):
+    """The model cannot take this input shape by design."""
+
+
+def find_candidates(export_dir, device, use_gpu):
+    """Return the reference and all other models found in ``export_dir``, SavedModels last.
+
+    TensorFlow adds its operators to the LiteRT runtime once it is imported, which would
+    hide a TFLite model that needs them, so the SavedModels are loaded and run last.
     """
-    input_name = session.get_inputs()[0].name
-    t0 = time.perf_counter()
-    outputs = session.run(None, {input_name: audio_np})
-    dt = time.perf_counter() - t0
-    # outputs[0] = predictions, outputs[1] = embeddings
-    return outputs[0], dt  # Return index 0 for predictions
+    def path(*parts):
+        return os.path.join(export_dir, *parts)
+
+    reference = TorchScriptModel('TS', 'fp32', path('torchscript', 'model.pt'), device)
+    candidates = [TorchScriptModel('TS_fp16', 'fp16', path('torchscript', 'model_fp16.pt'), device)]
+    for name, precision, file_name in (('ONNX', 'fp32', 'model.onnx'),
+                                       ('ONNX_fp16', 'fp16', 'model_fp16.onnx'),
+                                       ('ONNX_fp16_gpu', 'fp16', 'model_fp16_gpu.onnx'),
+                                       ('ONNX_int8', 'int8', 'model_int8.onnx')):
+        candidates.append(OnnxModel(name, precision, path('onnx', file_name),
+                                    use_gpu and precision != 'int8'))
+    preprocessing = path('tf', 'preprocessing', 'model.tflite')
+    for suffix, precision in (('', 'fp32'), ('_fp16', 'fp16'), ('_int8', 'int8')):
+        candidates.append(TfliteModel(f'LiteRT{suffix}', precision,
+                                      [path('tf', 'combined', f'model{suffix}.tflite')]))
+        candidates.append(TfliteModel(f'LRT_main{suffix}', precision,
+                                      [preprocessing, path('tf', 'main', f'model{suffix}.tflite')]))
+    for suffix, precision in (('', 'fp32'), ('_fp16', 'fp16'), ('_int8', 'int8')):
+        candidates.append(CoreMLModel(f'CoreML{suffix}', 'coreml_fp16' if precision == 'fp16' else precision,
+                                      path('coreml', f'model{suffix}.mlpackage')))
+    candidates.append(SavedModel('SavedModel', 'fp32', [path('tf', 'combined')]))
+    candidates.append(SavedModel('SM_main', 'fp32', [path('tf', 'preprocessing'), path('tf', 'main')]))
+    return reference, candidates
 
 
-def run_tflite(model_path: str, audio_np: np.ndarray) -> np.ndarray:
-    """Run inference with a TFLite/LiteRT model.
-
-    Creates a fresh interpreter, resizes input tensors to match ``audio_np``,
-    and invokes the model.
-
-    Returns:
-        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
-    """
-    interpreter = Interpreter(model_path=model_path)
-    input_details = interpreter.get_input_details()
-    interpreter.resize_tensor_input(input_details[0]['index'], list(audio_np.shape))
-    interpreter.allocate_tensors()
-    input_details  = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    interpreter.set_tensor(input_details[0]['index'], audio_np)
-    t0 = time.perf_counter()
-    interpreter.invoke()
-    dt = time.perf_counter() - t0
-    
-    # Grab the tensor explicitly named 'predictions'
-    for detail in output_details:
-        if 'predictions' in detail['name']:
-            return interpreter.get_tensor(detail['index']), dt
-            
-    # Fallback just in case
-    return interpreter.get_tensor(output_details[0]['index']), dt
+def model_exists(candidate):
+    """True if every file of the candidate is in the export directory."""
+    def exists(path):
+        if os.path.isdir(path) and not path.endswith('.mlpackage'):
+            return os.path.isfile(os.path.join(path, 'saved_model.pb'))
+        return os.path.exists(path)
+    return all(exists(path) for path in candidate.paths)
 
 
-def run_tflite_partial(pre_path: str, main_path: str, audio_np: np.ndarray):
-    """Chain preprocessing tflite + main (optimised) tflite."""
-    # Preprocessing
-    pre = Interpreter(model_path=pre_path)
-    pre_in = pre.get_input_details()
-    pre.resize_tensor_input(pre_in[0]['index'], list(audio_np.shape))
-    pre.allocate_tensors()
-    pre_in  = pre.get_input_details()
-    pre_out = pre.get_output_details()
-    pre.set_tensor(pre_in[0]['index'], audio_np)
-    t0 = time.perf_counter()
-    pre.invoke()
-    spec = pre.get_tensor(pre_out[0]['index'])  # [B, H, W, C]
-
-    # Transpose to [B, C, H, W] for main model
-    spec = np.transpose(spec, (0, 3, 1, 2))
-
-    # Main (optimised)
-    main = Interpreter(model_path=main_path)
-    main_in = main.get_input_details()
-    main.resize_tensor_input(main_in[0]['index'], list(spec.shape))
-    main.allocate_tensors()
-    main_in  = main.get_input_details()
-    main_out = main.get_output_details()
-    main.set_tensor(main_in[0]['index'], spec)
-    main.invoke()
-    dt = time.perf_counter() - t0
-    # Grab the tensor explicitly named 'predictions'
-    for detail in main_out:
-        if 'predictions' in detail['name']:
-            return main.get_tensor(detail['index']), dt
-            
-    # Fallback
-    return main.get_tensor(main_out[0]['index']), dt
-
-def run_coreml(model, audio_np: np.ndarray):
-    """Run inference with a Core ML model (macOS only).
-
-    Returns:
-        tuple[np.ndarray, float]: Predictions array and elapsed time in seconds.
-    """
-    t0 = time.perf_counter()
-    out = model.predict({'input': audio_np})
-    dt = time.perf_counter() - t0
-    return np.asarray(out['predictions']), dt
-
-
-def coreml_input_shape(model) -> tuple:
-    """Return the fixed (batch, samples) input shape of a Core ML model."""
-    return tuple(model.get_spec().description.input[0].type.multiArrayType.shape)
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Comparison ───────────────────────────────────────────────────────────────
 
 def fmt_topk(out, k=TOP_K):
-    """Format the top-k class indices and scores from the first batch element."""
+    """Format the top-k class indices and scores of the first batch row."""
     topk = np.argsort(out[0])[-k:][::-1]
     return " ".join(f"{i}({out[0][i]:.3f})" for i in topk)
 
 
-def compare_and_print(name: str, ref_out, other_out, duration, batch_size, ref_dt, other_dt,
-                      atol=ATOL):
-    """Compare other_out against ref_out (TorchScript). Returns 'PASS'/'FAIL'."""
-    max_d = np.max(np.abs(ref_out - other_out))
-    mean_d = np.mean(np.abs(ref_out - other_out))
-    passed = np.allclose(ref_out, other_out, atol=atol, rtol=RTOL)
-    icon = "✅ PASS" if passed else "❌ FAIL"
-    dt_diff = other_dt - ref_dt
-    sign = "+" if dt_diff >= 0 else ""
-    print(f"{icon}  {name:<10}  dur={duration:.1f}s  batch={batch_size}  "
-          f"max_diff={max_d:.6f}  mean_diff={mean_d:.6f}  "
-          f"time: {other_dt:.3f}s ({sign}{dt_diff:.3f}s vs TS)")
-    print(f"  TS:   {fmt_topk(ref_out)}")
-    print(f"  {name + ':':<5} {fmt_topk(other_out)}")
-    return 'PASS' if passed else 'FAIL'
+def compare(candidate, case, reference, output, off_length=False, silence=False):
+    """Print one comparison and return 'PASS', 'FAIL' or 'INFO' (experimental model).
+
+    Embeddings are not checked at another length than the export length, nor for the
+    Core ML FP16 model on silence: computing in float16, its embeddings drift there
+    while the scores stay within tolerance (see the Core ML section of the README).
+    """
+    (ref_pred, ref_emb), (pred, emb) = reference, output
+    pred, emb = np.asarray(pred, dtype=np.float32), np.asarray(emb, dtype=np.float32)
+    problems = []
+    if pred.shape != ref_pred.shape or emb.shape != ref_emb.shape:
+        problems.append(f'output shapes {pred.shape}, {emb.shape} instead of '
+                        f'{ref_pred.shape}, {ref_emb.shape}')
+    elif not (np.isfinite(pred).all() and np.isfinite(emb).all()):
+        problems.append('output is not finite')
+    if problems:
+        print(f"❌ FAIL  {candidate.name:<14} {case}  {problems[0]}")
+        return 'FAIL'
+
+    max_diff = float(np.abs(ref_pred - pred).max())
+    emb_diff = float(np.abs(ref_emb - emb).max() / max(float(np.abs(ref_emb).max()), 1e-12))
+    same_top1 = bool((ref_pred.argmax(1) == pred.argmax(1)).all())
+    note = ''
+    if candidate.experimental:
+        status, icon, limits = 'INFO', 'ℹ️  INFO', 'experimental, not checked'
+    else:
+        tolerance = OFF_LENGTH_TOLERANCE if off_length else TOLERANCE[candidate.precision]
+        skip_embeddings = off_length or (silence and candidate.precision == 'coreml_fp16')
+        emb_tolerance = None if skip_embeddings else EMBEDDING_TOLERANCE[candidate.precision]
+        passed = max_diff <= tolerance and (emb_tolerance is None or emb_diff <= emb_tolerance)
+        if off_length:
+            passed = passed and same_top1
+            note = '  (not the export length)'
+        elif emb_tolerance is None:
+            note = '  (embeddings not checked on silence)'
+        status, icon = ('PASS', '✅ PASS') if passed else ('FAIL', '❌ FAIL')
+        limits = f'tolerance {tolerance:g}' + (f' / {emb_tolerance:g}' if emb_tolerance else '')
+    print(f"{icon}  {candidate.name:<14} {case}  max_diff={max_diff:.6f}  "
+          f"embeddings={emb_diff:.6f}  top-1 {'same' if same_top1 else 'differs'}  "
+          f"({limits}){note}")
+    if status != 'PASS':
+        print(f"         TS:    {fmt_topk(ref_pred)}")
+        print(f"         model: {fmt_topk(pred)}")
+    return status
 
 
-def run_any(name: str, model, audio_np: np.ndarray, device: str):
-    """Run any loaded model by its name in the ``models`` dict; returns (predictions, seconds)."""
-    if name.startswith('TS'):
-        return run_torchscript(model, audio_np, device)
-    if name.startswith('ONNX'):
-        return run_onnx(model, audio_np)
-    if name == 'LRT_int8_partial':
-        return run_tflite_partial(model[0], model[1], audio_np)
-    if name.startswith('L'):
-        return run_tflite(model, audio_np)
-    return run_coreml(model, audio_np)
+def count_labels(export_dir):
+    """Return ``(file name, number of label rows)`` for the export's label file, or None."""
+    path = os.path.join(export_dir, 'labels.csv')
+    if os.path.isfile(path):
+        with open(path, newline='', encoding='utf-8-sig') as f:
+            return 'labels.csv', sum(1 for _ in csv.reader(f)) - 1
+    for name in ('labels_pruned.xlsx', 'labels.xlsx'):
+        path = os.path.join(export_dir, name)
+        if os.path.isfile(path):
+            import pandas as pd
+            return name, len(pd.read_excel(path))
+    return None
 
 
 # ── Speed test ───────────────────────────────────────────────────────────────
 
-def _tflite_runner(model_path: str, input_np: np.ndarray):
-    """Build an interpreter once and return a function that runs it on ``input_np``.
-
-    Uses all CPU cores, like TorchScript and ONNX Runtime do by default.
-    """
-    interpreter = Interpreter(model_path=model_path, num_threads=os.cpu_count())
-    index = interpreter.get_input_details()[0]['index']
-    interpreter.resize_tensor_input(index, list(input_np.shape))
-    interpreter.allocate_tensors()
-
-    def run():
-        interpreter.set_tensor(index, input_np)
-        interpreter.invoke()
-    return run, interpreter
-
-
-def build_speed_runners(models: dict, audio: np.ndarray, device: str) -> dict:
-    """Return ``{model name: zero-argument function}`` that runs each model once on ``audio``.
-
-    Sessions and interpreters are set up here, outside the timed part. A model that
-    cannot take the input shape (fixed-shape TFLite or Core ML) maps to an error string.
-    """
-    runners = {}
-    for name, model in models.items():
-        try:
-            if name.startswith('TS'):
-                audio_t = torch.from_numpy(audio).to(device)
-
-                def run(model=model, audio_t=audio_t):
-                    with torch.no_grad():
-                        model(audio_t)
-                        if device != 'cpu':
-                            torch.cuda.synchronize()
-            elif name.startswith('ONNX'):
-                input_name = model.get_inputs()[0].name
-
-                def run(model=model, input_name=input_name):
-                    model.run(None, {input_name: audio})
-            elif name == 'LRT_int8_partial':
-                run_pre, pre = _tflite_runner(model[0], audio)
-                run_pre()
-                pre_out = pre.get_output_details()[0]['index']
-                spec = np.transpose(pre.get_tensor(pre_out), (0, 3, 1, 2))
-                main_index_run, _ = _tflite_runner(model[1], spec)
-
-                def run(run_pre=run_pre, run_main=main_index_run):
-                    run_pre()
-                    run_main()
-            elif name.startswith('L'):
-                run, _ = _tflite_runner(model, audio)
-            else:  # Core ML
-                if coreml_input_shape(model) != audio.shape:
-                    raise RuntimeError(f'model input is fixed at {coreml_input_shape(model)}')
-
-                def run(model=model):
-                    model.predict({'input': audio})
-            run()  # first call: fails here if the shape is not supported
-            runners[name] = run
-        except Exception as e:
-            runners[name] = str(e).split(chr(10))[0][:70]
-    return runners
-
-
-def speed_test(models: dict, audio: np.ndarray, device: str, n_runs: int, providers: dict):
+def speed_test(models, audio, n_runs):
     """Time every model on the same input and print a table.
 
     Each model gets two warm-up runs and ``n_runs`` timed runs; the median is reported,
@@ -289,29 +342,28 @@ def speed_test(models: dict, audio: np.ndarray, device: str, n_runs: int, provid
     print(f"Speed test: batch={batch_size}, {samples / SAMPLE_RATE:.1f} s segments, "
           f"median of {n_runs} runs after 2 warm-up runs")
     print(f"  {'model':<18}{'runs on':<10}{'ms/batch':>10}{'x real-time':>13}{'vs TS':>8}")
-
-    runners = build_speed_runners(models, audio, device)
     ts_ms = None
-    for name, run in runners.items():
-        if isinstance(run, str):
-            print(f"  {name:<18}skipped: {run}")
+    for model in models:
+        shape = model.input_shape()
+        if shape is not None and shape != audio.shape:
+            print(f"  {model.name:<18}skipped: model input is fixed at {shape}")
             continue
         try:
             for _ in range(2):
-                run()
+                model.run(audio)
             times = []
             for _ in range(n_runs):
                 t0 = time.perf_counter()
-                run()
+                model.run(audio)
                 times.append(time.perf_counter() - t0)
         except Exception as e:
-            print(f"  {name:<18}failed: {str(e).split(chr(10))[0][:70]}")
+            print(f"  {model.name:<18}failed: {str(e).split(chr(10))[0][:70]}")
             continue
         ms = float(np.median(times)) * 1000.0
-        if name == 'TS':
+        if model.name == 'TS':
             ts_ms = ms
         rel = f"{ts_ms / ms:.2f}x" if ts_ms else ''
-        print(f"  {name:<18}{providers.get(name, 'CPU'):<10}{ms:>10.1f}"
+        print(f"  {model.name:<18}{model.where:<10}{ms:>10.1f}"
               f"{audio_seconds / (ms / 1000.0):>13.0f}{rel:>8}")
     print()
 
@@ -319,43 +371,42 @@ def speed_test(models: dict, audio: np.ndarray, device: str, n_runs: int, provid
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _build_parser():
-    """Build the argparse parser for the test CLI."""
     parser = argparse.ArgumentParser(
-        description='Compare converted model outputs against TorchScript reference.',
+        description='Compare converted model outputs against the TorchScript reference.',
     )
     parser.add_argument(
-        '-e', '--export-dir',
-        default=DEFAULT_EXPORT_DIR,
-        help="Path to a model's export directory (default: export/<MODEL_NAME>/)",
+        '-e', '--export-dir', default=DEFAULT_EXPORT_DIR,
+        help="Path to a model's export directory (default: export/<model name>/)",
     )
     parser.add_argument(
-        '-a', '--audio',
-        default=DEFAULT_AUDIO,
-        help='Path to audio file for test input (default: example/soundscape.wav).',
+        '-a', '--audio', default=DEFAULT_AUDIO,
+        help='Audio file for test input (default: example/soundscape.wav)',
     )
     parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=1,
-        help='Batch size for test inputs (default: 1)',
+        '--batch-size', type=int, default=1,
+        help='Batch size the fixed-shape models were exported with (default: 1)',
     )
     parser.add_argument(
-        '--durations',
-        type=float,
-        nargs='+',
-        default=[3.0, 5.0],
-        help='Segment durations in seconds to test (default: 3.0, 5.0)',
+        '--segment-duration', type=float, default=3.0,
+        help='Segment duration in seconds the fixed-shape models were exported with (default: 3.0)',
     )
     parser.add_argument(
-        '--gpu',
-        action='store_true',
-        help='Use GPU for TorchScript and ONNX (LiteRT runs on CPU; Core ML picks its own units)',
+        '--durations', type=float, nargs='+', default=None,
+        help='Segment durations in seconds to test (default: the segment duration and 5.0)',
     )
     parser.add_argument(
-        '--speed-runs',
-        type=int,
-        default=10,
-        help='Timed runs per model in the speed test, at the first duration (default: 10; 0 skips it)',
+        '--expect', nargs='+', default=[], metavar='MODEL',
+        help='Model names that must be found and compared, e.g. ONNX LiteRT_fp16; '
+             'the test fails if one is missing or skipped',
+    )
+    parser.add_argument(
+        '--gpu', action='store_true',
+        help='Use GPU for TorchScript and ONNX (LiteRT and TensorFlow run on the CPU; '
+             'Core ML picks its own units)',
+    )
+    parser.add_argument(
+        '--speed-runs', type=int, default=10,
+        help='Timed runs per model in the speed test, at the segment duration (default: 10; 0 skips it)',
     )
     return parser
 
@@ -363,290 +414,119 @@ def _build_parser():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    """Entry point: parse CLI arguments, load models, run comparisons, and report results."""
-    parser = _build_parser()
-    args = parser.parse_args()
-
+    args = _build_parser().parse_args()
+    durations = args.durations or sorted({args.segment_duration, 5.0})
+    if args.batch_size < 1 or args.speed_runs < 0 or args.segment_duration <= 0:
+        sys.exit('Error: --batch-size must be at least 1, --speed-runs 0 or more and '
+                 '--segment-duration positive')
+    if min(durations) * SAMPLE_RATE < 1025:
+        sys.exit('Error: --durations must be at least 1025 samples (0.033 s) long')
+    if not os.path.isfile(args.audio):
+        sys.exit(f'Error: audio file not found: {args.audio}')
+    if args.gpu and not torch.cuda.is_available():
+        sys.exit('Error: --gpu given but CUDA is not available')
+    device = 'cuda' if args.gpu else 'cpu'
     export_dir = os.path.abspath(args.export_dir)
-    audio_path = args.audio
-    batch_sizes = [args.batch_size]
-    durations = args.durations
-    use_gpu = args.gpu and torch.cuda.is_available()
-    device = 'cuda' if use_gpu else 'cpu'
 
-    # Derive model paths from export directory
-    torchscript_path = os.path.join(export_dir, 'torchscript', 'model.pt')
-    onnx_path = os.path.join(export_dir, 'onnx', 'model.onnx')
-    tflite_path = os.path.join(export_dir, 'tf', 'combined', 'model.tflite')
-
-    # FP16 / INT8 variants
-    torchscript_fp16_path = os.path.join(export_dir, 'torchscript', 'model_fp16.pt')
-    onnx_fp16_path = os.path.join(export_dir, 'onnx', 'model_fp16.onnx')
-    onnx_fp16_gpu_path = os.path.join(export_dir, 'onnx', 'model_fp16_gpu.onnx')
-    onnx_int8_path = os.path.join(export_dir, 'onnx', 'model_int8.onnx')
-    tflite_fp16_path = os.path.join(export_dir, 'tf', 'combined', 'model_fp16.tflite')
-    tflite_int8_path = os.path.join(export_dir, 'tf', 'combined', 'model_int8.tflite')
-
-    # tflite int8 partial (preprocessing float32 + main int8 optimised)
-    tflite_pre_path = os.path.join(export_dir, 'tf', 'preprocessing', 'model.tflite')
-    tflite_main_opt_path = os.path.join(export_dir, 'tf', 'main', 'model_int8.tflite')
-
-    audio_label = audio_path if audio_path else 'random noise (seed=42)'
-    print(f"Model comparison (reference: TorchScript)  |  atol={ATOL} (int8: {ATOL_INT8})  rtol={RTOL}  top-{TOP_K}")
-    print(f"Device: {device}" + (f"  ({torch.cuda.get_device_name()})" if use_gpu else ""))
-    print(f"Audio: {audio_label}")
+    print(f"Model comparison (reference: TorchScript)  |  tolerance: "
+          + ", ".join(f"{k} {v:g}" for k, v in TOLERANCE.items())
+          + f", other length (TFLite) {OFF_LENGTH_TOLERANCE:g}")
+    print(f"Device: {device}" + (f"  ({torch.cuda.get_device_name()})" if args.gpu else ""))
+    print(f"Audio: {args.audio}")
     print(f"Export dir: {export_dir}\n")
 
-    if use_gpu and hasattr(ort, 'preload_dlls'):
+    if args.gpu and hasattr(ort, 'preload_dlls'):
         # Load the CUDA/cuDNN libraries that ship with PyTorch; without them ONNX Runtime
-        # falls back to the CPU without failing.
+        # cannot load its CUDA provider
         ort.preload_dlls()
 
-    # Check which models exist
-    models = {}
+    reference, candidates = find_candidates(export_dir, device, args.gpu)
+    unknown = set(args.expect) - {c.name for c in candidates}
+    if unknown:
+        sys.exit(f'Error: --expect names unknown model(s) {", ".join(sorted(unknown))}; '
+                 f'known: {", ".join(c.name for c in candidates)}')
+    if not model_exists(reference):
+        sys.exit(f'Error: TorchScript reference not found at {reference.paths[0]}')
+    reference.load()
 
-    print("Loading models...", flush=True)
-
-    if not os.path.exists(torchscript_path):
-        sys.exit(f'Error: TorchScript reference not found at {torchscript_path}')
-    print(f"  TorchScript: {torchscript_path}")
-    ts_model = torch.jit.load(torchscript_path, map_location=device)
-    ts_model.eval()
-    models['TS'] = ts_model
-
-    if os.path.exists(torchscript_fp16_path):
-        print(f"  TS fp16:     {torchscript_fp16_path}")
-        ts_fp16_model = torch.jit.load(torchscript_fp16_path, map_location=device)
-        ts_fp16_model.eval()
-        models['TS_fp16'] = ts_fp16_model
-    else:
-        print(f"  TS fp16:     NOT FOUND — skipping")
-
-    if os.path.exists(onnx_path):
-        onnx_providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
-                          if use_gpu else ['CPUExecutionProvider'])
-        print(f"  ONNX:        {onnx_path}  (providers: {onnx_providers[0]})")
-        onnx_session = ort.InferenceSession(onnx_path, providers=onnx_providers)
-        models['ONNX'] = onnx_session
-    else:
-        print(f"  ONNX:        NOT FOUND — skipping")
-
-    if os.path.exists(onnx_fp16_path):
-        print(f"  ONNX fp16:   {onnx_fp16_path}")
-        models['ONNX_fp16'] = ort.InferenceSession(
-            onnx_fp16_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
-                                       if use_gpu else ['CPUExecutionProvider']))
-
-    if os.path.exists(onnx_fp16_gpu_path):
-        print(f"  ONNX fp16 GPU: {onnx_fp16_gpu_path}")
-        models['ONNX_fp16_gpu'] = ort.InferenceSession(
-            onnx_fp16_gpu_path, providers=(['CUDAExecutionProvider', 'CPUExecutionProvider']
-                                        if use_gpu else ['CPUExecutionProvider']))
-
-    if os.path.exists(onnx_int8_path):
-        print(f"  ONNX int8:   {onnx_int8_path}")
-        models['ONNX_int8'] = ort.InferenceSession(
-            onnx_int8_path, providers=['CPUExecutionProvider'])
-
-    if os.path.exists(tflite_path):
-        print(f"  LiteRT:      {tflite_path}")
-        models['LiteRT'] = tflite_path
-    else:
-        print(f"  LiteRT:      NOT FOUND — skipping")
-
-    if os.path.exists(tflite_fp16_path):
-        print(f"  LiteRT fp16: {tflite_fp16_path}")
-        models['LRT_fp16'] = tflite_fp16_path
-
-    if os.path.exists(tflite_int8_path):
-        print(f"  LiteRT int8: {tflite_int8_path}")
-        models['LRT_int8'] = tflite_int8_path
-
-    if os.path.exists(tflite_pre_path) and os.path.exists(tflite_main_opt_path):
-        print(f"  LRT int8 partial: {tflite_pre_path} + {tflite_main_opt_path}")
-        models['LRT_int8_partial'] = (tflite_pre_path, tflite_main_opt_path)
-    else:
-        print(f"  LRT int8 partial: NOT FOUND — skipping")
-
-    # Core ML (runs only on macOS; each model has a fixed batch size and segment length)
-    coreml_paths = {name: os.path.join(export_dir, 'coreml', f'{stem}.mlpackage')
-                    for name, stem in (('CoreML', 'model'), ('CML_fp16', 'model_fp16'),
-                                       ('CML_int8', 'model_int8'))}
-    for name, path in coreml_paths.items():
-        if not os.path.exists(path):
-            continue
-        if sys.platform != 'darwin':
-            print(f"  {name + ':':<12} {path}  (needs macOS — skipping)")
-            continue
-        import coremltools as ct
-        print(f"  {name + ':':<12} {path}")
-        models[name] = ct.models.MLModel(path)  # default compute units, as an app gets them
-
-    print("done.\n")
-
-    # Where each model really runs (ONNX Runtime falls back to the CPU if CUDA cannot load)
-    providers = {}
-    for name, model in models.items():
-        if name.startswith('TS'):
-            providers[name] = 'CUDA' if use_gpu else 'CPU'
-        elif name.startswith('ONNX'):
-            providers[name] = model.get_providers()[0].replace('ExecutionProvider', '')
-            if use_gpu and name != 'ONNX_int8' and providers[name] != 'CUDA':
-                print(f"⚠️  {name}: CUDA execution provider not available, running on {providers[name]}")
-        elif name.startswith('C'):
-            providers[name] = 'Core ML'
-
-    results = []
-
+    # Inputs and reference outputs: every duration at the export batch size, a larger
+    # batch for the models with a dynamic batch size, and silence. A constant spectrogram
+    # is the degenerate case of the per-sample normalization (0/0); every model must
+    # return finite scores that match the reference.
+    cases = []
     for duration in durations:
-        for batch_size in batch_sizes:
-            audio = load_audio(audio_path, duration, batch_size)
-            ts_out, ts_dt = run_torchscript(ts_model, audio, device)
+        cases.append((f'dur={duration:.1f}s batch={args.batch_size}',
+                      load_audio(args.audio, duration, args.batch_size), False))
+    cases.append((f'dur={args.segment_duration:.1f}s batch={DYNAMIC_BATCH}',
+                  load_audio(args.audio, args.segment_duration, DYNAMIC_BATCH), True))
+    cases.append((f'silence  batch={args.batch_size}',
+                  np.zeros((args.batch_size, int(args.segment_duration * SAMPLE_RATE)), np.float32), False))
+    references = [reference.run(audio) for _, audio, _ in cases]
+    native_samples = int(args.segment_duration * SAMPLE_RATE)
 
-            # TorchScript FP16
-            if 'TS_fp16' in models:
-                try:
-                    out, dt = run_torchscript(models['TS_fp16'], audio, device)
-                    results.append(compare_and_print(
-                        'TS_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
-                except Exception as e:
-                    print(f"⚠️ ERR   TS_fp16     dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
-                    results.append('ERROR')
+    results, compared, loaded = [], set(), [reference]
+    labels = count_labels(export_dir)
+    n_outputs = references[0][0].shape[1]
+    if labels is None:
+        print('⚠️  No label file in the export directory')
+    elif labels[1] != n_outputs:
+        print(f"❌ FAIL  {labels[0]} has {labels[1]} rows but the model has {n_outputs} outputs")
+        results.append('FAIL')
+    else:
+        print(f"✅ PASS  {labels[0]} has one row per model output ({n_outputs})")
+        results.append('PASS')
+    print()
 
-            # ONNX
-            if 'ONNX' in models:
-                try:
-                    onnx_out, onnx_dt = run_onnx(models['ONNX'], audio)
-                    results.append(compare_and_print(
-                        'ONNX', ts_out, onnx_out, duration, batch_size, ts_dt, onnx_dt))
-                except Exception as e:
-                    print(f"⚠️ ERR   ONNX        dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
-                    results.append('ERROR')
-
-            # ONNX FP16 (mixed precision: fp16 convolutions, fp32 elsewhere)
-            if 'ONNX_fp16' in models:
-                try:
-                    out, dt = run_onnx(models['ONNX_fp16'], audio)
-                    results.append(compare_and_print(
-                        'ONNX_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
-                except Exception as e:
-                    print(f"⚠️ ERR   ONNX_fp16   dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
-                    results.append('ERROR')
-
-            # ONNX FP16 for GPUs (whole backbone in fp16)
-            if 'ONNX_fp16_gpu' in models:
-                try:
-                    out, dt = run_onnx(models['ONNX_fp16_gpu'], audio)
-                    results.append(compare_and_print(
-                        'ONNX_fp16_gpu', ts_out, out, duration, batch_size, ts_dt, dt))
-                except Exception as e:
-                    print(f"⚠️ ERR   ONNX_fp16_gpu  dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
-                    results.append('ERROR')
-
-            # ONNX INT8
-            if 'ONNX_int8' in models:
-                try:
-                    out, dt = run_onnx(models['ONNX_int8'], audio)
-                    results.append(compare_and_print(
-                        'ONNX_int8', ts_out, out, duration, batch_size, ts_dt, dt,
-                        atol=ATOL_INT8))
-                except Exception as e:
-                    print(f"⚠️ ERR   ONNX_int8   dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
-                    results.append('ERROR')
-
-            # LiteRT
-            if 'LiteRT' in models:
-                try:
-                    tfl_out, tfl_dt = run_tflite(models['LiteRT'], audio)
-                    results.append(compare_and_print(
-                        'LiteRT', ts_out, tfl_out, duration, batch_size, ts_dt, tfl_dt))
-                except RuntimeError as e:
-                    print(f"⚠️ ERR   LiteRT      dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
-                    results.append('ERROR')
-
-            # LiteRT FP16
-            if 'LRT_fp16' in models:
-                try:
-                    out, dt = run_tflite(models['LRT_fp16'], audio)
-                    results.append(compare_and_print(
-                        'LRT_fp16', ts_out, out, duration, batch_size, ts_dt, dt))
-                except RuntimeError as e:
-                    print(f"⚠️ ERR   LRT_fp16    dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
-                    results.append('ERROR')
-
-            # LRT int8 partially optimized (preprocessing + main optimized)
-            if 'LRT_int8_partial' in models:
-                try:
-                    pre_path, main_opt_path = models['LRT_int8_partial']
-                    part_out, part_dt = run_tflite_partial(pre_path, main_opt_path, audio)
-                    results.append(compare_and_print(
-                        'LRT_int8_partial', ts_out, part_out, duration, batch_size, ts_dt, part_dt, atol=ATOL_INT8))
-                except RuntimeError as e:
-                    print(f"⚠️ ERR   LRT_int8_partial     dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
-                    results.append('ERROR')
-
-            # LiteRT INT8
-            if 'LRT_int8' in models:
-                try:
-                    out, dt = run_tflite(models['LRT_int8'], audio)
-                    results.append(compare_and_print(
-                        'LRT_int8', ts_out, out, duration, batch_size, ts_dt, dt,
-                        atol=ATOL_INT8))
-                except RuntimeError as e:
-                    print(f"⚠️ ERR   LRT_int8    dur={duration:.1f}s  batch={batch_size}  {str(e).split(chr(10))[0][:80]}")
-                    results.append('ERROR')
-
-            # Core ML
-            for name in ('CoreML', 'CML_fp16', 'CML_int8'):
-                if name not in models:
-                    continue
-                if coreml_input_shape(models[name]) != audio.shape:
-                    print(f"⏭️  SKIP  {name:<10}  dur={duration:.1f}s  batch={batch_size}  "
-                          f"(model input is fixed at {coreml_input_shape(models[name])})")
-                    continue
-                try:
-                    out, dt = run_coreml(models[name], audio)
-                    results.append(compare_and_print(
-                        name, ts_out, out, duration, batch_size, ts_dt, dt,
-                        atol=ATOL_INT8 if name.endswith('int8') else ATOL))
-                except Exception as e:
-                    print(f"⚠️ ERR   {name:<10}  dur={duration:.1f}s  batch={batch_size}  {str(e)[:80]}")
-                    results.append('ERROR')
-
-            print()
-
-    # Silence: a constant spectrogram is the degenerate case of the per-sample
-    # normalization (0/0); every model must return finite scores that match the reference.
-    duration, batch_size = durations[0], batch_sizes[0]
-    silence = np.zeros((batch_size, int(duration * SAMPLE_RATE)), dtype=np.float32)
-    ts_out, ts_dt = run_torchscript(ts_model, silence, device)
-    print("Silence (all-zero input):")
-    for name, model in models.items():
-        if name == 'TS':
+    for candidate in candidates:
+        if not model_exists(candidate):
+            print(f"   ----  {candidate.name:<14} not in the export directory")
             continue
-        if name.startswith('C') and coreml_input_shape(model) != silence.shape:
+        if isinstance(candidate, CoreMLModel) and sys.platform != 'darwin':
+            print(f"   ----  {candidate.name:<14} needs macOS")
             continue
         try:
-            out, dt = run_any(name, model, silence, device)
-            results.append(compare_and_print(
-                name, ts_out, out, duration, batch_size, ts_dt, dt,
-                atol=ATOL_INT8 if 'int8' in name else ATOL))
+            candidate.load()
         except Exception as e:
-            print(f"⚠️ ERR   {name:<10}  silence  {str(e).split(chr(10))[0][:80]}")
+            print(f"⚠️ ERR   {candidate.name:<14} does not load: {str(e).split(chr(10))[0][:100]}")
             results.append('ERROR')
+            continue
+        loaded.append(candidate)
+        for (case, audio, batch_test), ref in zip(cases, references):
+            if batch_test and not candidate.dynamic_batch:
+                continue
+            shape = candidate.input_shape()
+            off_length = candidate.off_length and audio.shape[1] != native_samples
+            if (shape is not None and shape != audio.shape) or (
+                    candidate.fixed_length and audio.shape[1] != native_samples):
+                print(f"   skip  {candidate.name:<14} {case}  (fixed input shape)")
+                continue
+            try:
+                status = compare(candidate, case, ref, candidate.run(audio), off_length,
+                                 silence=case.startswith('silence'))
+            except FixedShape as e:
+                print(f"   skip  {candidate.name:<14} {case}  ({e})")
+                continue
+            except Exception as e:
+                print(f"⚠️ ERR   {candidate.name:<14} {case}  {str(e).split(chr(10))[0][:100]}")
+                status = 'ERROR'
+            results.append(status)
+            if status in ('PASS', 'FAIL', 'INFO'):
+                compared.add(candidate.name)
     print()
 
     if args.speed_runs > 0:
-        speed_test(models, load_audio(audio_path, durations[0], batch_sizes[0]),
-                   device, args.speed_runs, providers)
+        speed_test(loaded, load_audio(args.audio, args.segment_duration, args.batch_size),
+                   args.speed_runs)
 
-    n_pass  = results.count('PASS')
-    n_fail  = results.count('FAIL')
-    n_error = results.count('ERROR')
-    print(f"{n_pass} passed, {n_fail} failed, {n_error} errors  "
-          f"(out of {len(results)} combos)")
-
-    sys.exit(0 if n_fail == 0 and n_error == 0 else 1)
+    n_pass, n_fail, n_error = (results.count(s) for s in ('PASS', 'FAIL', 'ERROR'))
+    print(f"{n_pass} passed, {n_fail} failed, {n_error} errors, "
+          f"{results.count('INFO')} experimental (not checked)")
+    missing = [name for name in args.expect if name not in compared]
+    if missing:
+        print(f"❌ Expected model(s) not compared: {', '.join(missing)}")
+    if not compared:
+        print('❌ No converted model was compared with the reference')
+    sys.exit(0 if n_fail == 0 and n_error == 0 and compared and not missing else 1)
 
 
 if __name__ == '__main__':

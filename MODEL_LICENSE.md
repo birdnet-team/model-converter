@@ -3,13 +3,14 @@
 Copyright (c) 2026 The BirdNET Team
 
 This license covers the trained model weights distributed with or converted by
-this project: PyTorch checkpoints and the converted TensorFlow/LiteRT,
-TorchScript, and ONNX models.
+this project — the BirdNET V3.0 audio models and the BirdNET+ Geomodel: PyTorch
+checkpoints and the converted TensorFlow/LiteRT, TorchScript, ONNX, and Core ML
+models.
 
 The source code in this repository is licensed separately under the MIT License;
 see [`LICENSE`](LICENSE).
 
-Expectations for responsible use of the BirdNET V3.0 models are described in
+Expectations for responsible use of these models are described in
 [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md); that document is guidance and does not
 add conditions to this license.
 

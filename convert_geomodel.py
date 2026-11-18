@@ -70,8 +70,7 @@ OUTPUT_NAME = 'probabilities'
 # Largest allowed difference in output probability between an export and the PyTorch model.
 # INT8 reaches 0.13 on the reference inputs and 0.2 on other random locations.
 TOLERANCE = {'fp32': 1e-4, 'fp16': 0.01, 'int8': 0.3,
-             # Core ML: other hardware, and the FP16 model really computes in float16
-             'coreml_fp32': 1e-4, 'coreml_fp16': 0.03}
+             'coreml_fp32': 1e-4, 'coreml_fp16': 0.01}
 # ONNX FP16 stores a weight as float16 only if it has at least this many elements;
 # biases, normalisation parameters and scalar constants stay float32
 FP16_MIN_ELEMENTS = 4096
@@ -186,6 +185,10 @@ def build_pruning_sheet(labels_path, taxonomy_path):
     if missing:
         sys.exit(f'Error: {taxonomy_path} is missing column(s): {", ".join(missing)}')
 
+    for column in ('birdnet_id', 'scientific_name'):
+        duplicated = taxonomy[column][taxonomy[column].duplicated()]
+        if len(duplicated):
+            sys.exit(f'Error: {taxonomy_path} lists {column} {duplicated.iloc[0]!r} more than once')
     by_name = dict(zip(taxonomy['scientific_name'], taxonomy['birdnet_id']))
     by_ebird = {c: b for c, b in zip(taxonomy['ebird_code'], taxonomy['birdnet_id']) if c}
     by_inat = {c: b for c, b in zip(taxonomy['inat_id'], taxonomy['birdnet_id']) if c}
@@ -197,6 +200,10 @@ def build_pruning_sheet(labels_path, taxonomy_path):
                 alias_position[(birdnet_id, alias)] = position
 
     names = taxonomy.set_index('birdnet_id')
+
+    def differs(common, birdnet_id):
+        return common.strip().lower() != names['common_name'][birdnet_id].strip().lower()
+
     ids, matched_by, review = [], [], []
     for code, name, common in zip(labels['code'], labels['scientific_name'], labels['common_name']):
         by_code = (by_inat if code.isdigit() else by_ebird).get(code)
@@ -208,11 +215,14 @@ def build_pruning_sheet(labels_path, taxonomy_path):
                         f'{names["scientific_name"][by_code]} in the taxonomy')
         elif by_code:
             ids.append(by_code); matched_by.append('code')
+            if differs(common, by_code):  # codes move when taxa are split or lumped
+                note = (f'matched by code only, to {names["scientific_name"][by_code]} '
+                        f'({names["common_name"][by_code]}); check that it is the same taxon')
         elif len(by_alias.get(name, ())) == 1:
             ids.append(next(iter(by_alias[name]))); matched_by.append('alias')
-            taxon_common = names['common_name'][ids[-1]]
-            if common.strip().lower() != taxon_common.strip().lower():
-                note = (f'alias of {names["scientific_name"][ids[-1]]} ({taxon_common}); '
+            if differs(common, ids[-1]):
+                note = (f'alias of {names["scientific_name"][ids[-1]]} '
+                        f'({names["common_name"][ids[-1]]}); '
                         f'check that it is the same taxon and not a part of it')
         else:
             ids.append(''); matched_by.append('unmatched')
@@ -232,6 +242,11 @@ def build_pruning_sheet(labels_path, taxonomy_path):
             for row in rows[1:]:
                 selected[row] = 0
                 matched_by[row] += f'; lumped into {labels["scientific_name"][rows[0]]}'
+            dropped = ', '.join(labels['scientific_name'][row] for row in rows[1:])
+            review[rows[0]] = '; '.join(filter(None, [
+                review[rows[0]],
+                f'the taxonomy lumps {dropped} into this taxon and their outputs are dropped; '
+                f'this class predicts only the range of {labels["scientific_name"][rows[0]]}']))
 
     sheet = pd.DataFrame({
         'ix': range(len(labels)),
@@ -307,7 +322,10 @@ def taxonomy_labels_for_ids(ids, taxonomy_path):
     IDs (such as one exported by this script) still gets a full labels.csv.
     """
     import pandas as pd
-    if not ids or not os.path.isfile(taxonomy_path):
+    if not ids:
+        return None
+    if not os.path.isfile(taxonomy_path):
+        print(f'⚠️  BirdNET taxonomy not found: {taxonomy_path}; labels.csv is not written')
         return None
     known = set(pd.read_csv(taxonomy_path, usecols=['birdnet_id'], dtype=str)['birdnet_id'])
     if len(set(ids)) != len(ids) or not set(ids) <= known:
@@ -374,14 +392,22 @@ class Results:
         print(f'  ❌ {name}: {error}')
         self.rows.append((name, False, float('nan'), float('nan'), 0.0))
 
+    def not_run(self, name, path, reason):
+        """Record a file that was written and checked for structure but not executed."""
+        print(f'  ⚠️  {name}: not run. {reason}')
+        self.rows.append((name, None, float('nan'), float('nan'), _size_mb(path)))
+
     def summary(self):
         """Print all results and return True if every export passed."""
         print('\nSummary (difference to the PyTorch model on '
               f'{len(self.reference)} locations and weeks)')
         for name, passed, max_diff, top1, size_mb in self.rows:
-            print(f'  {"PASS" if passed else "FAIL"}  {name:22s} max diff {max_diff:.6f}  '
-                  f'top-1 {top1:.1%}  {size_mb:.1f} MB')
-        return all(row[1] for row in self.rows)
+            if passed is None:
+                print(f'  NOT RUN  {name:22s} {size_mb:.1f} MB')
+            else:
+                print(f'  {"PASS" if passed else "FAIL"}     {name:22s} max diff {max_diff:.6f}  '
+                      f'top-1 {top1:.1%}  {size_mb:.1f} MB')
+        return all(row[1] is not False for row in self.rows)
 
 
 def _size_mb(path):
@@ -555,6 +581,8 @@ def export_onnx(module, model, inputs, results, output_dir, precisions):
         print(f'ONNX FP16 model saved to {fp16_path} '
               f'({converted} weight matrices as float16, {kept} small tensors kept float32)')
         validate('ONNX FP16', fp16_path, 'fp16')
+    if 'int8' in precisions and not {'fp32', 'fp16'} & set(precisions):
+        print('  ⚠️  Skipping ONNX — there is no INT8 ONNX export for the geomodel.')
 
 
 class _ErfGELU(torch.nn.Module):
@@ -600,8 +628,6 @@ def export_tf(module, model, inputs, results, output_dir, formats, precisions, b
         ]
         for precision, name, file_name, flags in variants:
             path = os.path.join(tf_dir, file_name)
-            if os.path.exists(path):
-                os.remove(path)  # never leave a file from an earlier run with other classes
             if precision not in precisions:
                 continue
             if precision == 'int8' and not experimental:
@@ -617,12 +643,6 @@ def export_tf(module, model, inputs, results, output_dir, formats, precisions, b
                 results.fail(name, f'does not run: {str(error)[:200]}')
 
     if 'tf' in formats:
-        for name in ('saved_model.pb', 'fingerprint.pb', 'variables', 'assets'):
-            path = os.path.join(tf_dir, name)
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.exists(path):
-                os.remove(path)
         if 'fp32' not in precisions:
             print('  ⚠️  Skipping TensorFlow SavedModel — it is FP32 only.')
             return
@@ -650,33 +670,6 @@ def export_tf(module, model, inputs, results, output_dir, formats, precisions, b
                 outputs.append(list(serving(**{key: tf.constant(chunk)}).values())[0].numpy()[:n])
         print(f'TensorFlow SavedModel saved to {tf_dir}')
         results.check('SavedModel', tf_dir, np.concatenate(outputs), 'fp32', size_of=('saved_model.pb', 'variables'))
-
-
-def _coreml_keeps_fp32(op):
-    """True for the Core ML operations that stay float32 in the FP16 model.
-
-    These are sin and cos and every operation whose result feeds them: splitting the
-    input, converting degrees and weeks to radians, and multiplying by the harmonics.
-    Latitude and longitude need more than float16's three to four significant digits;
-    computed in float16, the coordinate encoding alone costs up to 0.17 in the output
-    probabilities. Everything after sin and cos, which holds all large weights, computes
-    in float16. The rule follows the graph, not module names, so it holds for any
-    geomodel architecture that encodes its inputs with sin and cos.
-    """
-    periodic = ('sin', 'cos')
-    if op.op_type in periodic:
-        return True
-    seen, pending = set(), [op]
-    while pending:
-        current = pending.pop()
-        for output in current.outputs:
-            for child in output.child_ops:
-                if child.op_type in periodic:
-                    return True
-                if id(child) not in seen:
-                    seen.add(id(child))
-                    pending.append(child)
-    return False
 
 
 def _register_coreml_ops():
@@ -714,16 +707,73 @@ def run_coreml(path, inputs):
     return np.concatenate(outputs)
 
 
+def _coreml_weights_as_fp16_pass():
+    """Register and return the name of the graph pass that stores weights as float16.
+
+    Every float32 weight matrix with at least ``FP16_MIN_ELEMENTS`` elements, the same
+    tensors as in the ONNX FP16 model, is stored as float16 and cast back to float32 when the model is loaded
+    (``constexpr_cast``), so the model is half the size but computes in float32, like the
+    ONNX FP16 model. Measured on macOS: 0.0025 from the PyTorch model, against 0.018 when
+    the model computes in float16.
+    """
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+    from coremltools.converters.mil.mil.passes.helper import block_context_manager
+    from coremltools.converters.mil.mil.passes.pass_registry import register_pass
+
+    @register_pass(namespace='common')
+    class geomodel_weights_as_fp16(AbstractGraphPass):
+        def apply(self, prog):
+            for function in prog.functions.values():
+                self._convert(function)
+
+        @block_context_manager
+        def _convert(self, block):
+            for op in list(block.operations):
+                value = op.outputs[0].val if op.op_type == 'const' else None
+                if (not isinstance(value, np.ndarray) or value.dtype != np.float32
+                        or value.ndim < 2 or value.size < FP16_MIN_ELEMENTS
+                        or np.abs(value).max() > np.finfo(np.float16).max):
+                    continue
+                stored = mb.constexpr_cast(source_val=value.astype(np.float16), output_dtype='fp32',
+                                           before_op=op, name=op.name + '_fp16')
+                block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0],
+                                                   new_var=stored, no_check_var_types=True)
+                block.remove_ops([op])
+
+    return 'common::geomodel_weights_as_fp16'
+
+
+def coreml_structure_problem(path, fp16):
+    """Return what is wrong with the operations of a saved Core ML model, or None.
+
+    Checks what can be checked without running the model, so it also works off macOS:
+    no sin operation is left (see ``_register_coreml_ops``), and the FP16 model stores
+    weights as float16.
+    """
+    import coremltools as ct
+    counts = {}
+    for function in ct.utils.load_spec(path).mlProgram.functions.values():
+        for block in function.block_specializations.values():
+            for operation in block.operations:
+                counts[operation.type] = counts.get(operation.type, 0) + 1
+    if counts.get('sin'):
+        return 'contains a sin operation, which Core ML evaluates wrongly at some angles'
+    if fp16 and not counts.get('constexpr_cast'):
+        return 'has no weights stored as float16'
+    return None
+
+
 def export_coreml(module, model, inputs, results, output_dir, precisions, batch_size):
     """Export Core ML ML Programs (.mlpackage) for iOS 16 / macOS 13 and later.
 
-    The input shape is fixed at ``[batch_size, 3]``. ``model.mlpackage`` computes in
-    float32. ``model_fp16.mlpackage`` computes in float16 except for the coordinate
-    encoding (see ``_coreml_keeps_fp32``); its input and output stay float32.
+    The input shape is fixed at ``[batch_size, 3]``. Both models compute in float32;
+    ``model_fp16.mlpackage`` stores its weights as float16 (see
+    ``_coreml_weights_as_fp16_pass``).
 
     coremltools converts on any OS, but Core ML only runs on macOS: there the models are
-    compared with the PyTorch model like every other format, elsewhere they are written
-    without being run.
+    compared with the PyTorch model like every other format, elsewhere only their
+    operations are checked.
     """
     import coremltools as ct
 
@@ -735,13 +785,14 @@ def export_coreml(module, model, inputs, results, output_dir, precisions, batch_
     with torch.no_grad():
         traced = torch.jit.trace(wrapper, example, check_trace=False)
 
+    fp16_pipeline = ct.PassPipeline.DEFAULT
+    fp16_pipeline.append_pass(_coreml_weights_as_fp16_pass())
     variants = [
-        ('fp32', 'Core ML', 'model.mlpackage', ct.precision.FLOAT32, 'coreml_fp32'),
-        ('fp16', 'Core ML FP16', 'model_fp16.mlpackage',
-         ct.transform.FP16ComputePrecision(op_selector=lambda op: not _coreml_keeps_fp32(op)),
+        ('fp32', 'Core ML', 'model.mlpackage', {}, 'coreml_fp32'),
+        ('fp16', 'Core ML FP16', 'model_fp16.mlpackage', {'pass_pipeline': fp16_pipeline},
          'coreml_fp16'),
     ]
-    for precision, name, file_name, compute_precision, tolerance in variants:
+    for precision, name, file_name, options, tolerance in variants:
         if precision not in precisions:
             continue
         mlmodel = ct.convert(
@@ -749,9 +800,10 @@ def export_coreml(module, model, inputs, results, output_dir, precisions, batch_
             inputs=[ct.TensorType(name=INPUT_NAME, shape=(batch_size, 3), dtype=np.float32)],
             outputs=[ct.TensorType(name=OUTPUT_NAME, dtype=np.float32)],
             convert_to='mlprogram',
-            compute_precision=compute_precision,
+            compute_precision=ct.precision.FLOAT32,
             minimum_deployment_target=getattr(ct.target, COREML_DEPLOYMENT_TARGET),
             skip_model_load=True,  # loading compiles the model, which only macOS can do
+            **options,
         )
         mlmodel.short_description = ('BirdNET+ Geomodel: latitude, longitude and week in, '
                                      'per-class occurrence probabilities out.')
@@ -761,18 +813,19 @@ def export_coreml(module, model, inputs, results, output_dir, precisions, batch_
         mlmodel.output_description[OUTPUT_NAME] = 'Per-class probabilities (see labels file)'
         mlmodel.user_defined_metadata.update({'n_species': str(model.n_species)})
         path = os.path.join(coreml_dir, file_name)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
         mlmodel.save(path)
         print(f'{name} model saved to {path}')
-        if sys.platform == 'darwin':
+        problem = coreml_structure_problem(path, precision == 'fp16')
+        if problem:
+            results.fail(name, problem)
+        elif sys.platform == 'darwin':
             try:
                 results.check(name, path, run_coreml(path, inputs), tolerance)
             except Exception as error:
                 results.fail(name, f'does not run: {str(error)[:200]}')
         else:
-            print(f'  ⚠️  {name}: not run. Core ML models only run on macOS; '
-                  f'check them there with test_geomodel.py.')
+            results.not_run(name, path, 'Core ML models only run on macOS; check them there '
+                                        'with test_geomodel.py.')
     if 'int8' in precisions and 'fp32' not in precisions and 'fp16' not in precisions:
         print('  ⚠️  Skipping Core ML — there is no INT8 Core ML export for the geomodel.')
 
@@ -862,7 +915,10 @@ def main():
         sys.exit('Error: --class-pruning and --no-class-pruning cannot be used together')
 
     model_dir = resolve_model_dir(args.model_name)
-    output_dir = os.path.join(args.output_dir.rstrip('/'), os.path.basename(model_dir))
+    # A checkpoint given with --checkpoint is another model: it gets its own export folder
+    export_name = (os.path.splitext(os.path.basename(args.checkpoint))[0] if args.checkpoint
+                   else os.path.basename(model_dir))
+    output_dir = os.path.join(args.output_dir, export_name)
     module = load_model_module(model_dir)
     checkpoint_path = args.checkpoint or os.path.join(model_dir, DEFAULT_CHECKPOINT_FILE)
     if not os.path.isfile(checkpoint_path):
@@ -870,6 +926,14 @@ def main():
     with open(checkpoint_path, 'rb') as f:
         if f.read(40).startswith(b'version https://git-lfs'):
             sys.exit(f'Error: {checkpoint_path} is a Git LFS pointer; run `git lfs pull` to fetch it')
+    formats, precisions = set(args.formats), set(args.precisions)
+    float_precision = bool({'fp32', 'fp16'} & precisions)
+    if not ({'checkpoint', 'torchscript'} & formats
+            or ({'onnx', 'coreml'} & formats and float_precision)
+            or ('tflite' in formats and (float_precision or args.experimental_mode))
+            or ('tf' in formats and 'fp32' in precisions)):
+        sys.exit('Error: nothing to export; the selected formats have no model in the selected '
+                 'precisions (INT8 exists for LiteRT only, with --experimental-mode)')
     if os.path.commonpath([os.path.abspath(checkpoint_path), os.path.abspath(output_dir)]) == os.path.abspath(output_dir):
         sys.exit(f'Error: {checkpoint_path} is inside the export directory {output_dir}, whose model '
                  f'files this run replaces; copy the checkpoint elsewhere or choose another -o')
@@ -902,33 +966,48 @@ def main():
     else:
         kept_ixs = list(range(n_source))
     if plain_labels is None:
+        # No sheet with BirdNET IDs: the checkpoint's vocabulary names the outputs, and a
+        # labels.txt next to the checkpoint adds scientific and common names
         sidecar = None if class_pruning else find_sidecar_labels(checkpoint_path)
         vocab = checkpoint.get('species_vocab') or {}
-        if sidecar:
+        names = ([str(vocab['idx_to_species'][i]) for i in kept_ixs]
+                 if 'idx_to_species' in vocab else None)
+        if names:
+            taxonomy_labels = taxonomy_labels_for_ids(names, args.taxonomy)
+        if taxonomy_labels is not None:  # the vocabulary already holds BirdNET IDs
+            label_ids = names
+            plain_labels = list(zip(taxonomy_labels['birdnet_id'], taxonomy_labels['scientific_name'],
+                                    taxonomy_labels['common_name']))
+        elif sidecar:
             source = read_source_labels(sidecar)
             if len(source) != n_source:
                 sys.exit(f'Error: {sidecar} has {len(source)} rows but the model has {n_source} classes')
+            if names and list(source['code']) != names:
+                row = next(i for i, (a, b) in enumerate(zip(source['code'], names)) if a != b)
+                sys.exit(f'Error: {sidecar} does not belong to {checkpoint_path}: row {row} is '
+                         f'{source["code"][row]}, the checkpoint has {names[row]}')
             plain_labels = list(source.itertuples(index=False, name=None))
-        elif 'idx_to_species' in vocab:
-            names = [str(vocab['idx_to_species'][i]) for i in kept_ixs]
-            taxonomy_labels = taxonomy_labels_for_ids(names, args.taxonomy)
-            if taxonomy_labels is not None:  # the vocabulary already holds BirdNET IDs
-                label_ids = names
-                plain_labels = list(zip(taxonomy_labels['birdnet_id'], taxonomy_labels['scientific_name'],
-                                        taxonomy_labels['common_name']))
-            else:
-                plain_labels = [(name,) for name in names]
+        elif names:
+            plain_labels = [(name,) for name in names]
         else:
             print('⚠️  No label source found; the export has no label file')
 
-    if len(kept_ixs) != n_source or kept_ixs != list(range(n_source)):
+    inputs = reference_inputs()
+    if kept_ixs != list(range(n_source)):
+        with torch.no_grad():
+            unpruned = module.ExportWrapper(model).eval()(torch.from_numpy(inputs)).numpy()
         module.prune_species(model, kept_ixs)
+        with torch.no_grad():
+            pruned = module.ExportWrapper(model).eval()(torch.from_numpy(inputs)).numpy()
+        if pruned.shape != (len(inputs), len(kept_ixs)) or not np.allclose(
+                pruned, unpruned[:, kept_ixs], rtol=0, atol=1e-6):
+            sys.exit('Error: the pruned model does not return the selected outputs of the '
+                     'checkpoint; prune_species in the model definition does not fit this model')
 
     clear_model_files(output_dir)
     write_label_files(output_dir, taxonomy_labels, plain_labels)
     write_terms_files(output_dir)
 
-    formats, precisions = set(args.formats), set(args.precisions)
     print(f'Model directory:    {model_dir}')
     print(f'Checkpoint:         {checkpoint_path}')
     print(f'Output directory:   {output_dir}')
@@ -940,7 +1019,6 @@ def main():
     print(f'Experimental mode:  {"enabled" if args.experimental_mode else "disabled"}')
     print()
 
-    inputs = reference_inputs()
     with torch.no_grad():
         reference = module.ExportWrapper(model).eval()(torch.from_numpy(inputs)).numpy()
     results = Results(reference)
@@ -961,6 +1039,9 @@ def main():
     if 'coreml' in formats:
         export_coreml(module, model, inputs, results, output_dir, precisions, args.batch_size)
 
+    if not results.rows:
+        sys.exit('Error: no model was exported; the selected formats have no model in the '
+                 'selected precisions')
     if not results.summary():
         sys.exit('\nError: at least one export differs from the PyTorch model by more than its tolerance')
     print('\nDone.')

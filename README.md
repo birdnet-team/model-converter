@@ -45,6 +45,8 @@
 
 ¹ Only with `--experimental-mode`, see [Precision Variants](#precision-variants).
 
+The default model is `02_BirdNET+_V3.0_Global_12K`. `01_BirdNET+_V3.0-preview3_Global_11K` is a legacy preview model: it still converts, but it is not tested, lacks the FP16 fixes of V3.0, and its ONNX exports return NaN on silent input. Do not publish models converted from it.
+
 Audio input is mono, 32 kHz, float32 `[batch, samples]`. Supported input shapes:
 
 | Format | Batch size | Audio length |
@@ -53,9 +55,11 @@ Audio input is mono, 32 kHz, float32 `[batch, samples]`. Supported input shapes:
 | TFLite | fixed (`--batch-size`) | `--segment-duration` ² |
 | TF SavedModel (main, combined), Core ML | fixed (`--batch-size`) | fixed (`--segment-duration`) |
 
-² The TFLite files accept other lengths, but the scores then deviate from the PyTorch model (by up to 0.1 at 2 s or 5 s for a 3 s export). For another length, export again with that `--segment-duration`.
+² The TFLite files accept other lengths, but they are only accurate at the export length: at 5 s, a 3 s export differs from the PyTorch model by up to 0.08 in score and its embeddings are off by more than half their range. For another length, export again with that `--segment-duration`.
 
-The separate preprocessing and main models let you plug in your own spectrogram pipeline or run the classifier on its own. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and copies of the model license and acceptable use policy.
+The separate preprocessing and main models let you plug in your own spectrogram pipeline or run the classifier on its own. The TF SavedModels are FP32 and are only kept when `-p` includes `fp32`; the preprocessing TFLite model is FP32 too and is always written, because the main models of every precision take its spectrogram. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and copies of the model license and acceptable use policy.
+
+One export directory holds one model configuration: all formats share the label file. `export_config.json` records the classes, head weights, segment duration and batch size of the models in the directory. A run with another configuration removes the models exported before; a run with the same configuration keeps the formats it does not write.
 
 Other scripts:
 
@@ -100,7 +104,7 @@ python convert_model.py --list-models          # list the models in models/
 -m, --model-name         Model directory: a name in models/ or a path (default: 02_BirdNET+_V3.0_Global_12K)
 -o, --output-dir         Directory that receives one folder per model (default: export/)
 -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx, coreml (default: all)
--p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)
+-p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all); the SavedModels are fp32 only
 --batch-size             Batch size of the fixed-shape models (default: 1)
 --segment-duration       Audio length in seconds of the fixed-shape models (default: 3.0)
 --head-weights W W W     Weights for the three classifier heads (default: from model definition)
@@ -162,7 +166,7 @@ Largest score difference to the FP32 PyTorch model, for the default model with a
 | ONNX INT8 | 0.11 | changed |
 | TFLite INT8, combined model | 0.83 | changed |
 
-On synthetic edge cases (silence, noise, clipping, very quiet or loud input) the ONNX FP16 models stay within 0.016. ONNX Runtime on x86 CPUs computes float16 graphs in float32, so only the CUDA figures reflect real float16 arithmetic; the models were not measured on arm64 devices.
+On synthetic edge cases (silence, noise, clipping, very quiet or loud input) the ONNX FP16 models stay within 0.016. ONNX Runtime on x86 CPUs computes float16 graphs in float32, so only the CUDA figures reflect real float16 arithmetic; the models were not measured on arm64 devices. Silence is the least stable input for FP16 models: a TFLite FP16 model exported for 2 s segments differed by 0.04 on all-zero input, while the 3 s export stays within 0.001.
 
 ONNX has two FP16 files of the same size and with the same inputs and outputs as the FP32 model:
 
@@ -189,25 +193,27 @@ scores = model.predict({'input': audio})['predictions']   # audio: float32 [1, 9
 
 ### Testing Converted Models
 
-`test_models.py` compares every converted model in an export directory against the TorchScript model, on audio and on silence, and then times each one:
+`test_models.py` compares the scores and embeddings of every converted model in an export directory with the TorchScript model, on audio and on silence, and then times each one. That covers the ONNX files, the TFLite and SavedModel combined models, the preprocessing models chained into the main models, and on macOS the Core ML models:
 
 ```bash
 python test_models.py
 python test_models.py -a path/to/audio.wav
 python test_models.py -e output/my_export/<model name>
-python test_models.py --durations 3.0 5.0 --batch-size 2 --gpu
+python test_models.py --durations 3.0 5.0 --gpu
 ```
 
 ```
--e, --export-dir    Path to a model's export directory (default: export/<model name>/)
--a, --audio         Audio file for test input (default: example/soundscape.wav)
---batch-size        Batch size for test inputs (default: 1)
---durations         Segment durations in seconds (default: 3.0 5.0)
---gpu               Use GPU for TorchScript and ONNX inference
---speed-runs        Timed runs per model in the speed test (default: 10; 0 skips it)
+-e, --export-dir       Path to a model's export directory (default: export/<model name>/)
+-a, --audio            Audio file for test input (default: example/soundscape.wav)
+--batch-size           Batch size the fixed-shape models were exported with (default: 1)
+--segment-duration     Segment duration the fixed-shape models were exported with (default: 3.0)
+--durations            Segment durations in seconds to test (default: the segment duration and 5.0)
+--expect MODEL ...     Models that must be found and compared; the test fails if one is missing
+--gpu                  Use GPU for TorchScript and ONNX inference
+--speed-runs           Timed runs per model in the speed test (default: 10; 0 skips it)
 ```
 
-A model passes if its scores match TorchScript within 0.09 (0.1 for INT8). Core ML models are tested only on macOS and only at the shape they were exported with. TFLite models drift at lengths other than the export length, so TFLite FP16 can fail the 5 s check.
+A model passes if its scores match TorchScript within 0.0001 (FP32), 0.02 (FP16) or 0.05 (Core ML FP16), and its embeddings within a matching share of their range. Models with a dynamic batch size are also run on a batch of three different segments. Fixed-shape models are tested at the shape they were exported with; TFLite models are also run at the other durations, where they must stay within 0.15 and keep the top class. INT8 models are reported but not checked, apart from returning finite output of the right shape. The test fails if no model was compared.
 
 Throughput in seconds of audio per second on one machine (x86 CPU, NVIDIA TITAN RTX; default model, all three heads, 3 s segments), as a rough guide:
 
@@ -260,11 +266,15 @@ Largest difference in output probability to the original PyTorch model, over 300
 | TorchScript, ONNX, LiteRT FP32, TF SavedModel | below 0.00004 | 100% | 15 MB |
 | ONNX FP16 | 0.005 (V3.0.4 release file: 0.09) | 99.9% | 7 MB |
 | LiteRT FP16 | 0.004 (V3.0.4 release file: 0.06) | 99.8% | 7 MB |
+| Core ML FP32 ³ | 0.00001 | 100% | 15 MB |
+| Core ML FP16 ³ | 0.003 | 99.4% | 7 MB |
 | LiteRT INT8 ² | 0.19 | 89% | 4 MB |
 
-The converter also checks every file it writes against the PyTorch model and fails if one is out of tolerance.
+³ On macOS (arm64), over 512 test inputs that include every week and coordinates at round fractions of 180°.
 
-The Core ML models are ML Programs for iOS 16 / macOS 13 and later (input `input`, output `probabilities`). `model_fp16.mlpackage` computes in float16, except for the coordinate encoding, which needs float32 precision. **They have been converted on Linux but not yet run on a device.**
+The converter also checks every file it writes against the PyTorch model and fails if one is out of tolerance. Off macOS it cannot run the Core ML models and only checks their operations; run `test_geomodel.py` on a Mac to compare them.
+
+The Core ML models are ML Programs for iOS 16 / macOS 13 and later (input `input`, output `probabilities`). Both compute in float32; `model_fp16.mlpackage` stores its weights as float16, like the ONNX FP16 model, which is seven times closer to the PyTorch model than computing in float16 (0.003 against 0.018). Core ML's `sin` returns the wrong sign at some exact angles, which weeks 2, 3, 4 and 7 and coordinates at multiples of 7.5° produce, so the converter writes every sine as `cos(x - π/2)`. The models have been run on macOS, not on iOS devices.
 
 ### Geomodel labels
 
@@ -283,7 +293,7 @@ python convert_geomodel.py --map-labels my_run/checkpoint_best_labels.txt --shee
 python convert_geomodel.py --checkpoint my_run/checkpoint_best.pt --class-pruning my_run/pruning.xlsx -o export/my_run
 ```
 
-`--map-labels` matches each label to the taxonomy by scientific name, code or alias, selects one class per BirdNET ID, and marks uncertain matches in a `review` column. Set `selected` to 0 for classes you do not want. Without a pruning sheet, every class of the checkpoint is exported. The model must match the architecture in `model.py` of the model directory given with `-m`.
+`--map-labels` matches each label to the taxonomy by scientific name, code or alias, selects one class per BirdNET ID, and marks matches to check in a `review` column. Where the taxonomy lumps several source classes into one BirdNET ID, one of them is kept and the others are dropped, so that class predicts only the range of the kept form; the `review` column names these. Set `selected` to 0 for classes you do not want. Without a pruning sheet, every class of the checkpoint is exported. With `--checkpoint`, the export folder is named after the checkpoint file (here `export/my_run/checkpoint_best/`). The model must match the architecture in `model.py` of the model directory given with `-m`.
 
 ## License
 

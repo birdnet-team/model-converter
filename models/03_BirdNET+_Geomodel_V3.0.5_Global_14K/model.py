@@ -557,7 +557,7 @@ class BirdNETGeoModel(nn.Module):
         Args:
             lat: Raw latitude in degrees, shape ``(batch,)``.
             lon: Raw longitude in degrees, shape ``(batch,)``.
-            week: Week number (0–48), shape ``(batch,)``.
+            week: Week number (1–48), shape ``(batch,)``.
             return_env: If True, also return environmental predictions.
 
         Returns:
@@ -741,6 +741,7 @@ def load_checkpoint(path: str) -> Tuple[BirdNETGeoModel, dict]:
         n_species=config['n_species'],
         n_env_features=config['n_env_features'],
         model_scale=config.get('model_scale', 1.0),
+        # Fallbacks for old checkpoints, as in the geomodel repository's convert.py
         coord_harmonics=config.get('coord_harmonics', 8),
         week_harmonics=config.get('week_harmonics', 4),
         habitat_head=config.get('habitat_head', False),

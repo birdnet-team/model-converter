@@ -1,12 +1,8 @@
-"""Post-process TFLite flatbuffer to fix static batch dimensions for dynamic batch.
+"""Post-process a TFLite flatbuffer so the model accepts other input lengths.
 
-The litert_torch converter traces models with batch=1, baking static batch
-dimensions into RESHAPE shape tensors and SLICE size tensors. This script
-patches both to enable dynamic batch at runtime.
-
-Fixes applied:
-  1. RESHAPE: shape tensors [1, ...] → [-1, ...]
-  2. SLICE: size tensors [1, ...] → [-1, ...] (TFLite SLICE uses -1 = "all remaining")
+The litert_torch converter traces the model at one input shape and bakes the time
+dimension of that shape into the shape tensors of RESHAPE ops. This script patches those
+tensors to -1, so the time dimension follows the input. The batch size stays fixed.
 """
 
 import numpy as np
@@ -232,354 +228,10 @@ def _fix_reshape(buf, interpreter, patched_offsets, expected_t_dims):
 
 # ─── SLICE fix ───────────────────────────────────────────────────────────────
 
-def _find_all_slice_sizes(interpreter):
-    """Find all SLICE ops whose size tensor has size[0] == 1 (static batch)
-    while the input tensor has a batch-dependent first dimension."""
-
-    tensor_details = {t['index']: t for t in interpreter.get_tensor_details()}
-
-    try:
-        op_details = interpreter._get_ops_details()
-    except AttributeError:
-        return []
-
-    results = []
-    for op in op_details:
-        op_name = op.get('op_name', '')
-        # TFLite SLICE op: inputs are [input, begin, size]
-        if op_name != 'SLICE':
-            continue
-
-        op_idx = op.get('index', '?')
-        input_indices = op.get('inputs', [])
-        output_indices = op.get('outputs', [])
-
-        if len(input_indices) < 3 or not output_indices:
-            continue
-
-        # Input tensor (the data to slice)
-        data_tensor_idx = input_indices[0]
-        data_tensor = tensor_details.get(data_tensor_idx)
-        if data_tensor is None:
-            continue
-
-        data_name = data_tensor['name']
-        data_shape = data_tensor['shape']
-        data_dtype = data_tensor['dtype']
-
-        # Heuristic: skip constants/weights
-        if (
-            data_name.startswith('arith.constant')
-            or data_name.startswith('Const')
-            or data_dtype not in [np.float32, np.float16]
-            or len(data_shape) < 2
-        ):
-            continue
-
-        # Check if input has dynamic/batch first dim
-        data_shape_sig = data_tensor.get('shape_signature', data_shape)
-        if not (data_shape[0] in [1, -1] or data_shape_sig[0] == -1):
-            continue
-
-        # begin tensor (input_indices[1]) — should have begin[0] == 0
-        begin_tensor_idx = input_indices[1]
-        begin_tensor = tensor_details.get(begin_tensor_idx)
-        if begin_tensor is None or begin_tensor['dtype'] != np.int32:
-            continue
-
-        try:
-            begin_val = interpreter.get_tensor(begin_tensor_idx).flatten()
-        except Exception:
-            continue
-
-        if begin_val[0] != 0:
-            # If begin[0] != 0, the slice doesn't start at the batch boundary
-            continue
-
-        # size tensor (input_indices[2]) — this is what we need to patch
-        size_tensor_idx = input_indices[2]
-        size_tensor = tensor_details.get(size_tensor_idx)
-        if size_tensor is None or size_tensor['dtype'] != np.int32:
-            continue
-
-        try:
-            size_val = interpreter.get_tensor(size_tensor_idx).flatten()
-        except Exception:
-            continue
-
-        # Match: size[0] == 1 (baked batch dim) and size has >= 2 elements
-        if len(size_val) >= 2 and size_val[0] == 1:
-            # Verify the output shape also has batch=1
-            output_tensor = tensor_details.get(output_indices[0])
-            if output_tensor is not None:
-                out_shape = output_tensor['shape']
-                if len(out_shape) > 0 and out_shape[0] != 1:
-                    continue  # output doesn't have batch=1, skip
-
-            results.append({
-                'op_idx': op_idx,
-                'tensor_idx': size_tensor_idx,
-                'tensor_name': size_tensor['name'],
-                'size_val': size_val.copy(),
-                'data_tensor_name': data_name,
-            })
-
-    return results
-
-
-def _fix_slice(buf, interpreter, patched_offsets):
-    """Fix all SLICE ops with static batch. Returns number of fixes."""
-
-    slice_ops = _find_all_slice_sizes(interpreter)
-
-    if not slice_ops:
-        print("  SLICE: No ops with static batch found.")
-        return 0
-
-    print(f"\n  SLICE: Found {len(slice_ops)} op(s) with static batch dim:")
-    for r in slice_ops:
-        print(f"    Op #{r['op_idx']}: size tensor [{r['tensor_idx']}] "
-              f"'{r['tensor_name']}' = {r['size_val']}  "
-              f"(input: '{r['data_tensor_name']}')")
-
-    # Group by unique size tensor index
-    unique_tensors = {}
-    for r in slice_ops:
-        tidx = r['tensor_idx']
-        if tidx not in unique_tensors:
-            unique_tensors[tidx] = r
-
-    print(f"  {len(unique_tensors)} unique size tensor(s) to patch:")
-
-    n_fixed = 0
-    for tidx, r in unique_tensors.items():
-        print(f"\n    Tensor [{tidx}] '{r['tensor_name']}':")
-        if _patch_int32_in_buffer(buf, r['size_val'], patched_offsets, label=""):
-            n_fixed += 1
-
-    return n_fixed
-
-
-# ─── STRIDED_SLICE fix ───────────────────────────────────────────────────────
-
-def _find_all_strided_slice_sizes(interpreter):
-    """Find all STRIDED_SLICE ops with static batch in their end tensor.
-    
-    STRIDED_SLICE takes: [input, begin, end, strides]
-    If end[0] == 1, it limits the batch dim to 1.
-    """
-
-    tensor_details = {t['index']: t for t in interpreter.get_tensor_details()}
-
-    try:
-        op_details = interpreter._get_ops_details()
-    except AttributeError:
-        return []
-
-    results = []
-    for op in op_details:
-        op_name = op.get('op_name', '')
-        if op_name != 'STRIDED_SLICE':
-            continue
-
-        op_idx = op.get('index', '?')
-        input_indices = op.get('inputs', [])
-        output_indices = op.get('outputs', [])
-
-        if len(input_indices) < 4 or not output_indices:
-            continue
-
-        # Input tensor
-        data_tensor_idx = input_indices[0]
-        data_tensor = tensor_details.get(data_tensor_idx)
-        if data_tensor is None:
-            continue
-
-        data_name = data_tensor['name']
-        data_shape = data_tensor['shape']
-        data_dtype = data_tensor['dtype']
-
-        if (
-            data_name.startswith('arith.constant')
-            or data_name.startswith('Const')
-            or data_dtype not in [np.float32, np.float16]
-            or len(data_shape) < 2
-        ):
-            continue
-
-        data_shape_sig = data_tensor.get('shape_signature', data_shape)
-        if not (data_shape[0] in [1, -1] or data_shape_sig[0] == -1):
-            continue
-
-        # begin tensor — should start at 0 for batch dim
-        begin_tensor_idx = input_indices[1]
-        begin_tensor = tensor_details.get(begin_tensor_idx)
-        if begin_tensor is None or begin_tensor['dtype'] != np.int32:
-            continue
-        try:
-            begin_val = interpreter.get_tensor(begin_tensor_idx).flatten()
-        except Exception:
-            continue
-        if begin_val[0] != 0:
-            continue
-
-        # end tensor — this is what we patch
-        end_tensor_idx = input_indices[2]
-        end_tensor = tensor_details.get(end_tensor_idx)
-        if end_tensor is None or end_tensor['dtype'] != np.int32:
-            continue
-        try:
-            end_val = interpreter.get_tensor(end_tensor_idx).flatten()
-        except Exception:
-            continue
-
-        if len(end_val) >= 2 and end_val[0] == 1:
-            output_tensor = tensor_details.get(output_indices[0])
-            if output_tensor is not None:
-                out_shape = output_tensor['shape']
-                if len(out_shape) > 0 and out_shape[0] != 1:
-                    continue
-
-            results.append({
-                'op_idx': op_idx,
-                'tensor_idx': end_tensor_idx,
-                'tensor_name': end_tensor['name'],
-                'end_val': end_val.copy(),
-                'data_tensor_name': data_name,
-            })
-
-    return results
-
-
-def _fix_strided_slice(buf, interpreter, patched_offsets, expected_t_dims):
-    """Fix all STRIDED_SLICE ops with static batch. Returns number of fixes."""
-
-    ss_ops = _find_all_strided_slice_sizes(interpreter)
-
-    if not ss_ops:
-        print("  STRIDED_SLICE: No ops with static batch found.")
-        return 0
-
-    print(f"\n  STRIDED_SLICE: Found {len(ss_ops)} op(s) with static batch dim:")
-    for r in ss_ops:
-        print(f"    Op #{r['op_idx']}: end tensor [{r['tensor_idx']}] "
-              f"'{r['tensor_name']}' = {r['end_val']}  "
-              f"(input: '{r['data_tensor_name']}')")
-
-    unique_tensors = {}
-    for r in ss_ops:
-        tidx = r['tensor_idx']
-        if tidx not in unique_tensors:
-            unique_tensors[tidx] = r
-
-    print(f"  {len(unique_tensors)} unique end tensor(s) to patch:")
-
-    # For STRIDED_SLICE, we patch end[0] to a large value (INT_MAX)
-    # since -1 doesn't have the same semantics as in SLICE
-    n_fixed = 0
-    for tidx, r in unique_tensors.items():
-        print(f"\n    Tensor [{tidx}] '{r['tensor_name']}':")
-        # Use 0x7FFFFFFF (INT_MAX) as "take all" for strided_slice end
-        end_val = r['end_val']
-        new_end = end_val.copy()
-        new_end[0] = 0x7FFFFFFF
-
-        target_bytes = np.array(end_val, dtype=np.int32).tobytes()
-        replacement_first = struct.pack('<i', 0x7FFFFFFF)
-
-        # Try vector-header pattern first
-        vec_byte_count = len(end_val) * 4
-        vec_target = np.array([vec_byte_count] + list(end_val), dtype=np.int32).tobytes()
-
-        found = False
-        pos = 0
-        while True:
-            pos = buf.find(vec_target, pos)
-            if pos == -1:
-                break
-            if pos % 4 == 0 and pos not in patched_offsets:
-                patch_pos = pos + 4
-                buf[patch_pos:patch_pos + 4] = replacement_first
-                patched_offsets.add(pos)
-                print(f"      ✅ Patched via vector header at offset {pos}")
-                n_fixed += 1
-                found = True
-                break
-            pos += 1
-
-        if not found:
-            # Fallback: raw pattern search
-            # Shape tensors in our model look like:
-            #   Batch-flatten: [-1, 11520] (size 2)
-            #   Pool/Conv:     [-1, 1280, 1, 9] (size 4) or [-1, 1280, 9] (size 3)
-            # We already patched dimension 0 to -1 above. Now we also need to un-bake
-            # the temporal dimensions (usually the last or second-to-last dimension)
-            # so they can grow/shrink based on the input sequence length.
-            # In BirdNET, baked lengths are usually 7, 9, 281, etc.
-            
-            # Since we can't easily have TWO -1 dimensions in a single reshape,
-            # this actually requires a different approach. Wait, TFLite ONLY allows one
-            # -1 dimension per reshape! 
-            # Check if this shape already has a -1 (which would be the batch dim we just set)
-            num_minus_one = sum(1 for v in end_val if v == -1)
-            
-            patched_val = end_val.copy()
-            modified = False
-            
-            for i in range(1, len(patched_val)):
-                # If it's a known temporal length from BirdNET models
-                if patched_val[i] in expected_t_dims:
-                    if num_minus_one == 0:
-                        patched_val[i] = -1
-                        num_minus_one += 1
-                        modified = True
-                    else:
-                        # We can't have two -1s. However, the batch dim (index 0) 
-                        # is usually already -1 in these ops. 
-                        # This means we CANNOT make both Batch and Time dynamic in a standard RESHAPE!
-                        # But let's at least try setting it to -1 if we can.
-                        pass
-                        
-            # Original fix: Just ensuring batch=1 becomes batch=-1
-            if patched_val[0] == 1 and num_minus_one == 0:
-                patched_val[0] = -1
-                modified = True
-                
-            if modified:
-                end_val = patched_val
-                target_bytes = np.array(end_val, dtype=np.int32).tobytes()
-                replacement_first = struct.pack('<i', end_val[0]) # Use the potentially new first element
-            
-            candidates = []
-            p = 0
-            while True:
-                p = buf.find(target_bytes, p)
-                if p == -1:
-                    break
-                if p % 4 == 0 and p not in patched_offsets:
-                    candidates.append(p)
-                p += 1
-
-            if candidates:
-                if len(candidates) == 1:
-                    cand = candidates[0]
-                else:
-                    cand = _score_candidates(buf, candidates, len(target_bytes))
-                buf[cand:cand + 4] = replacement_first
-                patched_offsets.add(cand)
-                print(f"      ✅ Patched at offset {cand}")
-                n_fixed += 1
-            else:
-                print(f"      ❌ Could not find byte pattern")
-
-    return n_fixed
-
-
 # ─── Public API ──────────────────────────────────────────────────────────────
 
 def fix_all_for_dynamic_batch(tflite_path, output_path=None, image_width=281, audio_length=96000, expected_t_dims=None):
-    """Apply all dynamic batch fixes (RESHAPE + SLICE + STRIDED_SLICE)
-    to a TFLite model. Returns total number of fixes."""
+    """Patch the RESHAPE shape tensors of a TFLite model; return the number patched."""
     import tensorflow as tf
 
     if expected_t_dims is None:
@@ -626,10 +278,7 @@ def fix_all_for_dynamic_batch(tflite_path, output_path=None, image_width=281, au
                 need_resize = True
                 
         if need_resize:
-            try:
-                interpreter.resize_tensor_input(details['index'], new_shape)
-            except Exception as e:
-                print(f"  Warning: Pre-allocation resize failed: {e}")
+            interpreter.resize_tensor_input(details['index'], new_shape)
 
     interpreter.allocate_tensors()
 
@@ -656,62 +305,43 @@ def fix_all_for_dynamic_batch(tflite_path, output_path=None, image_width=281, au
     return total
 
 
-# Legacy API — kept for backward compatibility
-def fix_reshape_for_dynamic_batch(tflite_path, output_path=None):
-    """Fix only RESHAPE ops. For full fix use fix_all_for_dynamic_batch()."""
-    return fix_all_for_dynamic_batch(tflite_path, output_path)
+def verify_fix(tflite_path, image_height=None, image_width=None, audio_length=96000):
+    """Run the patched model once at the export shape; raise if it does not run.
 
-
-def verify_fix(tflite_path, image_height=None, image_width=None):
-    """Verify the fix by testing batch=1, 2, 4.
-
-    Auto-detects input shape from the model. image_height and image_width
-    are used as fallback values for any dynamic dimensions.
+    ``image_height``/``image_width`` (main model) and ``audio_length`` (preprocessing and
+    combined models) fill in the dynamic dimensions.
     """
     import tensorflow as tf
 
     print(f"\n  Verifying {tflite_path}...")
-
-    interpreter_test = tf.lite.Interpreter(
+    interpreter = tf.lite.Interpreter(
         model_path=tflite_path,
         experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
     )
-    test_sig = list(interpreter_test.get_input_details()[0].get('shape_signature', interpreter_test.get_input_details()[0]['shape']))
-    batches_to_test = [1, 2, 4] if test_sig[0] == -1 else [test_sig[0]]
-
-    for batch in batches_to_test:
-        try:
-            interpreter = tf.lite.Interpreter(
-                model_path=tflite_path,
-                experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES
-            )
-            input_details = interpreter.get_input_details()
-            shape = list(input_details[0]['shape'])
-            sig = list(input_details[0].get('shape_signature', shape))
-
-            # Replace batch dim and any dynamic dims with concrete values
-            shape[0] = batch
-            ndim = len(shape)
-            for i in range(1, ndim):
-                if sig[i] == -1 or shape[i] <= 0:
-                    if ndim == 2:
-                        shape[i] = 96000  # audio samples (3s * 32000)
-                    elif ndim == 4 and image_height is not None and image_width is not None:
-                        shape[i] = [3, image_height, image_width][i - 1]
-                    else:
-                        shape[i] = 1
-
-            interpreter.resize_tensor_input(input_details[0]['index'], shape)
-            interpreter.allocate_tensors()
-
-            test_data = np.random.rand(*shape).astype(np.float32)
-            interpreter.set_tensor(input_details[0]['index'], test_data)
-            interpreter.invoke()
-
-            output = interpreter.get_tensor(interpreter.get_output_details()[0]['index'])
-            print(f"    batch={batch}: output shape={output.shape} ✅")
-        except Exception as e:
-            print(f"    batch={batch}: ❌ {e}")
+    input_details = interpreter.get_input_details()
+    shape = list(input_details[0]['shape'])
+    sig = list(input_details[0].get('shape_signature', shape))
+    ndim = len(shape)
+    for i in range(1, ndim):
+        if sig[i] == -1 or shape[i] <= 0:
+            if ndim == 2:
+                shape[i] = audio_length
+            elif ndim == 4 and image_height is not None and image_width is not None:
+                shape[i] = [3, image_height, image_width][i - 1]
+            else:
+                shape[i] = 1
+    shape[0] = max(int(shape[0]), 1)
+    try:
+        interpreter.resize_tensor_input(input_details[0]['index'], shape)
+        interpreter.allocate_tensors()
+        interpreter.set_tensor(input_details[0]['index'], np.random.rand(*shape).astype(np.float32))
+        interpreter.invoke()
+        output = interpreter.get_tensor(interpreter.get_output_details()[0]['index'])
+    except Exception as e:
+        raise RuntimeError(f'{tflite_path} does not run at input shape {shape}: {e}') from e
+    if not np.isfinite(output).all():
+        raise RuntimeError(f'{tflite_path} returns non-finite values at input shape {shape}')
+    print(f"    input {shape}: output shape={output.shape} ✅")
 
 
 if __name__ == '__main__':

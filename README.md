@@ -9,12 +9,12 @@
   <a href="MODEL_LICENSE.md"><img src="https://img.shields.io/badge/model%20license-Apache--2.0-blue.svg" alt="Model license: Apache 2.0"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.9+-ee4c2c.svg" alt="PyTorch 2.9+"></a>
-  <img src="https://img.shields.io/badge/model-V3.0-green.svg" alt="BirdNET+ V3.0">
+  <img src="https://img.shields.io/badge/model-V3.x-green.svg" alt="BirdNET+ V3.x">
   <img src="https://img.shields.io/badge/species-11%2C709-yellow.svg" alt="11,709 animal species">
 </p>
 
 <p align="center">
-  Convert BirdNET+ V3.0 PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, ONNX, and Core ML formats.<br>
+  Convert BirdNET+ V3.x PyTorch audio classification models into TensorFlow/LiteRT, TorchScript, ONNX, and Core ML formats.<br>
   ONNX and TorchScript models take any batch size and audio length; the other formats use the export shape.<br>
   The <a href="#birdnet-geomodel">BirdNET+ Geomodel</a>, which predicts where and when species occur, is converted here too.
 </p>
@@ -32,7 +32,7 @@
 
 ## Overview
 
-`convert_model.py` converts a BirdNET+ V3.0 PyTorch model (multi-head classifier on an EfficientNet backbone) into these formats, written to `export/<model name>/`:
+`convert_model.py` converts a BirdNET+ V3.x PyTorch model (multi-head classifier on an EfficientNet backbone) into these formats, written to `export/<model name>/`:
 
 | Format | Files | Input | FP16 | INT8 ¹ |
 |---|---|---|---|---|

@@ -51,7 +51,7 @@ LABEL_OVERRIDE_KEYS = ('ix', 'birdnet_id')
 
 # BirdNET taxonomy used to write labels.csv for kept classes that have a birdnet_id
 DEFAULT_TAXONOMY_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'BirdNET_Taxonomy_v0.5-Nov2026.csv'
+    os.path.dirname(os.path.abspath(__file__)), 'BirdNET+_Taxonomy_v0.5-Nov2026.csv'
 )
 TAXONOMY_LABEL_COLUMNS = [
     'birdnet_id', 'scientific_name', 'common_name', 'taxon_group', 'inat_id', 'ebird_code',

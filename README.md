@@ -45,6 +45,8 @@
 
 ¹ Only with `--experimental-mode`, see [Precision Variants](#precision-variants).
 
+The default model is `02_BirdNET+_V3.0_Global_12K`. `01_BirdNET+_V3.0-preview3_Global_11K` is a legacy preview model: it still converts, but it is not tested, lacks the FP16 fixes of V3.0, and its ONNX exports return NaN on silent input. Do not publish models converted from it.
+
 Audio input is mono, 32 kHz, float32 `[batch, samples]`. Supported input shapes:
 
 | Format | Batch size | Audio length |
@@ -55,7 +57,7 @@ Audio input is mono, 32 kHz, float32 `[batch, samples]`. Supported input shapes:
 
 ² The TFLite files accept other lengths, but they are only accurate at the export length: at 5 s, a 3 s export differs from the PyTorch model by up to 0.08 in score and its embeddings are off by more than half their range. For another length, export again with that `--segment-duration`.
 
-The separate preprocessing and main models let you plug in your own spectrogram pipeline or run the classifier on its own. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and copies of the model license and acceptable use policy.
+The separate preprocessing and main models let you plug in your own spectrogram pipeline or run the classifier on its own. The TF SavedModels are FP32 and are only kept when `-p` includes `fp32`; the preprocessing TFLite model is FP32 too and is always written, because the main models of every precision take its spectrogram. The export directory also gets a label file (see [Class Pruning and Labels](#class-pruning-and-labels)) and copies of the model license and acceptable use policy.
 
 One export directory holds one model configuration: all formats share the label file. `export_config.json` records the classes, head weights, segment duration and batch size of the models in the directory. A run with another configuration removes the models exported before; a run with the same configuration keeps the formats it does not write.
 
@@ -102,7 +104,7 @@ python convert_model.py --list-models          # list the models in models/
 -m, --model-name         Model directory: a name in models/ or a path (default: 02_BirdNET+_V3.0_Global_12K)
 -o, --output-dir         Directory that receives one folder per model (default: export/)
 -f, --formats FMT        Output format(s): tf, tflite, torchscript, onnx, coreml (default: all)
--p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all)
+-p, --precisions PREC    Precision variant(s): fp32, fp16, int8 (default: all); the SavedModels are fp32 only
 --batch-size             Batch size of the fixed-shape models (default: 1)
 --segment-duration       Audio length in seconds of the fixed-shape models (default: 3.0)
 --head-weights W W W     Weights for the three classifier heads (default: from model definition)

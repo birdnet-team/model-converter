@@ -117,13 +117,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      # CPU builds of torch keep the install small; TensorRT is not used for conversion.
+      # CPU builds of torch keep the install small
       - name: Install requirements
         run: |
           pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
             --index-url https://download.pytorch.org/whl/cpu
-          grep -v '^tensorrt' requirements.txt > requirements-ci.txt
-          pip install -r requirements-ci.txt
+          pip install -r requirements.txt
 
       - name: Convert
         run: python convert_model.py -m "$MODEL" -o export

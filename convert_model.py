@@ -10,7 +10,6 @@ import numpy as np
 import importlib.util
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.python.keras.engine.base_layer import Layer
 import torch
 import litert_torch
 import onnx
@@ -19,7 +18,13 @@ from fix_conv2dsame import fix_conv2dsame_padding
 from fix_tflite_dynamic_input import fix_all_for_dynamic_batch, verify_fix
 
 
-DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K' # 01_BirdNET+_V3.0-preview3_Global_11K 02_BirdNET+_V3.0_Global_12K
+DEFAULT_MODEL_NAME = '02_BirdNET+_V3.0_Global_12K'
+# Models that still convert but are not tested or maintained; converting one prints the note
+LEGACY_MODELS = {
+    '01_BirdNET+_V3.0-preview3_Global_11K':
+        'legacy preview model: not tested, without the FP16 fixes of V3.0, and its ONNX '
+        'exports return NaN on silent input. Do not publish models converted from it.',
+}
 
 ALL_FORMATS = ['tf', 'tflite', 'torchscript', 'onnx', 'coreml']
 ALL_PRECISIONS = ['fp32', 'fp16', 'int8']
@@ -177,29 +182,14 @@ def _is_experimental():
 def createTfPreprocessingModel():
     """Export the mel-spectrogram preprocessing layer as a TF SavedModel and TFLite.
 
-    Builds a Keras model around the model_module.Preprocessing layer, saves it
-    as a TF SavedModel, then converts to TFLite.  Supports dynamic input length
-    when allow_dynamic_input_length is True (default).
+    Builds a Keras model around the model_module.Preprocessing layer with a dynamic
+    input length, saves it as a TF SavedModel, then converts to TFLite. The TFLite model
+    is fp32 and written for every precision: all main models take its spectrogram.
 
     Output: ``{outputDir}/tf/preprocessing/`` (SavedModel + model.tflite)
     """
-    allow_dynamic_input_length = True
-    batch_size = batchSize
-
-
-    
     preprocessing = model_module.Preprocessing()
-
-    
-    if allow_dynamic_input_length:
-        inputs = keras.Input(shape=(None,), batch_size=batch_size, name='inputs') # dynamic input length
-    else:
-        segmentDurationInSamples = int(segmentDuration * model_module.sampleRate)
-        dtype = np.float32
-        sampleVec = np.random.rand(segmentDurationInSamples).astype(dtype)
-        input_shape = sampleVec.shape
-        inputs = keras.Input(shape=input_shape, batch_size=batch_size, name='inputs') # fixed input length
-
+    inputs = keras.Input(shape=(None,), batch_size=batchSize, name='inputs')  # dynamic input length
     x = preprocessing(inputs)
 
     model = keras.Model(inputs, x)
@@ -216,8 +206,6 @@ def createTfPreprocessingModel():
 
     converter.experimental_new_converter = True
     converter.experimental_enable_resource_variables = True
-
-    #converter.allow_custom_ops = True # ?
 
     tflite_model = converter.convert()
 
@@ -309,7 +297,6 @@ def prune_to_selected_classes(model, class_ixs, n_classes):
 
 def loadPytorchModelAndWeights(includePreprocessing=True):
 
-    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     device = 'cpu'
 
     # Load model
@@ -404,16 +391,13 @@ def get_expected_t_dims():
     return sorted(list(t_dims))
 
 
-def createTfMainModel(saveKerasModel=False):
+def createTfMainModel():
     """Convert the classifier to a TF SavedModel and TFLite (spectrogram input).
 
     Steps:
         1. Convert the PyTorch classifier to a static TF SavedModel via litert_torch.
         2. Re-wrap the SavedModel with a dynamic temporal dimension.
         3. Export to TFLite (fp32, and optionally fp16/int8) and fix static ops.
-
-    Args:
-        saveKerasModel: If True, also save a ``.keras`` file.
 
     Output: ``{outputDir}/tf/main/`` (SavedModel + TFLite variants)
     """
@@ -442,23 +426,8 @@ def createTfMainModel(saveKerasModel=False):
 
     print("Step 1: Converting PyTorch model to static TF SavedModel...")
 
-    # # Define a simple wrapper to strip out the embeddings so the resulting
-    # # TFLite model keeps the same single-output signature as before.
-    # class _SingleOutputWrapper(torch.nn.Module):
-    #     def __init__(self, core_model):
-    #         super().__init__()
-    #         self.core_model = core_model
-
-    #     def forward(self, x):
-    #         preds, embs = self.core_model(x)
-    #         return preds
-
-    # single_output_model = _SingleOutputWrapper(model)
-    # single_output_model.eval()
-
-    edge_model = litert_torch.convert(
+    litert_torch.convert(
         model,
-        #single_output_model,
         sample_inputs,
         _saved_model_dir=staticDir,
     )
@@ -557,7 +526,7 @@ def createTfMainModel(saveKerasModel=False):
 
         print(f"  Fixing static ops for dynamic batch...")
         audio_length = int(segmentDuration * model_module.sampleRate)
-        n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
+        fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
         verify_fix(tflite_path, model_module.imageHeight, imageWidth, audio_length)
 
     print("Step 3: Converting and fixing TFLite models...")
@@ -580,14 +549,17 @@ def createTfMainModel(saveKerasModel=False):
         print(f"Cleaned up {staticDir}")
 
 
-    ## Save as keras model
-    if saveKerasModel:
-        dstPath = dstDir + 'model.keras'
-        saved_model = tf.keras.layers.TFSMLayer(dstDir, call_endpoint='serving_default')
-        tf.keras.models.save_model(saved_model, dstPath, overwrite=True)
-        print('Exported keras model to', dstPath)
+SAVED_MODEL_FILES = ('saved_model.pb', 'fingerprint.pb', 'variables', 'assets')
 
 
+def _remove_saved_model(saved_model_dir):
+    """Delete the SavedModel in a directory; the TFLite models next to it stay."""
+    for name in SAVED_MODEL_FILES:
+        path = os.path.join(saved_model_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
 
 
 def _resave_saved_model_static(saved_model_dir, input_shape):
@@ -636,12 +608,7 @@ def _resave_saved_model_static(saved_model_dir, input_shape):
     tmpDir = saved_model_dir.rstrip('/') + '_static_tmp/'
     tf.saved_model.save(static_model, tmpDir, signatures={'serving_default': static_model.serve})
 
-    for name in ('saved_model.pb', 'fingerprint.pb', 'variables', 'assets'):
-        path = os.path.join(saved_model_dir, name)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        elif os.path.exists(path):
-            os.remove(path)
+    _remove_saved_model(saved_model_dir)
     for name in os.listdir(tmpDir):
         shutil.move(os.path.join(tmpDir, name), os.path.join(saved_model_dir, name))
     shutil.rmtree(tmpDir)
@@ -673,7 +640,6 @@ def combineTfModels():
             pre_out = self.pre.signatures['serving_default'](x)['output_0']
             # reshape pre_out to match input shape of main model: (B, 224, W, 3) --> (B, 3, 224, W)
             pre_out = tf.transpose(pre_out, perm=[0, 3, 1, 2])
-            #main_out = self.main.signatures['serving_default'](pre_out)['output_0']
             main_out = self.main.signatures['serving_default'](pre_out)
             #return main_out
             return {
@@ -722,7 +688,7 @@ def combineTfModels():
 
         print(f'  Fixing static ops for dynamic batch...')
         audio_length = int(segmentDuration * model_module.sampleRate)
-        n_fixed = fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
+        fix_all_for_dynamic_batch(tflite_path, image_width=imageWidth, audio_length=audio_length, expected_t_dims=expected_t_dims)
         verify_fix(tflite_path, model_module.imageHeight, imageWidth, audio_length)
 
 
@@ -737,6 +703,13 @@ def combineTfModels():
             _convert_and_fix_tflite(dstDir, dstDir + 'model_int8.tflite', optimize=True) # Dynamic range quantization (weights only)
         else:
             print("  ⚠️  Skipping TFLite INT8 (combined) — this is only supported in experimental mode. Use --experimental-mode to enable.")
+
+    if 'fp32' not in precisions:
+        # The SavedModels are fp32; without that precision they only served the conversion
+        for directory in (path_pre, path_main, dstDir):
+            _remove_saved_model(directory)
+        print('Removed the fp32 SavedModels (fp32 not requested)')
+        return
 
     # The SavedModels only run at the export shape; advertise it now that TFLite is done.
     audio_length = int(segmentDuration * model_module.sampleRate)
@@ -1181,7 +1154,6 @@ def createTorchScriptModel():
 
                 def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                     spec = self.preprocess(x)          # float32 audio → float32 spec
-                    #emb, pred = self.backbone(spec.half())  # fp16 entry; fp32 exit
                     #return emb, pred
                     pred, emb = self.backbone(spec.half())  # <-- Flipped order
                     return pred, emb # <-- Flipped order
@@ -2008,7 +1980,9 @@ def _build_parser():
         metavar='PREC',
         help=(
             'Precision variant(s) to produce. '
-            f'Choose from: {", ".join(ALL_PRECISIONS)} (default: all)'
+            f'Choose from: {", ".join(ALL_PRECISIONS)} (default: all). The TF SavedModels '
+            'are fp32 and only kept with fp32; the fp32 preprocessing TFLite model is '
+            'always written, because the main models of every precision need it'
         ),
     )
     parser.add_argument(
@@ -2148,6 +2122,9 @@ def main():
                       source_labels)
     write_terms_files(outputDir)
 
+    legacy_note = LEGACY_MODELS.get(os.path.basename(os.path.normpath(modelDir)))
+    if legacy_note:
+        print(f'⚠️  {os.path.basename(os.path.normpath(modelDir))} is a {legacy_note}\n')
     print(f'Model directory:    {modelDir}')
     print(f'Output directory:   {outputDir}')
     print(f'Output format(s):   {", ".join(sorted(formats))}')
@@ -2168,7 +2145,7 @@ def main():
 
     if 'tf' in formats or 'tflite' in formats:
         createTfPreprocessingModel()
-        createTfMainModel(saveKerasModel=False)
+        createTfMainModel()
         combineTfModels()
 
     if 'torchscript' in formats:
